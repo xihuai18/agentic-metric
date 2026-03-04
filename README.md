@@ -2,7 +2,7 @@
 
 [中文文档](README-CN.md)
 
-A local-only monitoring tool for AI coding agents. Track token usage and costs across Claude Code, Cursor, and more — with a TUI dashboard, system tray, and CLI.
+A local-only monitoring tool for AI coding agents. Track token usage and costs across Claude Code, Cursor, and more — with a TUI dashboard and CLI.
 
 **All data stays on your machine. No network requests, no telemetry, no data leaves your computer.** The tool only reads local agent data files (e.g. `~/.claude/`) and process info.
 
@@ -13,7 +13,6 @@ A local-only monitoring tool for AI coding agents. Track token usage and costs a
 - **Today overview** — Sessions, token usage, and cost summary for the current day
 - **Historical trends** — 30-day daily token/cost trends
 - **TUI dashboard** — Terminal UI with 1-second live refresh, stacked token charts, and trend lines
-- **System tray** — Sits in your system tray with a quick-access menu
 - **Multi-agent** — Plugin architecture, supports Claude Code and Cursor, extensible
 
 ## Data Sources
@@ -32,18 +31,6 @@ All aggregated data is stored locally in `~/.local/share/agentic_metric/data.db`
 pip install agentic-metric
 ```
 
-### Optional Dependencies
-
-Linux system tray menu requires AppIndicator (pre-installed on most desktop distros):
-
-```bash
-# Ubuntu/Debian
-sudo apt install gir1.2-ayatanaappindicator3-0.1
-
-# Fedora
-sudo dnf install libayatana-appindicator-gtk3
-```
-
 ## Usage
 
 ```bash
@@ -53,7 +40,6 @@ agentic-metric history         # Historical trends (default 30 days)
 agentic-metric history -d 7    # Last 7 days
 agentic-metric sync            # Force sync data to local database
 agentic-metric tui             # Launch TUI dashboard
-agentic-metric tray            # Launch system tray icon
 ```
 
 ### TUI Keybindings

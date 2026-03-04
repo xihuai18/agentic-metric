@@ -10,6 +10,7 @@ app = typer.Typer(
     name="agentic-metric",
     help="Monitor token usage and costs across AI coding agents.",
     invoke_without_command=True,
+    add_completion=False,
 )
 
 console = Console()
@@ -28,27 +29,6 @@ def tui() -> None:
     from .tui.app import AgenticMetricApp
 
     AgenticMetricApp().run()
-
-
-@app.command()
-def tray(
-    foreground: bool = typer.Option(False, "--foreground", "-f", help="Run in foreground (blocking)."),
-) -> None:
-    """Launch the system tray icon."""
-    if foreground:
-        from .tray.app import run_tray
-        run_tray()
-    else:
-        import subprocess
-        import sys
-
-        subprocess.Popen(
-            [sys.executable, "-m", "agentic_metric", "tray", "--foreground"],
-            start_new_session=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        console.print("Tray icon launched in background.")
 
 
 @app.command()
