@@ -83,6 +83,7 @@ class AgenticMetricApp(App):
         )
 
         live_ids = self._get_live_session_ids()
+        live_by_id = {s.session_id: s for s in self._live_sessions}
         db_ids = {s["session_id"] for s in self._today_sessions}
 
         # Build rows: active first, then finished (by started_at desc)
@@ -101,7 +102,12 @@ class AgenticMetricApp(App):
             cost = fmt_cost(s["estimated_cost_usd"] or 0)
             model = (s["model"] or "").split("-20")[0]
             started = ts_to_local(s["started_at"] or "")
-            prompt_raw = s["first_prompt"] or ""
+            # For active sessions, prefer live last_prompt over DB value
+            live = live_by_id.get(sid)
+            if live and (live.last_prompt or live.first_prompt):
+                prompt_raw = live.last_prompt or live.first_prompt
+            else:
+                prompt_raw = s.get("last_prompt") or s["first_prompt"] or ""
             prompt = (prompt_raw[:40] + "…") if len(prompt_raw) > 40 else prompt_raw
 
             row = (status, project, branch, turns, output, cache_r, cost, model, started, prompt)
@@ -116,7 +122,7 @@ class AgenticMetricApp(App):
                 continue
             cost = estimate_session_cost(ls)
             project = ls.project_path.rsplit("/", 1)[-1] if ls.project_path else ""
-            prompt_raw = ls.first_prompt or ""
+            prompt_raw = ls.last_prompt or ls.first_prompt or ""
             prompt = (prompt_raw[:40] + "…") if len(prompt_raw) > 40 else prompt_raw
             active_rows.append((
                 "[green]●[/]",

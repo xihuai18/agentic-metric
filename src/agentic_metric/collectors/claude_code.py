@@ -61,6 +61,7 @@ class _SessionAccum:
         "first_ts",
         "last_ts",
         "first_prompt",
+        "last_prompt",
         "git_branch",
         "model",
     )
@@ -80,6 +81,7 @@ class _SessionAccum:
         self.first_ts = ""
         self.last_ts = ""
         self.first_prompt = ""
+        self.last_prompt = ""
         self.git_branch = ""
         self.model = ""
 
@@ -122,13 +124,14 @@ class _SessionAccum:
             self.user_turns += 1
             if not self.git_branch:
                 self.git_branch = entry.get("gitBranch", "")
-            if not self.first_prompt:
-                msg = entry.get("message", {})
-                content = msg.get("content", "") if isinstance(msg, dict) else ""
-                if isinstance(content, str):
-                    clean = _extract_prompt(content)
-                    if clean:
+            msg = entry.get("message", {})
+            content = msg.get("content", "") if isinstance(msg, dict) else ""
+            if isinstance(content, str):
+                clean = _extract_prompt(content)
+                if clean:
+                    if not self.first_prompt:
                         self.first_prompt = clean[:80]
+                    self.last_prompt = clean[:80]
 
         elif entry_type == "assistant":
             msg = entry.get("message", {})
@@ -156,6 +159,7 @@ class _SessionAccum:
             started=self.first_ts,
             last_active=self.last_ts,
             first_prompt=self.first_prompt,
+            last_prompt=self.last_prompt,
             pid=self.pid,
         )
 
@@ -508,6 +512,7 @@ class ClaudeCodeCollector(BaseCollector):
                     started_at=accum.first_ts,
                     ended_at=accum.last_ts,
                     first_prompt=accum.first_prompt,
+                    last_prompt=accum.last_prompt,
                 )
 
                 db.set_sync_state(sync_key, str(file_size))

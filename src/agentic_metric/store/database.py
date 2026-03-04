@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     started_at TEXT,
     ended_at TEXT,
     first_prompt TEXT DEFAULT '',
+    last_prompt TEXT DEFAULT '',
     summary TEXT DEFAULT ''
 );
 
@@ -66,6 +67,18 @@ class Database:
         self._conn = sqlite3.connect(self._path)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Add columns that may be missing in older databases."""
+        cols = {
+            r[1]
+            for r in self._conn.execute("PRAGMA table_info(sessions)").fetchall()
+        }
+        if "last_prompt" not in cols:
+            self._conn.execute(
+                "ALTER TABLE sessions ADD COLUMN last_prompt TEXT DEFAULT ''"
+            )
 
     def close(self) -> None:
         self._conn.close()
@@ -110,6 +123,7 @@ class Database:
         started_at: str = "",
         ended_at: str = "",
         first_prompt: str = "",
+        last_prompt: str = "",
         summary: str = "",
     ) -> None:
         self._conn.execute(
@@ -117,8 +131,8 @@ class Database:
                    (session_id, agent_type, project_path, git_branch, model,
                     message_count, user_turns, input_tokens, output_tokens,
                     cache_read_tokens, cache_creation_tokens, estimated_cost_usd,
-                    started_at, ended_at, first_prompt, summary)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    started_at, ended_at, first_prompt, last_prompt, summary)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(session_id) DO UPDATE SET
                    message_count = excluded.message_count,
                    user_turns = excluded.user_turns,
@@ -128,6 +142,7 @@ class Database:
                    cache_creation_tokens = excluded.cache_creation_tokens,
                    estimated_cost_usd = excluded.estimated_cost_usd,
                    ended_at = excluded.ended_at,
+                   last_prompt = excluded.last_prompt,
                    summary = excluded.summary,
                    model = CASE WHEN excluded.model != '' THEN excluded.model ELSE sessions.model END
             """,
@@ -135,7 +150,7 @@ class Database:
                 session_id, agent_type, project_path, git_branch, model,
                 message_count, user_turns, input_tokens, output_tokens,
                 cache_read_tokens, cache_creation_tokens, estimated_cost_usd,
-                started_at, ended_at, first_prompt, summary,
+                started_at, ended_at, first_prompt, last_prompt, summary,
             ),
         )
 

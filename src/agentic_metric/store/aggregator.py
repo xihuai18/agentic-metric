@@ -112,7 +112,7 @@ def get_today_sessions(db: Database) -> list[dict]:
         """SELECT session_id, agent_type, project_path, git_branch, model,
                   message_count, user_turns, input_tokens, output_tokens,
                   cache_read_tokens, cache_creation_tokens, estimated_cost_usd,
-                  started_at, ended_at, first_prompt
+                  started_at, ended_at, first_prompt, last_prompt
            FROM sessions
            WHERE date(started_at) = ?
            ORDER BY started_at DESC

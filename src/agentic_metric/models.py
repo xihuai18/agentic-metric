@@ -23,6 +23,7 @@ class LiveSession:
     started: str = ""
     last_active: str = ""
     first_prompt: str = ""
+    last_prompt: str = ""
     pid: int = 0
 
     @property

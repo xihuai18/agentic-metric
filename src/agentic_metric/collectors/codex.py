@@ -38,6 +38,7 @@ class _SessionAccum:
         "first_ts",
         "last_ts",
         "first_prompt",
+        "last_prompt",
         "git_branch",
         "model",
     )
@@ -57,6 +58,7 @@ class _SessionAccum:
         self.first_ts = ""
         self.last_ts = ""
         self.first_prompt = ""
+        self.last_prompt = ""
         self.git_branch = ""
         self.model = ""
 
@@ -116,10 +118,12 @@ class _SessionAccum:
 
         if msg_type == "user_message":
             self.user_turns += 1
-            if not self.first_prompt:
-                text = payload.get("message", "")
-                if isinstance(text, str) and text.strip():
-                    self.first_prompt = text.strip()[:80]
+            text = payload.get("message", "")
+            if isinstance(text, str) and text.strip():
+                clean = text.strip()[:80]
+                if not self.first_prompt:
+                    self.first_prompt = clean
+                self.last_prompt = clean
 
         elif msg_type == "agent_message":
             self.message_count += 1
@@ -151,6 +155,7 @@ class _SessionAccum:
             started=self.first_ts,
             last_active=self.last_ts,
             first_prompt=self.first_prompt,
+            last_prompt=self.last_prompt,
             pid=self.pid,
         )
 
@@ -326,6 +331,7 @@ class CodexCollector(BaseCollector):
                 started_at=accum.first_ts,
                 ended_at=accum.last_ts,
                 first_prompt=accum.first_prompt,
+                last_prompt=accum.last_prompt,
             )
 
             db.set_sync_state(sync_key, str(file_size))
