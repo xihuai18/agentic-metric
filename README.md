@@ -2,7 +2,7 @@
 
 [中文文档](README-CN.md)
 
-A local-only monitoring tool for AI coding agents. Track token usage and costs across Claude Code, Cursor, VS Code (Copilot Chat), and more — with a TUI dashboard and CLI.
+A local-only monitoring tool for AI coding agents. Track token usage and costs across Claude Code, Cursor, OpenCode, VS Code (Copilot Chat), and more — with a TUI dashboard and CLI.
 
 **All data stays on your machine. No network requests, no telemetry, no data leaves your computer.** The tool only reads local agent data files (e.g. `~/.claude/`) and process info.
 
@@ -27,6 +27,8 @@ A local-only monitoring tool for AI coding agents. Track token usage and costs a
 | VS Code | `~/.config/Code/User/workspaceStorage/*/chatSessions/` | Chat sessions (JSON + JSONL), token usage (JSONL only), model |
 | VS Code | `~/.config/Code/User/globalStorage/emptyWindowChatSessions/` | Empty-window chat sessions |
 | VS Code | Process detection | Running status, working directory |
+| OpenCode | `~/.local/share/opencode/opencode.db` | SQLite sessions, messages, token usage, model |
+| OpenCode | Process detection | Running status, active session matching |
 
 All aggregated data is stored locally in `~/.local/share/agentic_metric/data.db` (SQLite).
 
@@ -59,20 +61,20 @@ agentic-metric tui             # Launch TUI dashboard
 
 Different agents expose different levels of local data. Here's what's available for each:
 
-| Field | Claude Code | Codex | Cursor | VS Code (Copilot) |
-|-------|:-----------:|:-----:|:------:|:-----------------:|
-| Session ID | ✓ JSONL | ✓ JSONL | ✓ composerId | ✓ sessionId |
-| Project path | ✓ JSONL | ✓ JSONL | ◐ partial (from bubble or conversationState) | ✓ workspace.json URI |
-| Git branch | ✓ JSONL | ✓ JSONL | ✗ not stored | ✗ not stored |
-| Model | ✓ JSONL | ✓ JSONL | ✓ modelConfig / bubble modelInfo | ✓ result.details (e.g. "Claude Haiku 4.5 • 1x") |
-| Input tokens | ✓ per-message | ✓ cumulative | ◐ ~75% of sessions | ◐ JSONL format only |
-| Output tokens | ✓ per-message | ✓ cumulative | ◐ ~75% of sessions | ◐ JSONL format only |
-| Cache tokens | ✓ read + write | ✓ read only | ✗ not exposed | ✗ not exposed |
-| User turns | ✓ | ✓ | ✓ | ✓ |
-| Message count | ✓ all messages | ✓ AI replies only | ✓ all messages | ✓ turns × 2 |
-| First/last prompt | ✓ | ✓ | ✓ from bubble text | ✓ message.text |
-| Cost estimation | ✓ | ✓ | ◐ only when tokens available | ◐ only when tokens available |
-| Live active status | ✓ PID + session file match | ✓ PID + session file match | ◐ process-level only (latest session marked active) | ◐ process-level only |
+| Field | Claude Code | Codex | Cursor | VS Code (Copilot) | OpenCode |
+|-------|:-----------:|:-----:|:------:|:-----------------:|:--------:|
+| Session ID | ✓ JSONL | ✓ JSONL | ✓ composerId | ✓ sessionId | ✓ session table |
+| Project path | ✓ JSONL | ✓ JSONL | ◐ partial (from bubble or conversationState) | ✓ workspace.json URI | ✓ session.directory (launch cwd) |
+| Git branch | ✓ JSONL | ✓ JSONL | ✗ not stored | ✗ not stored | ✗ not stored |
+| Model | ✓ JSONL | ✓ JSONL | ✓ modelConfig / bubble modelInfo | ✓ result.details (e.g. "Claude Haiku 4.5 • 1x") | ✓ message.modelID |
+| Input tokens | ✓ per-message | ✓ cumulative | ◐ ~75% of sessions | ◐ JSONL format only | ✓ per-message |
+| Output tokens | ✓ per-message | ✓ cumulative | ◐ ~75% of sessions | ◐ JSONL format only | ✓ per-message (includes reasoning) |
+| Cache tokens | ✓ read + write | ✓ read only | ✗ not exposed | ✗ not exposed | ◐ read only (write always 0) |
+| User turns | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Message count | ✓ all messages | ✓ AI replies only | ✓ all messages | ✓ turns × 2 | ✓ all messages |
+| First/last prompt | ✓ | ✓ | ✓ from bubble text | ✓ message.text | ✓ from part table |
+| Cost estimation | ✓ | ✓ | ◐ only when tokens available | ◐ only when tokens available | ◐ estimated only (reported cost always 0) |
+| Live active status | ✓ PID + session file match | ✓ PID + session file match | ◐ process-level only (latest session marked active) | ◐ process-level only | ✓ PID + DB session match |
 
 **Key differences:**
 
@@ -81,6 +83,7 @@ Different agents expose different levels of local data. Here's what's available 
 - **Token coverage** — Cursor does not record token counts for all sessions. Older sessions and some "default" model sessions have zero tokens. Cache token breakdown (read/write) is not available.
 - **Model name** — Cursor's "default" model setting doesn't record which model was actually used on the backend. These sessions show `default` in the model column.
 - **VS Code (Copilot Chat)** — Has two storage formats: legacy JSON (older sessions, no token data) and newer incremental JSONL (with `result.usage` containing `promptTokens`/`completionTokens`). Token usage is only available for sessions stored in JSONL format. Model names are extracted from Copilot's display strings (e.g. "GPT-4o • 1x") and normalized to pricing keys. Workspace paths support local (`file://`), SSH remote (`vscode-remote://ssh-remote+host`), and container (`attached-container+...`) URIs.
+- **OpenCode** — Stores all data in a local SQLite database (`opencode.db`). Token data is per-message with `input`, `output`, `reasoning`, and `cache.read`/`cache.write` fields. Reasoning tokens are counted as output tokens (billed at output rate). The `cost` field in messages is always 0, so all costs are estimated using the pricing table. `cache.write` is also always 0.
 
 ## Privacy
 

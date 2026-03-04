@@ -84,10 +84,12 @@ class OpenCodeCollector(BaseCollector):
                 ).fetchone()[0]
 
                 # Aggregate tokens across all assistant messages
+                # reasoning tokens are billed as output, so add them together
                 agg = src.execute(
                     """SELECT
                            SUM(json_extract(data, '$.tokens.input')) AS inp,
-                           SUM(json_extract(data, '$.tokens.output')) AS outp,
+                           SUM(json_extract(data, '$.tokens.output')
+                               + json_extract(data, '$.tokens.reasoning')) AS outp,
                            SUM(json_extract(data, '$.tokens.cache.read')) AS cread,
                            SUM(json_extract(data, '$.tokens.cache.write')) AS cwrite
                        FROM message
@@ -239,7 +241,8 @@ class OpenCodeCollector(BaseCollector):
                 if model:
                     agg["models"].add(model)
                 agg["input_tokens"] += mr["inp"] or 0
-                agg["output_tokens"] += mr["outp"] or 0
+                # reasoning tokens are billed as output
+                agg["output_tokens"] += (mr["outp"] or 0) + (mr["reasoning"] or 0)
                 agg["cache_read"] += mr["cread"] or 0
                 agg["cache_write"] += mr["cwrite"] or 0
                 agg["cost"] += mr["cost"] or 0.0
