@@ -117,14 +117,22 @@ class AgenticMetricApp(App):
             agent = s["agent_type"] or ""
             project = (s["project_path"] or "").rsplit("/", 1)[-1]
             branch = s["git_branch"] or ""
-            turns = str(s["user_turns"] or 0)
-            total_tokens = (s["input_tokens"] or 0) + (s["output_tokens"] or 0) + (s["cache_read_tokens"] or 0) + (s["cache_creation_tokens"] or 0)
-            tokens = fmt_tokens(total_tokens)
-            cost = fmt_cost(s["estimated_cost_usd"] or 0)
-            model = (s["model"] or "").split("-20")[0]
+            # For active sessions with live token data, prefer live values
+            live = live_by_id.get(sid)
+            if live and live.output_tokens > 0:
+                turns = str(live.user_turns)
+                total_tokens = live.input_tokens + live.output_tokens + live.cache_read_tokens + live.cache_creation_tokens
+                tokens = fmt_tokens(total_tokens)
+                cost = fmt_cost(estimate_session_cost(live))
+                model = (live.model or s["model"] or "").split("-20")[0]
+            else:
+                turns = str(s["user_turns"] or 0)
+                total_tokens = (s["input_tokens"] or 0) + (s["output_tokens"] or 0) + (s["cache_read_tokens"] or 0) + (s["cache_creation_tokens"] or 0)
+                tokens = fmt_tokens(total_tokens)
+                cost = fmt_cost(s["estimated_cost_usd"] or 0)
+                model = (s["model"] or "").split("-20")[0]
             started = ts_to_local(s["started_at"] or "")
             # For active sessions, prefer live last_prompt over DB value
-            live = live_by_id.get(sid)
             if live and (live.last_prompt or live.first_prompt):
                 prompt_raw = live.last_prompt or live.first_prompt
             else:

@@ -72,4 +72,7 @@ def create_default_registry() -> CollectorRegistry:
     from .vscode import VscodeCollector
     registry.register(VscodeCollector())
 
+    from .opencode import OpenCodeCollector
+    registry.register(OpenCodeCollector())
+
     return registry

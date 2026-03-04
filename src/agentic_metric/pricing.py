@@ -4,23 +4,25 @@ from __future__ import annotations
 
 # (input, output, cache_read, cache_write) — USD per million tokens
 PRICING: dict[str, tuple[float, float, float, float]] = {
-    "claude-opus-4-6":   (5.0, 25.0, 0.50, 10.0),
-    "claude-opus-4-5":   (5.0, 25.0, 0.50, 10.0),
-    "claude-opus-4-1":   (15.0, 75.0, 1.50, 30.0),
-    "claude-sonnet-4-6": (3.0, 15.0, 0.30, 6.0),
-    "claude-sonnet-4-5": (3.0, 15.0, 0.30, 6.0),
-    "claude-sonnet-4":   (3.0, 15.0, 0.30, 6.0),
-    "claude-haiku-4-5":  (1.0,  5.0, 0.10, 2.0),
-    "gpt-5.3-codex":     (2.5, 10.0, 1.25, 0.0),
+    "claude-opus-4-6":   (5.0, 25.0, 0.50, 6.25),
+    "claude-opus-4-5":   (5.0, 25.0, 0.50, 6.25),
+    "claude-opus-4-1":   (15.0, 75.0, 1.50, 18.75),
+    "claude-sonnet-4-6": (3.0, 15.0, 0.30, 3.75),
+    "claude-sonnet-4-5": (3.0, 15.0, 0.30, 3.75),
+    "claude-sonnet-4":   (3.0, 15.0, 0.30, 3.75),
+    "claude-haiku-4-5":  (1.0,  5.0, 0.10, 1.25),
+    "gpt-5.3-codex":     (1.75, 14.0, 0.175, 0.0),
     "gpt-5.2":           (1.75, 14.0, 0.175, 0.0),
-    "gpt-5.1-codex":     (1.25, 10.0, 0.625, 0.0),
+    "gpt-5.1-codex":     (1.25, 10.0, 0.125, 0.0),
     "gpt-4o":            (2.5, 10.0, 1.25, 0.0),
-    "gemini-3-pro":      (2.0, 12.0, 0.0, 0.0),
-    "o3":                (10.0, 40.0, 2.50, 0.0),
-    "o4-mini":           (1.1,  4.4, 0.55, 0.0),
+    "gemini-3-pro":      (2.0, 12.0, 0.20, 0.0),
+    "o3":                (2.0,  8.0, 0.50, 0.0),
+    "o4-mini":           (1.1,  4.4, 0.275, 0.0),
+    "kimi-k2":           (0.60, 2.50, 0.15, 0.0),
+    "kimi-k2.5":         (0.60, 3.00, 0.15, 0.0),
 }
 
-_DEFAULT_PRICING = (5.0, 25.0, 0.50, 10.0)  # fallback to opus pricing
+_DEFAULT_PRICING = (5.0, 25.0, 0.50, 6.25)  # fallback to opus pricing
 
 # Cursor model name → our pricing key
 _MODEL_ALIASES: dict[str, str] = {
