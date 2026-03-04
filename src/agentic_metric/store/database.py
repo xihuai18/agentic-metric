@@ -144,7 +144,8 @@ class Database:
                    ended_at = excluded.ended_at,
                    last_prompt = excluded.last_prompt,
                    summary = excluded.summary,
-                   model = CASE WHEN excluded.model != '' THEN excluded.model ELSE sessions.model END
+                   model = CASE WHEN excluded.model != '' THEN excluded.model ELSE sessions.model END,
+                   project_path = CASE WHEN excluded.project_path != '' THEN excluded.project_path ELSE sessions.project_path END
             """,
             (
                 session_id, agent_type, project_path, git_branch, model,

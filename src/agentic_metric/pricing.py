@@ -12,12 +12,29 @@ PRICING: dict[str, tuple[float, float, float, float]] = {
     "claude-sonnet-4":   (3.0, 15.0, 0.30, 6.0),
     "claude-haiku-4-5":  (1.0,  5.0, 0.10, 2.0),
     "gpt-5.3-codex":     (2.5, 10.0, 1.25, 0.0),
+    "gpt-5.2":           (1.75, 14.0, 0.175, 0.0),
+    "gpt-5.1-codex":     (1.25, 10.0, 0.625, 0.0),
     "gpt-4o":            (2.5, 10.0, 1.25, 0.0),
+    "gemini-3-pro":      (2.0, 12.0, 0.0, 0.0),
     "o3":                (10.0, 40.0, 2.50, 0.0),
     "o4-mini":           (1.1,  4.4, 0.55, 0.0),
 }
 
 _DEFAULT_PRICING = (5.0, 25.0, 0.50, 10.0)  # fallback to opus pricing
+
+# Cursor model name → our pricing key
+_MODEL_ALIASES: dict[str, str] = {
+    "claude-4.5-sonnet-thinking": "claude-sonnet-4-5",
+    "claude-4.5-opus-high-thinking": "claude-opus-4-5",
+    "gpt-5.1-codex-max": "gpt-5.1-codex",
+}
+
+
+def normalize_model(name: str) -> str:
+    """Normalize external model names (e.g. Cursor) to our pricing keys."""
+    if not name:
+        return ""
+    return _MODEL_ALIASES.get(name, name)
 
 
 def get_pricing(model: str) -> tuple[float, float, float, float]:

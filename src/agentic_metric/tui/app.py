@@ -63,7 +63,7 @@ class AgenticMetricApp(App):
         self._today_sessions = get_today_sessions(self._db)
         overview = get_today_overview(self._db)
         self.query_one("#today-summary", TodaySummary).update_data(
-            overview, len(self._live_sessions)
+            overview, self._count_active()
         )
         self._populate_session_table()
 
@@ -73,18 +73,32 @@ class AgenticMetricApp(App):
     def _get_live_session_ids(self) -> set[str]:
         return {s.session_id for s in self._live_sessions}
 
+    def _count_active(self) -> int:
+        """Count live sessions that have actual data (not process-only)."""
+        db_ids = {s["session_id"] for s in self._today_sessions}
+        return sum(
+            1 for s in self._live_sessions
+            if s.session_id in db_ids or s.user_turns > 0 or s.output_tokens > 0
+        )
+
     def _populate_session_table(self) -> None:
         table = self.query_one("#live-table", DataTable)
         table.clear(columns=True)
         table.add_columns(
-            "Status", "Project", "Branch", "Turns",
-            "Output", "Cache R", "Cost",
-            "Model", "Started", "Prompt",
+            "Status", "Agent", "Project", "Branch", "Turns",
+            "Tokens", "Cost",
+            "Model", "Started", "Latest Prompt",
         )
 
         live_ids = self._get_live_session_ids()
         live_by_id = {s.session_id: s for s in self._live_sessions}
         db_ids = {s["session_id"] for s in self._today_sessions}
+        # Agent types with live processes but no session-level ID matching
+        live_agent_types = {s.agent_type for s in self._live_sessions} - {
+            s.agent_type for s in self._live_sessions if s.session_id in db_ids
+        }
+        # Track: mark only the latest (first seen) session per agent type
+        agent_type_marked: set[str] = set()
 
         # Build rows: active first, then finished (by started_at desc)
         active_rows: list[tuple] = []
@@ -92,13 +106,20 @@ class AgenticMetricApp(App):
 
         for s in self._today_sessions:
             sid = s["session_id"]
+            agent = s["agent_type"] or ""
             is_active = sid in live_ids
+            # For process-level collectors (e.g. Cursor): mark latest session active
+            if not is_active and agent in live_agent_types and agent not in agent_type_marked:
+                is_active = True
+            if is_active:
+                agent_type_marked.add(agent)
             status = "[green]●[/]" if is_active else "[dim]○[/]"
+            agent = s["agent_type"] or ""
             project = (s["project_path"] or "").rsplit("/", 1)[-1]
             branch = s["git_branch"] or ""
             turns = str(s["user_turns"] or 0)
-            output = fmt_tokens(s["output_tokens"] or 0)
-            cache_r = fmt_tokens(s["cache_read_tokens"] or 0)
+            total_tokens = (s["input_tokens"] or 0) + (s["output_tokens"] or 0) + (s["cache_read_tokens"] or 0) + (s["cache_creation_tokens"] or 0)
+            tokens = fmt_tokens(total_tokens)
             cost = fmt_cost(s["estimated_cost_usd"] or 0)
             model = (s["model"] or "").split("-20")[0]
             started = ts_to_local(s["started_at"] or "")
@@ -110,7 +131,7 @@ class AgenticMetricApp(App):
                 prompt_raw = s.get("last_prompt") or s["first_prompt"] or ""
             prompt = (prompt_raw[:40] + "…") if len(prompt_raw) > 40 else prompt_raw
 
-            row = (status, project, branch, turns, output, cache_r, cost, model, started, prompt)
+            row = (status, agent, project, branch, turns, tokens, cost, model, started, prompt)
             if is_active:
                 active_rows.append(row)
             else:
@@ -120,17 +141,21 @@ class AgenticMetricApp(App):
         for ls in self._live_sessions:
             if ls.session_id in db_ids:
                 continue
+            # Skip process-only sessions with no actual data
+            if ls.user_turns == 0 and ls.output_tokens == 0:
+                continue
             cost = estimate_session_cost(ls)
             project = ls.project_path.rsplit("/", 1)[-1] if ls.project_path else ""
+            total_tokens = ls.input_tokens + ls.output_tokens + ls.cache_read_tokens + ls.cache_creation_tokens
             prompt_raw = ls.last_prompt or ls.first_prompt or ""
             prompt = (prompt_raw[:40] + "…") if len(prompt_raw) > 40 else prompt_raw
             active_rows.append((
                 "[green]●[/]",
+                ls.agent_type or "",
                 project,
                 ls.git_branch or "",
                 str(ls.user_turns),
-                fmt_tokens(ls.output_tokens),
-                fmt_tokens(ls.cache_read_tokens),
+                fmt_tokens(total_tokens),
                 fmt_cost(cost),
                 (ls.model or "").split("-20")[0],
                 ts_to_local(ls.started),
@@ -214,7 +239,7 @@ class AgenticMetricApp(App):
         self._live_sessions = sessions
         overview = get_today_overview(self._db)
         self.query_one("#today-summary", TodaySummary).update_data(
-            overview, len(sessions)
+            overview, self._count_active()
         )
         self._populate_session_table()
 

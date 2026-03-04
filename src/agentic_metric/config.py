@@ -13,6 +13,7 @@ CODEX_SESSIONS_DIR = CODEX_HOME / "sessions"
 
 # Cursor data paths
 CURSOR_TRACKING_DB = Path.home() / ".cursor" / "ai-tracking" / "ai-code-tracking.db"
+CURSOR_STATE_DB = Path.home() / ".config" / "Cursor" / "User" / "globalStorage" / "state.vscdb"
 
 # Application data
 DATA_DIR = Path.home() / ".local" / "share" / "agentic_metric"
