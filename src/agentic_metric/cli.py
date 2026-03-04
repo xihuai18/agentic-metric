@@ -24,11 +24,24 @@ def tui() -> None:
 
 
 @app.command()
-def tray() -> None:
+def tray(
+    foreground: bool = typer.Option(False, "--foreground", "-f", help="Run in foreground (blocking)."),
+) -> None:
     """Launch the system tray icon."""
-    from .tray.app import run_tray
+    if foreground:
+        from .tray.app import run_tray
+        run_tray()
+    else:
+        import subprocess
+        import sys
 
-    run_tray()
+        subprocess.Popen(
+            [sys.executable, "-m", "agentic_metric", "tray", "--foreground"],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        console.print("Tray icon launched in background.")
 
 
 @app.command()

@@ -53,6 +53,7 @@ class _SessionAccum:
         "pid",
         "offset",
         "user_turns",
+        "message_count",
         "input_tokens",
         "output_tokens",
         "cache_read",
@@ -71,6 +72,7 @@ class _SessionAccum:
         self.pid = pid
         self.offset = 0
         self.user_turns = 0
+        self.message_count = 0
         self.input_tokens = 0
         self.output_tokens = 0
         self.cache_read = 0
@@ -112,6 +114,9 @@ class _SessionAccum:
             self.last_ts = ts
 
         entry_type = entry.get("type", "")
+
+        if entry_type in ("user", "assistant"):
+            self.message_count += 1
 
         if entry_type == "user":
             self.user_turns += 1
@@ -493,6 +498,7 @@ class ClaudeCodeCollector(BaseCollector):
                     project_path=project_path,
                     git_branch=accum.git_branch,
                     model=accum.model,
+                    message_count=accum.message_count,
                     user_turns=accum.user_turns,
                     input_tokens=accum.input_tokens,
                     output_tokens=accum.output_tokens,
