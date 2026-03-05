@@ -35,7 +35,9 @@ A local-only monitoring tool for AI coding agents. Track token usage and costs a
 | Live active status | ✓ | ✓ | ✓² | ✓ | ✓ |
 
 > ¹ VS Code legacy JSON sessions (older Copilot versions) do not contain token data; only newer JSONL sessions are supported.
+>
 > ² VS Code live status is process-level only; cannot match to a specific Copilot Chat session.
+>
 > ³ Cache read tokens only; cache write data is not exposed.
 
 ## Installation
