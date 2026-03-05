@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from importlib.metadata import version as _pkg_version
+
 import typer
 from rich.console import Console
 from rich.table import Table
@@ -16,8 +18,20 @@ app = typer.Typer(
 console = Console()
 
 
+def _version_callback(value: bool) -> None:
+    if value:
+        console.print(f"agentic-metric {_pkg_version('agentic-metric')}")
+        raise typer.Exit()
+
+
 @app.callback(invoke_without_command=True)
-def _default(ctx: typer.Context) -> None:
+def _default(
+    ctx: typer.Context,
+    version: bool = typer.Option(
+        False, "--version", "-v", callback=_version_callback,
+        is_eager=True, help="Show version and exit.",
+    ),
+) -> None:
     """Launch TUI by default when no command is given."""
     if ctx.invoked_subcommand is None:
         tui()
