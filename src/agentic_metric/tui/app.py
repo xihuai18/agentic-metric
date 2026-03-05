@@ -203,6 +203,7 @@ class AgenticMetricApp(App):
             plot_widget.refresh()
             return
 
+        trends = list(reversed(trends))  # oldest → newest for chart
         dates = [t.date[5:] for t in trends]  # MM-DD
         raw_tokens = [t.total_tokens for t in trends]
         cost_vals = [t.estimated_cost_usd for t in trends]
@@ -232,7 +233,7 @@ class AgenticMetricApp(App):
         table.clear(columns=True)
         table.add_columns("Date", "Sessions", "Messages", "Tokens", "Cost", "Agent")
 
-        for t in reversed(trends):
+        for t in trends:
             agent = t.agent_type if t.agent_type else "all"
             table.add_row(
                 t.date,
