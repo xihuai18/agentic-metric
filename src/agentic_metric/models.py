@@ -81,6 +81,7 @@ class DailyTrend:
     date: str
     agent_type: str = ""
     session_count: int = 0
+    user_turns: int = 0
     message_count: int = 0
     input_tokens: int = 0
     output_tokens: int = 0

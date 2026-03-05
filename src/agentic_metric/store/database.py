@@ -108,16 +108,17 @@ class Database:
                     started_at, ended_at, first_prompt, last_prompt, summary)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(session_id) DO UPDATE SET
-                   message_count = excluded.message_count,
-                   user_turns = excluded.user_turns,
-                   input_tokens = excluded.input_tokens,
-                   output_tokens = excluded.output_tokens,
-                   cache_read_tokens = excluded.cache_read_tokens,
-                   cache_creation_tokens = excluded.cache_creation_tokens,
-                   estimated_cost_usd = excluded.estimated_cost_usd,
-                   ended_at = excluded.ended_at,
-                   last_prompt = excluded.last_prompt,
-                   summary = excluded.summary,
+                   message_count = CASE WHEN excluded.message_count > 0 THEN excluded.message_count ELSE sessions.message_count END,
+                   user_turns = CASE WHEN excluded.user_turns > 0 THEN excluded.user_turns ELSE sessions.user_turns END,
+                   input_tokens = CASE WHEN excluded.input_tokens > 0 THEN excluded.input_tokens ELSE sessions.input_tokens END,
+                   output_tokens = CASE WHEN excluded.output_tokens > 0 THEN excluded.output_tokens ELSE sessions.output_tokens END,
+                   cache_read_tokens = CASE WHEN excluded.cache_read_tokens > 0 THEN excluded.cache_read_tokens ELSE sessions.cache_read_tokens END,
+                   cache_creation_tokens = CASE WHEN excluded.cache_creation_tokens > 0 THEN excluded.cache_creation_tokens ELSE sessions.cache_creation_tokens END,
+                   estimated_cost_usd = CASE WHEN excluded.estimated_cost_usd > 0 THEN excluded.estimated_cost_usd ELSE sessions.estimated_cost_usd END,
+                   ended_at = CASE WHEN excluded.ended_at != '' THEN excluded.ended_at ELSE sessions.ended_at END,
+                   first_prompt = CASE WHEN excluded.first_prompt != '' THEN excluded.first_prompt ELSE sessions.first_prompt END,
+                   last_prompt = CASE WHEN excluded.last_prompt != '' THEN excluded.last_prompt ELSE sessions.last_prompt END,
+                   summary = CASE WHEN excluded.summary != '' THEN excluded.summary ELSE sessions.summary END,
                    model = CASE WHEN excluded.model != '' THEN excluded.model ELSE sessions.model END,
                    project_path = CASE WHEN excluded.project_path != '' THEN excluded.project_path ELSE sessions.project_path END
             """,

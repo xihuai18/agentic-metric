@@ -52,7 +52,8 @@ def status() -> None:
     from .pricing import estimate_session_cost
 
     registry = create_default_registry()
-    sessions = registry.get_live_sessions()
+    sessions = [s for s in registry.get_live_sessions()
+                if s.user_turns > 0 or s.output_tokens > 0]
 
     if not sessions:
         console.print("No active agents.")
@@ -62,10 +63,11 @@ def status() -> None:
     table.add_column("PID", justify="right", style="cyan")
     table.add_column("Agent", style="magenta")
     table.add_column("Project", style="green")
-    table.add_column("Turns", justify="right")
-    table.add_column("Output", justify="right")
-    table.add_column("Cost", justify="right", style="yellow")
     table.add_column("Model", style="blue")
+    table.add_column("Turns", justify="right")
+    table.add_column("Messages", justify="right")
+    table.add_column("Tokens", justify="right")
+    table.add_column("Cost", justify="right", style="yellow")
 
     for s in sessions:
         cost = estimate_session_cost(s)
@@ -74,10 +76,11 @@ def status() -> None:
             str(s.pid),
             s.agent_type,
             project,
-            str(s.user_turns),
-            f"{s.output_tokens:,}",
-            f"${cost:.2f}",
             s.model or "-",
+            str(s.user_turns),
+            str(s.message_count),
+            _fmt_tokens(s.total_tokens),
+            f"${cost:.2f}",
         )
 
     console.print(table)
@@ -89,58 +92,53 @@ def today() -> None:
     from .store.database import Database
     from .store import aggregator
     from .collectors import create_default_registry
-    from .pricing import estimate_session_cost
 
     db = Database()
     registry = create_default_registry()
     registry.sync_all(db)
 
     overview = aggregator.get_today_overview(db)
-
-    # Augment with live session data
+    today_sessions = aggregator.get_today_sessions(db)
     live_sessions = registry.get_live_sessions()
-    overview.active_agents = len(live_sessions)
-    live_cost = sum(estimate_session_cost(s) for s in live_sessions)
-    live_out = sum(s.output_tokens for s in live_sessions)
-    live_in = sum(s.input_tokens for s in live_sessions)
+    aggregator.merge_live_into_overview(overview, live_sessions, today_sessions)
+    overview.active_agents = sum(
+        1 for s in live_sessions if s.user_turns > 0 or s.output_tokens > 0
+    )
 
     db.close()
 
-    console.print(f"\n[bold]Today's Overview[/bold]  ({overview.date})\n")
-    console.print(f"  Active:     [bold green]{overview.active_agents} agents[/bold green]")
-    console.print(f"  Sessions:   {overview.session_count}")
-    console.print(f"  Messages:   {overview.message_count}")
-    console.print(f"  Input tok:  {overview.input_tokens:,}")
-    console.print(f"  Output tok: {overview.output_tokens:,}")
-    console.print(f"  Cache read: {overview.cache_read_tokens:,}")
-    console.print(f"  Cache write:{overview.cache_creation_tokens:,}")
-    console.print(f"  [bold yellow]Cost:       ${overview.estimated_cost_usd:.2f}[/bold yellow]")
-    if live_sessions:
-        console.print(f"\n  [dim]Live sessions: {len(live_sessions)} | "
-                       f"Output: {live_out:,} | Cost: ${live_cost:.2f}[/dim]\n")
+    table = Table(title=f"Today's Overview  ({overview.date})")
+    table.add_column("Agent", style="magenta")
+    table.add_column("Sessions", justify="right")
+    table.add_column("Turns", justify="right")
+    table.add_column("Messages", justify="right")
+    table.add_column("Tokens", justify="right")
+    table.add_column("Cost", justify="right", style="yellow")
 
     if overview.by_agent:
-        table = Table(title="Per-Agent Breakdown")
-        table.add_column("Agent", style="magenta")
-        table.add_column("Sessions", justify="right")
-        table.add_column("Messages", justify="right")
-        table.add_column("Input", justify="right")
-        table.add_column("Output", justify="right")
-        table.add_column("Cost", justify="right", style="yellow")
-
         for agent, data in overview.by_agent.items():
+            total_tokens = data["input_tokens"] + data["output_tokens"]
             table.add_row(
                 agent,
                 str(data["session_count"]),
+                str(data["turns"]),
                 str(data["message_count"]),
-                f"{data['input_tokens']:,}",
-                f"{data['output_tokens']:,}",
+                _fmt_tokens(total_tokens),
                 f"${data['cost']:.2f}",
             )
+        table.add_section()
 
-        console.print(table)
-    else:
-        console.print("  No data recorded yet for today.")
+    active_str = f" ([green]{overview.active_agents} active[/green])" if overview.active_agents else ""
+    table.add_row(
+        "[bold]Total[/bold]",
+        f"[bold]{overview.session_count}[/bold]{active_str}",
+        f"[bold]{overview.tool_call_count}[/bold]",
+        f"[bold]{overview.message_count}[/bold]",
+        f"[bold]{_fmt_tokens(overview.total_tokens)}[/bold]",
+        f"[bold yellow]${overview.estimated_cost_usd:.2f}[/bold yellow]",
+    )
+
+    console.print(table)
 
 
 @app.command()
@@ -157,31 +155,48 @@ def history(
     registry.sync_all(db)
 
     trends = aggregator.get_daily_trends(db, days=days)
+
+    # Merge live data into today's row
+    from datetime import datetime
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    overview = aggregator.get_today_overview(db)
+    today_sessions = aggregator.get_today_sessions(db)
+    live_sessions = registry.get_live_sessions()
+    aggregator.merge_live_into_overview(overview, live_sessions, today_sessions)
     db.close()
 
-    if not trends:
+    if not trends and not overview.session_count:
         console.print("No history data available.")
         return
 
     table = Table(title=f"Daily Trends (last {days} days)")
     table.add_column("Date", style="cyan")
     table.add_column("Sessions", justify="right")
+    table.add_column("Turns", justify="right")
     table.add_column("Messages", justify="right")
-    table.add_column("Input", justify="right")
-    table.add_column("Output", justify="right")
-    table.add_column("Cache Read", justify="right")
+    table.add_column("Tokens", justify="right")
     table.add_column("Cost", justify="right", style="yellow")
 
     for t in trends:
-        table.add_row(
-            t.date,
-            str(t.session_count),
-            str(t.message_count),
-            f"{t.input_tokens:,}",
-            f"{t.output_tokens:,}",
-            f"{t.cache_read_tokens:,}",
-            f"${t.estimated_cost_usd:.2f}",
-        )
+        if t.date == today_str:
+            # Use live-merged overview for today
+            table.add_row(
+                t.date,
+                str(overview.session_count),
+                str(overview.tool_call_count),
+                str(overview.message_count),
+                _fmt_tokens(overview.total_tokens),
+                f"${overview.estimated_cost_usd:.2f}",
+            )
+        else:
+            table.add_row(
+                t.date,
+                str(t.session_count),
+                str(t.user_turns),
+                str(t.message_count),
+                _fmt_tokens(t.total_tokens),
+                f"${t.estimated_cost_usd:.2f}",
+            )
 
     console.print(table)
 
@@ -210,6 +225,9 @@ def bar() -> None:
         registry = create_default_registry()
         registry.sync_all(db)
         overview = aggregator.get_today_overview(db)
+        today_sessions = aggregator.get_today_sessions(db)
+        live_sessions = registry.get_live_sessions()
+        aggregator.merge_live_into_overview(overview, live_sessions, today_sessions)
         db.close()
     except Exception:
         print("AM: --")
