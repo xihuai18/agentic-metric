@@ -267,8 +267,12 @@ class AgenticMetricApp(App):
         self.run_worker(self._sync_worker, thread=True)
 
     async def _sync_worker(self) -> None:
-        self._collectors.sync_all(self._db)
-        self._db.commit()
+        db = Database()
+        try:
+            self._collectors.sync_all(db)
+            db.commit()
+        finally:
+            db.close()
         self.call_from_thread(self._refresh_all)
 
     def _refresh_all(self) -> None:
