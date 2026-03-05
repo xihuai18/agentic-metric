@@ -27,18 +27,18 @@ A local-only monitoring tool for AI coding agents. Track token usage and costs a
 | Model | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Input tokens | ✓ | ✓ | ✓¹ | ✓ | ✓ |
 | Output tokens | ✓ | ✓ | ✓¹ | ✓ | ✓ |
-| Cache tokens | ✓ | ✓³ | ✗ | ✓³ | ✓³ |
+| Cache tokens | ✓ | ✓² | ✗ | ✓² | ✓² |
 | User turns | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Message count | ✓ | ✓ | ✓ | ✓ | ✓ |
 | First/last prompt | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Cost estimation | ✓ | ✓ | ✓¹ | ✓ | ✓ |
-| Live active status | ✓ | ✓ | ✓² | ✓ | ✓ |
+| Live active status | ✓ | ✓ | ✓³ | ✓ | ✓ |
 
 > ¹ VS Code legacy JSON sessions (older Copilot versions) do not contain token data; only newer JSONL sessions are supported.
 >
-> ² VS Code live status is process-level only; cannot match to a specific Copilot Chat session.
+> ² Cache read tokens only; cache write data is not exposed.
 >
-> ³ Cache read tokens only; cache write data is not exposed.
+> ³ VS Code live status is process-level only; cannot match to a specific Copilot Chat session.
 
 ## Installation
 

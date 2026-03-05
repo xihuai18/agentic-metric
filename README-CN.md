@@ -27,18 +27,18 @@
 | 模型名称 | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Input tokens | ✓ | ✓ | ✓¹ | ✓ | ✓ |
 | Output tokens | ✓ | ✓ | ✓¹ | ✓ | ✓ |
-| Cache tokens | ✓ | ✓³ | ✗ | ✓³ | ✓³ |
+| Cache tokens | ✓ | ✓² | ✗ | ✓² | ✓² |
 | 用户轮次 | ✓ | ✓ | ✓ | ✓ | ✓ |
 | 消息总数 | ✓ | ✓ | ✓ | ✓ | ✓ |
 | 首条/末条 prompt | ✓ | ✓ | ✓ | ✓ | ✓ |
 | 成本估算 | ✓ | ✓ | ✓¹ | ✓ | ✓ |
-| 实时活跃状态 | ✓ | ✓ | ✓² | ✓ | ✓ |
+| 实时活跃状态 | ✓ | ✓ | ✓³ | ✓ | ✓ |
 
 > ¹ VS Code 旧版 JSON 格式会话（早期 Copilot 版本）不含 token 数据，仅新版 JSONL 格式可统计。
 >
-> ² VS Code 仅支持进程级检测，无法匹配到具体的 Copilot Chat 会话。
+> ² 仅支持 cache read tokens，cache write 数据不暴露。
 >
-> ³ 仅支持 cache read tokens，cache write 数据不暴露。
+> ³ VS Code 仅支持进程级检测，无法匹配到具体的 Copilot Chat 会话。
 
 ## 数据来源
 
