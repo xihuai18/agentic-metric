@@ -17,7 +17,7 @@
 - **TUI 仪表盘** — 终端图形界面，实时刷新（1 秒），含 token 堆叠图和趋势折线图
 - **多 Agent 支持** — 插件架构，已支持 Claude Code、Codex、OpenCode、Qwen Code、VS Code，可扩展
 
-## 各 Agent 统计口径差异
+## 各 Agent 指标覆盖情况
 
 | 字段 | Claude Code | Codex | VS Code (Copilot) | OpenCode | Qwen Code |
 |------|:-----------:|:-----:|:-----------------:|:--------:|:---------:|
