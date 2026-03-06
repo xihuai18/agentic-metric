@@ -2,11 +2,13 @@
 
 [English](README.md)
 
-本地化的 AI coding agent 指标监控工具。追踪 Claude Code、Codex、OpenCode、Qwen Code、VS Code (Copilot Chat) 等 agent 的 token 用量和成本，提供 TUI 仪表盘和 CLI 命令。
+本地化的 AI coding agent 指标监控工具 — 类似 `top`，但监控的是你的 coding agent。追踪 Claude Code、Codex、OpenCode、Qwen Code、VS Code (Copilot Chat) 等 agent 的 token 用量和成本，提供 TUI 仪表盘和 CLI 命令。
 
 **支持平台：Linux 和 macOS。**
 
 **所有数据完全存储在本地，使用过程不会联网。** 工具仅读取本机的 agent 数据文件（如 `~/.claude/`）和进程信息，不发送任何数据到外部服务器。
+
+![Agentic Metric TUI](screenshot.png)
 
 ## 功能
 
@@ -42,6 +44,8 @@
 
 ## 安装
 
+需要 Python 3.10+。
+
 ```bash
 pip install agentic-metric
 ```
@@ -49,6 +53,7 @@ pip install agentic-metric
 ## 使用
 
 ```bash
+agentic-metric                 # 启动 TUI 仪表盘（无参数时默认启动）
 agentic-metric status          # 查看当前活跃的 agent
 agentic-metric today           # 今日用量概览
 agentic-metric history         # 历史趋势（默认 30 天）

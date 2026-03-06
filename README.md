@@ -2,11 +2,13 @@
 
 [中文文档](README-CN.md)
 
-A local-only monitoring tool for AI coding agents. Track token usage and costs across Claude Code, Codex, OpenCode, Qwen Code, VS Code (Copilot Chat), and more — with a TUI dashboard and CLI.
+A local-only monitoring tool for AI coding agents — like `top`, but for your coding agents. Track token usage and costs across Claude Code, Codex, OpenCode, Qwen Code, VS Code (Copilot Chat), and more — with a TUI dashboard and CLI.
 
 **Supported platforms: Linux and macOS.**
 
 **All data stays on your machine. No network requests, no telemetry, no data leaves your computer.** The tool only reads local agent data files (e.g. `~/.claude/`) and process info.
+
+![Agentic Metric TUI](screenshot.png)
 
 ## Features
 
@@ -42,6 +44,8 @@ A local-only monitoring tool for AI coding agents. Track token usage and costs a
 
 ## Installation
 
+Requires Python 3.10+.
+
 ```bash
 pip install agentic-metric
 ```
@@ -49,6 +53,7 @@ pip install agentic-metric
 ## Usage
 
 ```bash
+agentic-metric                 # Launch TUI dashboard (default when no command given)
 agentic-metric status          # Show currently active agents
 agentic-metric today           # Today's usage overview
 agentic-metric history         # Historical trends (default 30 days)
