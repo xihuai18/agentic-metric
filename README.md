@@ -50,6 +50,14 @@ Requires Python 3.10+.
 pip install agentic-metric
 ```
 
+Or with [uv](https://docs.astral.sh/uv/):
+
+```bash
+uvx agentic-metric              # Run directly without installing
+uv tool install agentic-metric   # Or install persistently
+uv tool upgrade agentic-metric   # Upgrade to latest version
+```
+
 ## Usage
 
 ```bash

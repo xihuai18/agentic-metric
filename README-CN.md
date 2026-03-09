@@ -50,6 +50,14 @@
 pip install agentic-metric
 ```
 
+或使用 [uv](https://docs.astral.sh/uv/)：
+
+```bash
+uvx agentic-metric              # 直接运行，无需安装
+uv tool install agentic-metric   # 持久安装
+uv tool upgrade agentic-metric   # 升级到最新版
+```
+
 ## 使用
 
 ```bash
