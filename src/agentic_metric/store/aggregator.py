@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 from ..models import DailyTrend, LiveSession, TodayOverview
-from ..pricing import estimate_session_cost
+from ..pricing import estimate_cost, estimate_session_cost
 from .database import Database
 
 
@@ -98,34 +98,100 @@ def merge_live_into_overview(
                     ba["output_tokens"] = ba.get("output_tokens", 0) + d_out
                     ba["cost"] = ba.get("cost", 0) + d_cost
         else:
+            # Use today-only values for cross-day sessions
+            t_turns = ls.today_user_turns if ls.today_user_turns >= 0 else ls.user_turns
+            t_msgs = ls.today_message_count if ls.today_message_count >= 0 else ls.message_count
+            t_in = ls.today_input_tokens if ls.today_input_tokens >= 0 else ls.input_tokens
+            t_out = ls.today_output_tokens if ls.today_output_tokens >= 0 else ls.output_tokens
+            t_cr = ls.today_cache_read_tokens if ls.today_cache_read_tokens >= 0 else ls.cache_read_tokens
+            t_cw = ls.today_cache_creation_tokens if ls.today_cache_creation_tokens >= 0 else ls.cache_creation_tokens
+            t_cost = estimate_cost(ls.model, t_in, t_out, t_cr, t_cw)
+
             if ls.user_turns == 0 and ls.output_tokens == 0:
                 continue
             overview.session_count += 1
-            overview.message_count += ls.message_count
-            overview.tool_call_count += ls.user_turns
-            overview.input_tokens += ls.input_tokens
-            overview.output_tokens += ls.output_tokens
-            overview.cache_read_tokens += ls.cache_read_tokens
-            overview.cache_creation_tokens += ls.cache_creation_tokens
-            overview.estimated_cost_usd += cost
+            overview.message_count += t_msgs
+            overview.tool_call_count += t_turns
+            overview.input_tokens += t_in
+            overview.output_tokens += t_out
+            overview.cache_read_tokens += t_cr
+            overview.cache_creation_tokens += t_cw
+            overview.estimated_cost_usd += t_cost
 
             ba = overview.by_agent.get(at)
             if ba:
                 ba["session_count"] = ba.get("session_count", 0) + 1
-                ba["turns"] = ba.get("turns", 0) + ls.user_turns
-                ba["message_count"] = ba.get("message_count", 0) + ls.message_count
-                ba["input_tokens"] = ba.get("input_tokens", 0) + ls.input_tokens
-                ba["output_tokens"] = ba.get("output_tokens", 0) + ls.output_tokens
-                ba["cost"] = ba.get("cost", 0) + cost
+                ba["turns"] = ba.get("turns", 0) + t_turns
+                ba["message_count"] = ba.get("message_count", 0) + t_msgs
+                ba["input_tokens"] = ba.get("input_tokens", 0) + t_in
+                ba["output_tokens"] = ba.get("output_tokens", 0) + t_out
+                ba["cost"] = ba.get("cost", 0) + t_cost
             else:
                 overview.by_agent[at] = {
                     "session_count": 1,
-                    "turns": ls.user_turns,
-                    "message_count": ls.message_count,
-                    "input_tokens": ls.input_tokens,
-                    "output_tokens": ls.output_tokens,
-                    "cost": cost,
+                    "turns": t_turns,
+                    "message_count": t_msgs,
+                    "input_tokens": t_in,
+                    "output_tokens": t_out,
+                    "cost": t_cost,
                 }
+
+
+def merge_live_into_trends(
+    trends: list[DailyTrend],
+    live_sessions: list[LiveSession],
+    today_sessions: list[dict],
+) -> None:
+    """Merge live session data into daily trends for today's entry.
+
+    Same logic as merge_live_into_overview but operates on the trend list.
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    # Find or create today's entry (trends are ordered DESC)
+    today_trend = None
+    for t in trends:
+        if t.date == today:
+            today_trend = t
+            break
+    if today_trend is None:
+        today_trend = DailyTrend(date=today)
+        trends.insert(0, today_trend)
+
+    db_ids = {s["session_id"] for s in today_sessions}
+    db_by_id = {s["session_id"]: s for s in today_sessions}
+
+    for ls in live_sessions:
+        if ls.session_id in db_ids:
+            db_s = db_by_id[ls.session_id]
+            if ls.output_tokens > 0:
+                today_trend.user_turns += max(0, ls.user_turns - (db_s["user_turns"] or 0))
+                today_trend.message_count += max(0, ls.message_count - (db_s["message_count"] or 0))
+                today_trend.input_tokens += max(0, ls.input_tokens - (db_s["input_tokens"] or 0))
+                today_trend.output_tokens += max(0, ls.output_tokens - (db_s["output_tokens"] or 0))
+                today_trend.cache_read_tokens += max(0, ls.cache_read_tokens - (db_s["cache_read_tokens"] or 0))
+                today_trend.cache_creation_tokens += max(0, ls.cache_creation_tokens - (db_s["cache_creation_tokens"] or 0))
+                d_cost = max(0, estimate_session_cost(ls) - (db_s["estimated_cost_usd"] or 0))
+                today_trend.estimated_cost_usd += d_cost
+        else:
+            if ls.user_turns == 0 and ls.output_tokens == 0:
+                continue
+            t_turns = ls.today_user_turns if ls.today_user_turns >= 0 else ls.user_turns
+            t_msgs = ls.today_message_count if ls.today_message_count >= 0 else ls.message_count
+            t_in = ls.today_input_tokens if ls.today_input_tokens >= 0 else ls.input_tokens
+            t_out = ls.today_output_tokens if ls.today_output_tokens >= 0 else ls.output_tokens
+            t_cr = ls.today_cache_read_tokens if ls.today_cache_read_tokens >= 0 else ls.cache_read_tokens
+            t_cw = ls.today_cache_creation_tokens if ls.today_cache_creation_tokens >= 0 else ls.cache_creation_tokens
+            t_cost = estimate_cost(ls.model, t_in, t_out, t_cr, t_cw)
+
+            today_trend.session_count += 1
+            today_trend.user_turns += t_turns
+            today_trend.message_count += t_msgs
+            today_trend.input_tokens += t_in
+            today_trend.output_tokens += t_out
+            today_trend.cache_read_tokens += t_cr
+            today_trend.cache_creation_tokens += t_cw
+            today_trend.estimated_cost_usd += t_cost
 
 
 def get_daily_trends(db: Database, days: int = 30) -> list[DailyTrend]:

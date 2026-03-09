@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 
 from ..config import QWEN_PROJECTS_DIR
@@ -39,6 +40,11 @@ class _SessionAccum:
         "last_prompt",
         "git_branch",
         "model",
+        "today_user_turns",
+        "today_message_count",
+        "today_input_tokens",
+        "today_output_tokens",
+        "today_cache_read",
     )
 
     def __init__(self, file_path: Path, project_path: str, pid: int = 0) -> None:
@@ -58,6 +64,11 @@ class _SessionAccum:
         self.last_prompt = ""
         self.git_branch = ""
         self.model = ""
+        self.today_user_turns = 0
+        self.today_message_count = 0
+        self.today_input_tokens = 0
+        self.today_output_tokens = 0
+        self.today_cache_read = 0
 
     def read_new_lines(self) -> None:
         """Read only bytes appended since last call."""
@@ -72,6 +83,7 @@ class _SessionAccum:
         except OSError:
             return
 
+        today_str = datetime.now().strftime("%Y-%m-%d")
         for raw_line in new_data.split(b"\n"):
             raw_line = raw_line.strip()
             if not raw_line:
@@ -80,14 +92,25 @@ class _SessionAccum:
                 entry = json.loads(raw_line)
             except (json.JSONDecodeError, UnicodeDecodeError):
                 continue
-            self._process_entry(entry)
+            self._process_entry(entry, today_str)
 
-    def _process_entry(self, entry: dict) -> None:
+    @staticmethod
+    def _ts_local_date(ts: str) -> str:
+        """Convert ISO timestamp to local date string YYYY-MM-DD."""
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            return dt.astimezone().strftime("%Y-%m-%d")
+        except (ValueError, TypeError):
+            return ts[:10] if len(ts) >= 10 else ""
+
+    def _process_entry(self, entry: dict, today_str: str) -> None:
         ts = entry.get("timestamp", "")
         if ts:
             if not self.first_ts:
                 self.first_ts = ts
             self.last_ts = ts
+
+        is_today = self._ts_local_date(ts) == today_str if ts else True
 
         if not self.git_branch:
             self.git_branch = entry.get("gitBranch", "")
@@ -97,6 +120,9 @@ class _SessionAccum:
         if entry_type == "user":
             self.user_turns += 1
             self.message_count += 1
+            if is_today:
+                self.today_user_turns += 1
+                self.today_message_count += 1
             msg = entry.get("message", {})
             parts = msg.get("parts", []) if isinstance(msg, dict) else []
             for part in parts:
@@ -112,14 +138,23 @@ class _SessionAccum:
 
         elif entry_type == "assistant":
             self.message_count += 1
+            if is_today:
+                self.today_message_count += 1
             if not self.model:
                 self.model = entry.get("model", "")
 
         elif entry_type == "system" and entry.get("subtype") == "ui_telemetry":
             payload = entry.get("systemPayload", {}).get("uiEvent", {})
-            self.input_tokens += payload.get("input_token_count", 0)
-            self.output_tokens += payload.get("output_token_count", 0)
-            self.cache_read += payload.get("cached_content_token_count", 0)
+            inp = payload.get("input_token_count", 0)
+            out = payload.get("output_token_count", 0)
+            cr = payload.get("cached_content_token_count", 0)
+            self.input_tokens += inp
+            self.output_tokens += out
+            self.cache_read += cr
+            if is_today:
+                self.today_input_tokens += inp
+                self.today_output_tokens += out
+                self.today_cache_read += cr
             if not self.model:
                 self.model = payload.get("model", "")
 
@@ -141,6 +176,12 @@ class _SessionAccum:
             first_prompt=self.first_prompt,
             last_prompt=self.last_prompt,
             pid=self.pid,
+            today_input_tokens=self.today_input_tokens,
+            today_output_tokens=self.today_output_tokens,
+            today_cache_read_tokens=self.today_cache_read,
+            today_cache_creation_tokens=0,
+            today_user_turns=self.today_user_turns,
+            today_message_count=self.today_message_count,
         )
 
 

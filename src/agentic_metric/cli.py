@@ -156,17 +156,12 @@ def history(
     registry.sync_all(db)
 
     trends = aggregator.get_daily_trends(db, days=days)
-
-    # Merge live data into today's row
-    from datetime import datetime
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    overview = aggregator.get_today_overview(db)
     today_sessions = aggregator.get_today_sessions(db)
     live_sessions = registry.get_live_sessions()
-    aggregator.merge_live_into_overview(overview, live_sessions, today_sessions)
+    aggregator.merge_live_into_trends(trends, live_sessions, today_sessions)
     db.close()
 
-    if not trends and not overview.session_count:
+    if not trends:
         console.print("No history data available.")
         return
 
@@ -179,25 +174,14 @@ def history(
     table.add_column("Cost", justify="right", style="yellow")
 
     for t in trends:
-        if t.date == today_str:
-            # Use live-merged overview for today
-            table.add_row(
-                t.date,
-                str(overview.session_count),
-                str(overview.tool_call_count),
-                str(overview.message_count),
-                _fmt_tokens(overview.total_tokens),
-                f"${overview.estimated_cost_usd:.2f}",
-            )
-        else:
-            table.add_row(
-                t.date,
-                str(t.session_count),
-                str(t.user_turns),
-                str(t.message_count),
-                _fmt_tokens(t.total_tokens),
-                f"${t.estimated_cost_usd:.2f}",
-            )
+        table.add_row(
+            t.date,
+            str(t.session_count),
+            str(t.user_turns),
+            str(t.message_count),
+            _fmt_tokens(t.total_tokens),
+            f"${t.estimated_cost_usd:.2f}",
+        )
 
     console.print(table)
 

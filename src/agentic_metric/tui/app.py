@@ -9,11 +9,16 @@ from textual_plotext import PlotextPlot
 
 from ..collectors import CollectorRegistry, create_default_registry
 from ..config import DATA_SYNC_INTERVAL, LIVE_REFRESH_INTERVAL
-from ..models import LiveSession
-from ..pricing import estimate_session_cost
-from ..store.aggregator import get_daily_trends, get_today_overview, get_today_sessions, merge_live_into_overview
+from ..models import DailyTrend, LiveSession
+from ..pricing import estimate_cost, estimate_session_cost
+from ..store.aggregator import get_daily_trends, get_today_overview, get_today_sessions, merge_live_into_overview, merge_live_into_trends
 from ..store.database import Database
 from .widgets import TodaySummary, fmt_cost, fmt_tokens, ts_to_local
+
+
+def _truncate(text: str, max_len: int) -> str:
+    """Truncate text with ellipsis if it exceeds *max_len*."""
+    return (text[:max_len - 1] + "…") if len(text) > max_len else text
 
 
 class AgenticMetricApp(App):
@@ -124,8 +129,8 @@ class AgenticMetricApp(App):
                 agent_type_marked.add(agent)
             status = "[green]●[/]" if is_active else "[dim]○[/]"
             agent = s["agent_type"] or ""
-            project = (s["project_path"] or "").rsplit("/", 1)[-1]
-            branch = s["git_branch"] or ""
+            project = _truncate((s["project_path"] or "").rsplit("/", 1)[-1], 18)
+            branch = _truncate(s["git_branch"] or "", 16)
             # For active sessions with live token data, prefer live values
             live = live_by_id.get(sid)
             if live and live.output_tokens > 0:
@@ -161,17 +166,23 @@ class AgenticMetricApp(App):
             # Skip process-only sessions with no actual data
             if ls.user_turns == 0 and ls.output_tokens == 0:
                 continue
-            cost = estimate_session_cost(ls)
-            project = ls.project_path.rsplit("/", 1)[-1] if ls.project_path else ""
-            total_tokens = ls.input_tokens + ls.output_tokens + ls.cache_read_tokens + ls.cache_creation_tokens
+            # Use today-only values for cross-day sessions
+            t_turns = ls.today_user_turns if ls.today_user_turns >= 0 else ls.user_turns
+            t_out = ls.today_output_tokens if ls.today_output_tokens >= 0 else ls.output_tokens
+            t_in = ls.today_input_tokens if ls.today_input_tokens >= 0 else ls.input_tokens
+            t_cr = ls.today_cache_read_tokens if ls.today_cache_read_tokens >= 0 else ls.cache_read_tokens
+            t_cw = ls.today_cache_creation_tokens if ls.today_cache_creation_tokens >= 0 else ls.cache_creation_tokens
+            cost = estimate_cost(ls.model, t_in, t_out, t_cr, t_cw)
+            project = _truncate(ls.project_path.rsplit("/", 1)[-1], 18) if ls.project_path else ""
+            total_tokens = t_in + t_out + t_cr + t_cw
             prompt_raw = ls.last_prompt or ls.first_prompt or ""
             prompt = (prompt_raw[:40] + "…") if len(prompt_raw) > 40 else prompt_raw
             active_rows.append((
                 "[green]●[/]",
                 ls.agent_type or "",
                 project,
-                ls.git_branch or "",
-                str(ls.user_turns),
+                _truncate(ls.git_branch or "", 16),
+                str(t_turns),
                 fmt_tokens(total_tokens),
                 fmt_cost(cost),
                 (ls.model or "").split("-20")[0],
@@ -187,12 +198,13 @@ class AgenticMetricApp(App):
     # ── History ───────────────────────────────────────────────────────
 
     def _populate_history(self) -> None:
-        self._draw_trend_chart()
-        self._populate_daily_table()
-
-    def _draw_trend_chart(self) -> None:
-        """Line chart of daily tokens and cost over the last 30 days."""
         trends = get_daily_trends(self._db, days=30)
+        merge_live_into_trends(trends, self._live_sessions, self._today_sessions)
+        self._draw_trend_chart(trends)
+        self._populate_daily_table(trends)
+
+    def _draw_trend_chart(self, trends: list[DailyTrend]) -> None:
+        """Line chart of daily tokens and cost over the last 30 days."""
         plot_widget = self.query_one("#trend-chart", PlotextPlot)
         plt = plot_widget.plt
         plt.clear_figure()
@@ -203,10 +215,10 @@ class AgenticMetricApp(App):
             plot_widget.refresh()
             return
 
-        trends = list(reversed(trends))  # oldest → newest for chart
-        dates = [t.date[5:] for t in trends]  # MM-DD
-        raw_tokens = [t.total_tokens for t in trends]
-        cost_vals = [t.estimated_cost_usd for t in trends]
+        ordered = list(reversed(trends))  # oldest → newest for chart
+        dates = [t.date[5:] for t in ordered]  # MM-DD
+        raw_tokens = [t.total_tokens for t in ordered]
+        cost_vals = [t.estimated_cost_usd for t in ordered]
         xs = list(range(len(dates)))
 
         max_tok = max(raw_tokens) if raw_tokens else 0
@@ -227,8 +239,7 @@ class AgenticMetricApp(App):
         plt.xlabel("Date")
         plot_widget.refresh()
 
-    def _populate_daily_table(self) -> None:
-        trends = get_daily_trends(self._db, days=30)
+    def _populate_daily_table(self, trends: list[DailyTrend]) -> None:
         table = self.query_one("#daily-table", DataTable)
         table.clear(columns=True)
         table.add_columns("Date", "Sessions", "Messages", "Tokens", "Cost", "Agent")
@@ -279,10 +290,7 @@ class AgenticMetricApp(App):
     def _refresh_all(self) -> None:
         self._today_sessions = get_today_sessions(self._db)
         self._populate_dashboard()
-        self._draw_trend_chart()
-        daily_table = self.query_one("#daily-table", DataTable)
-        daily_table.clear(columns=True)
-        self._populate_daily_table()
+        self._populate_history()
 
     # ── Actions ───────────────────────────────────────────────────────
 
@@ -290,10 +298,7 @@ class AgenticMetricApp(App):
         self._collectors.sync_all(self._db)
         self._db.commit()
         self._populate_dashboard()
-        self._draw_trend_chart()
-        daily_table = self.query_one("#daily-table", DataTable)
-        daily_table.clear(columns=True)
-        self._populate_daily_table()
+        self._populate_history()
         self.notify("Data refreshed")
 
     def on_unmount(self) -> None:

@@ -26,6 +26,13 @@ class LiveSession:
     first_prompt: str = ""
     last_prompt: str = ""
     pid: int = 0
+    # Today-only counters (for cross-day sessions; equal to totals if started today)
+    today_input_tokens: int = -1
+    today_output_tokens: int = -1
+    today_cache_read_tokens: int = -1
+    today_cache_creation_tokens: int = -1
+    today_user_turns: int = -1
+    today_message_count: int = -1
 
     @property
     def total_tokens(self) -> int:
@@ -34,6 +41,17 @@ class LiveSession:
             + self.output_tokens
             + self.cache_read_tokens
             + self.cache_creation_tokens
+        )
+
+    @property
+    def today_total_tokens(self) -> int:
+        if self.today_input_tokens < 0:
+            return self.total_tokens
+        return (
+            self.today_input_tokens
+            + self.today_output_tokens
+            + self.today_cache_read_tokens
+            + self.today_cache_creation_tokens
         )
 
     @property

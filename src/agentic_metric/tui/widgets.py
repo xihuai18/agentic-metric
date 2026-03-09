@@ -29,12 +29,17 @@ def fmt_cost(usd: float) -> str:
 
 
 def ts_to_local(ts: str) -> str:
-    """Convert an ISO-8601 timestamp to a short local-time string."""
+    """Convert an ISO-8601 timestamp to a short local-time string.
+
+    Shows ``HH:MM`` for today, ``MM-DD HH:MM`` for other days.
+    """
     if not ts:
         return ""
     try:
         dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
-        return dt.strftime("%H:%M")
+        if dt.date() == datetime.now().astimezone().date():
+            return dt.strftime("%H:%M")
+        return dt.strftime("%m-%d %H:%M")
     except (ValueError, TypeError):
         return ts[:16]
 

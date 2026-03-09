@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime
 from pathlib import Path
 
 from ..config import PROJECTS_DIR
@@ -64,6 +65,12 @@ class _SessionAccum:
         "last_prompt",
         "git_branch",
         "model",
+        "today_user_turns",
+        "today_message_count",
+        "today_input_tokens",
+        "today_output_tokens",
+        "today_cache_read",
+        "today_cache_create",
     )
 
     def __init__(self, file_path: Path, project_path: str, pid: int = 0) -> None:
@@ -84,6 +91,12 @@ class _SessionAccum:
         self.last_prompt = ""
         self.git_branch = ""
         self.model = ""
+        self.today_user_turns = 0
+        self.today_message_count = 0
+        self.today_input_tokens = 0
+        self.today_output_tokens = 0
+        self.today_cache_read = 0
+        self.today_cache_create = 0
 
     def read_new_lines(self) -> None:
         """Read only bytes appended since last call."""
@@ -98,6 +111,7 @@ class _SessionAccum:
         except OSError:
             return
 
+        today_str = datetime.now().strftime("%Y-%m-%d")
         for raw_line in new_data.split(b"\n"):
             raw_line = raw_line.strip()
             if not raw_line:
@@ -106,15 +120,25 @@ class _SessionAccum:
                 entry = json.loads(raw_line)
             except (json.JSONDecodeError, UnicodeDecodeError):
                 continue
-            self._process_entry(entry)
+            self._process_entry(entry, today_str)
 
-    def _process_entry(self, entry: dict) -> None:
+    @staticmethod
+    def _ts_local_date(ts: str) -> str:
+        """Convert ISO timestamp to local date string YYYY-MM-DD."""
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            return dt.astimezone().strftime("%Y-%m-%d")
+        except (ValueError, TypeError):
+            return ts[:10] if len(ts) >= 10 else ""
+
+    def _process_entry(self, entry: dict, today_str: str) -> None:
         ts = entry.get("timestamp", "")
         if ts:
             if not self.first_ts:
                 self.first_ts = ts
             self.last_ts = ts
 
+        is_today = self._ts_local_date(ts) == today_str if ts else True
         entry_type = entry.get("type", "")
 
         if entry_type == "user":
@@ -130,6 +154,9 @@ class _SessionAccum:
             if not is_tool_result:
                 self.user_turns += 1
                 self.message_count += 1
+                if is_today:
+                    self.today_user_turns += 1
+                    self.today_message_count += 1
                 if isinstance(content, str):
                     clean = _extract_prompt(content)
                     if clean:
@@ -139,13 +166,24 @@ class _SessionAccum:
 
         elif entry_type == "assistant":
             self.message_count += 1
+            if is_today:
+                self.today_message_count += 1
             msg = entry.get("message", {})
             usage = msg.get("usage", {}) if isinstance(msg, dict) else {}
             if usage:
-                self.input_tokens += usage.get("input_tokens", 0)
-                self.output_tokens += usage.get("output_tokens", 0)
-                self.cache_read += usage.get("cache_read_input_tokens", 0)
-                self.cache_create += usage.get("cache_creation_input_tokens", 0)
+                inp = usage.get("input_tokens", 0)
+                out = usage.get("output_tokens", 0)
+                cr = usage.get("cache_read_input_tokens", 0)
+                cw = usage.get("cache_creation_input_tokens", 0)
+                self.input_tokens += inp
+                self.output_tokens += out
+                self.cache_read += cr
+                self.cache_create += cw
+                if is_today:
+                    self.today_input_tokens += inp
+                    self.today_output_tokens += out
+                    self.today_cache_read += cr
+                    self.today_cache_create += cw
             if not self.model and isinstance(msg, dict):
                 self.model = msg.get("model", "")
 
@@ -167,6 +205,12 @@ class _SessionAccum:
             first_prompt=self.first_prompt,
             last_prompt=self.last_prompt,
             pid=self.pid,
+            today_input_tokens=self.today_input_tokens,
+            today_output_tokens=self.today_output_tokens,
+            today_cache_read_tokens=self.today_cache_read,
+            today_cache_creation_tokens=self.today_cache_create,
+            today_user_turns=self.today_user_turns,
+            today_message_count=self.today_message_count,
         )
 
 
