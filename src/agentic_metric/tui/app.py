@@ -107,10 +107,12 @@ class AgenticMetricApp(App):
         live_ids = self._get_live_session_ids()
         live_by_id = {s.session_id: s for s in self._live_sessions}
         db_ids = {s["session_id"] for s in self._today_sessions}
-        # Agent types with live processes but no session-level ID matching
-        live_agent_types = {s.agent_type for s in self._live_sessions} - {
-            s.agent_type for s in self._live_sessions if s.session_id in db_ids
-        }
+        # Agent types with only process-level detection (PID-based session IDs
+        # like "vscode-1234" that never match real DB session IDs)
+        live_agent_types: set[str] = set()
+        for s in self._live_sessions:
+            if s.pid and s.session_id == f"{s.agent_type}-{s.pid}":
+                live_agent_types.add(s.agent_type)
         # Track: mark only the latest (first seen) session per agent type
         agent_type_marked: set[str] = set()
 
