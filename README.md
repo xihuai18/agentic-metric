@@ -13,7 +13,7 @@ A local-only monitoring tool for AI coding agents — like `top`, but for your c
 ## Features
 
 - **Live monitoring** — Detect running agent processes, incremental JSONL session parsing
-- **Cost estimation** — Per-model pricing table, calculates API-equivalent costs
+- **Cost estimation** — Per-model pricing table with CLI management, calculates API-equivalent costs
 - **Today overview** — Sessions, token usage, and cost summary for the current day
 - **Historical trends** — 30-day daily token/cost trends
 - **TUI dashboard** — Terminal UI with 1-second live refresh, stacked token charts, and trend lines
@@ -61,7 +61,22 @@ agentic-metric history -d 7    # Last 7 days
 agentic-metric sync            # Force sync data to local database
 agentic-metric tui             # Launch TUI dashboard
 agentic-metric bar             # One-line summary for status bars
+agentic-metric pricing         # Manage model pricing
 ```
+
+### Pricing Management
+
+Model pricing is used for cost estimation. Builtin pricing is included for common models. You can add new models or override existing prices via CLI — overrides are stored in `$DATA/agentic_metric/pricing.json`.
+
+```bash
+agentic-metric pricing list                                    # List all model pricing
+agentic-metric pricing set deepseek-r2 -i 0.5 -o 2.0          # Add a new model
+agentic-metric pricing set claude-opus-4-6 -i 4.0 -o 20.0 -cr 0.4 -cw 5.0  # Override builtin
+agentic-metric pricing reset deepseek-r2                       # Reset a model to builtin default
+agentic-metric pricing reset --all                             # Reset all overrides
+```
+
+For unknown models, pricing falls back by model family (e.g. `claude-sonnet-*` uses Sonnet pricing) before using the global default.
 
 ### Status Bar Integration
 

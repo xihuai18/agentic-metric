@@ -13,7 +13,7 @@
 ## 功能
 
 - **实时监控** — 检测运行中的 agent 进程，增量解析 JSONL 会话数据
-- **成本估算** — 基于各模型定价表计算 API 等效成本
+- **成本估算** — 基于各模型定价表计算 API 等效成本，支持 CLI 管理定价
 - **今日概览** — 当天的 session 数、token 用量、花费汇总
 - **历史趋势** — 每日 token/成本的 30 天趋势
 - **TUI 仪表盘** — 终端图形界面，实时刷新（1 秒），含 token 堆叠图和趋势折线图
@@ -61,7 +61,22 @@ agentic-metric history -d 7    # 最近 7 天
 agentic-metric sync            # 强制同步数据到本地数据库
 agentic-metric tui             # 启动 TUI 仪表盘
 agentic-metric bar             # 单行摘要，用于状态栏集成
+agentic-metric pricing         # 管理模型定价
 ```
+
+### 定价管理
+
+模型定价用于成本估算。常见模型已内置定价，你可以通过 CLI 添加新模型或覆盖现有价格 — 用户自定义定价存储在 `$DATA/agentic_metric/pricing.json`。
+
+```bash
+agentic-metric pricing list                                    # 查看所有模型定价
+agentic-metric pricing set deepseek-r2 -i 0.5 -o 2.0          # 添加新模型
+agentic-metric pricing set claude-opus-4-6 -i 4.0 -o 20.0 -cr 0.4 -cw 5.0  # 覆盖内置定价
+agentic-metric pricing reset deepseek-r2                       # 恢复单个模型为内置默认
+agentic-metric pricing reset --all                             # 恢复所有定价为默认
+```
+
+对于未知模型，会按模型族自动匹配定价（如 `claude-sonnet-*` 使用 Sonnet 定价），最后才使用全局默认值。
 
 ### 状态栏集成
 

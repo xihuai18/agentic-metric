@@ -48,6 +48,7 @@ DATA_DIR = (
     else _HOME / ".local" / "share" / "agentic_metric"
 )
 DB_PATH = DATA_DIR / "data.db"
+PRICING_FILE = DATA_DIR / "pricing.json"
 
 # Refresh intervals (seconds)
 LIVE_REFRESH_INTERVAL = 1  # running sessions

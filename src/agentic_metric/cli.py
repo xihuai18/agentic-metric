@@ -15,6 +15,20 @@ app = typer.Typer(
     add_completion=True,
     context_settings={"help_option_names": ["-h", "--help"]},
 )
+pricing_app = typer.Typer(
+    help="View and manage model pricing.",
+    invoke_without_command=True,
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
+app.add_typer(pricing_app, name="pricing")
+
+
+@pricing_app.callback(invoke_without_command=True)
+def _pricing_default(ctx: typer.Context) -> None:
+    """Show help by default."""
+    if ctx.invoked_subcommand is None:
+        console.print(ctx.get_help())
+        raise typer.Exit()
 
 console = Console()
 
@@ -245,3 +259,104 @@ def sync() -> None:
     console.print(f"  Collectors: {len(registry.get_all())}")
     for c in registry.get_all():
         console.print(f"    - {c.agent_type}")
+
+
+# ── pricing subcommands ────────────────────────────────────────────
+
+
+@pricing_app.command("list")
+def pricing_list() -> None:
+    """List all model pricing (builtin + user overrides)."""
+    from .pricing import _BUILTIN_PRICING, _load_user_pricing
+
+    user = _load_user_pricing()
+
+    table = Table(title="Model Pricing (USD per 1M tokens)")
+    table.add_column("Model", style="cyan")
+    table.add_column("Input", justify="right")
+    table.add_column("Output", justify="right")
+    table.add_column("Cache Read", justify="right")
+    table.add_column("Cache Write", justify="right")
+    table.add_column("Source", style="dim")
+
+    # Show all builtin models, marking overrides
+    all_models = dict(_BUILTIN_PRICING)
+    all_models.update(user)
+
+    for model in sorted(all_models):
+        p = all_models[model]
+        if model in user and model in _BUILTIN_PRICING:
+            source = "[yellow]override[/yellow]"
+        elif model in user:
+            source = "[green]custom[/green]"
+        else:
+            source = "builtin"
+        table.add_row(
+            model,
+            f"${p[0]:.3f}",
+            f"${p[1]:.3f}",
+            f"${p[2]:.3f}",
+            f"${p[3]:.3f}",
+            source,
+        )
+
+    console.print(table)
+
+
+@pricing_app.command("set", context_settings={"help_option_names": ["-h", "--help"]})
+def pricing_set(
+    ctx: typer.Context,
+    model: str = typer.Argument(None, help="Model name (e.g. claude-opus-4-6)."),
+    input_price: float = typer.Option(None, "--input", "-i", help="Input price per 1M tokens."),
+    output_price: float = typer.Option(None, "--output", "-o", help="Output price per 1M tokens."),
+    cache_read: float = typer.Option(0.0, "--cache-read", "-cr", help="Cache read price per 1M tokens."),
+    cache_write: float = typer.Option(0.0, "--cache-write", "-cw", help="Cache write price per 1M tokens."),
+) -> None:
+    """Add or update pricing for a model.
+
+    Prices are in USD per 1M tokens.
+    """
+    if model is None or input_price is None or output_price is None:
+        console.print(ctx.get_help())
+        console.print()
+        console.print("[bold]Examples:[/bold]")
+        console.print("  # Add a new model")
+        console.print("  agentic-metric pricing set deepseek-r2 -i 0.5 -o 2.0")
+        console.print()
+        console.print("  # Override builtin pricing")
+        console.print("  agentic-metric pricing set claude-opus-4-6 -i 4.0 -o 20.0 -cr 0.4 -cw 5.0")
+        raise typer.Exit()
+
+    from .pricing import set_user_pricing
+
+    set_user_pricing(model, input_price, output_price, cache_read, cache_write)
+    console.print(
+        f"[green]Set pricing for {model}:[/green] "
+        f"input=${input_price:.3f}  output=${output_price:.3f}  "
+        f"cache_read=${cache_read:.3f}  cache_write=${cache_write:.3f}"
+    )
+
+
+@pricing_app.command("reset")
+def pricing_reset(
+    model: str = typer.Argument(
+        None, help="Model to reset. Omit to reset all.",
+    ),
+    all_models: bool = typer.Option(
+        False, "--all", help="Reset all user overrides.",
+    ),
+) -> None:
+    """Reset pricing to builtin defaults."""
+    from .pricing import remove_user_pricing, reset_all_user_pricing
+
+    if all_models:
+        reset_all_user_pricing()
+        console.print("[green]All user pricing overrides removed.[/green]")
+    elif model:
+        if remove_user_pricing(model):
+            console.print(f"[green]Reset {model} to builtin default.[/green]")
+        else:
+            console.print(f"[yellow]{model} has no user override.[/yellow]")
+    else:
+        console.print("[red]Specify a model name or use --all.[/red]")
+        raise typer.Exit(1)
