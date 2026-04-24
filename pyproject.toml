@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "agentic-metric"
+name = "agentic-metric-x"
 version = "0.2.1"
 description = "Minimal personal-usage monitor for Codex + Claude Code"
 readme = "README.md"

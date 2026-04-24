@@ -1,4 +1,7 @@
-# Agentic Metric
+# Agentic Metric X
+
+[![PyPI](https://img.shields.io/pypi/v/agentic-metric-x)](https://pypi.org/project/agentic-metric-x/)
+[![Python](https://img.shields.io/pypi/pyversions/agentic-metric-x)](https://pypi.org/project/agentic-metric-x/)
 
 [English](README.md)
 
@@ -44,15 +47,15 @@
 需要 Python 3.10+。
 
 ```bash
-pip install agentic-metric
+pip install agentic-metric-x
 ```
 
 或使用 [uv](https://docs.astral.sh/uv/):
 
 ```bash
-uvx agentic-metric              # 直接运行,无需安装
-uv tool install agentic-metric   # 持久安装
-uv tool upgrade agentic-metric   # 升级到最新版
+uvx agentic-metric-x              # 直接运行,无需安装
+uv tool install agentic-metric-x   # 持久安装
+uv tool upgrade agentic-metric-x   # 升级到最新版
 ```
 
 ## 使用

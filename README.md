@@ -1,4 +1,7 @@
-# Agentic Metric
+# Agentic Metric X
+
+[![PyPI](https://img.shields.io/pypi/v/agentic-metric-x)](https://pypi.org/project/agentic-metric-x/)
+[![Python](https://img.shields.io/pypi/pyversions/agentic-metric-x)](https://pypi.org/project/agentic-metric-x/)
 
 [中文文档](README-CN.md)
 
@@ -45,15 +48,15 @@ A local-only monitoring tool for AI coding agents — like `top`, but for your c
 Requires Python 3.10+.
 
 ```bash
-pip install agentic-metric
+pip install agentic-metric-x
 ```
 
 Or with [uv](https://docs.astral.sh/uv/):
 
 ```bash
-uvx agentic-metric              # Run directly without installing
-uv tool install agentic-metric   # Or install persistently
-uv tool upgrade agentic-metric   # Upgrade to latest version
+uvx agentic-metric-x              # Run directly without installing
+uv tool install agentic-metric-x   # Or install persistently
+uv tool upgrade agentic-metric-x   # Upgrade to latest version
 ```
 
 ## Usage
