@@ -1,7 +1,9 @@
 """Tests for store module."""
 
+import json
 import tempfile
 from datetime import datetime
+from unittest.mock import patch
 
 from agentic_metric.store.database import Database
 from agentic_metric.store.aggregator import get_today_overview, get_daily_trends
@@ -46,6 +48,65 @@ def test_upsert_session():
     row = db.conn.execute("SELECT * FROM sessions WHERE session_id = 's1'").fetchone()
     assert row["input_tokens"] == 2000
     db.close()
+
+
+def test_upsert_session_allows_zero_and_started_at_updates():
+    db = _make_db()
+    db.upsert_session(
+        "s1", "claude_code",
+        input_tokens=1000,
+        estimated_cost_usd=12.0,
+        started_at="",
+    )
+    db.commit()
+
+    db.upsert_session(
+        "s1", "claude_code",
+        input_tokens=0,
+        estimated_cost_usd=0.0,
+        started_at="2026-04-23T10:00:00Z",
+    )
+    db.commit()
+
+    row = db.conn.execute("SELECT * FROM sessions WHERE session_id = 's1'").fetchone()
+    assert row["input_tokens"] == 0
+    assert row["estimated_cost_usd"] == 0.0
+    assert row["started_at"] == "2026-04-23T10:00:00Z"
+    db.close()
+
+
+def test_upsert_session_is_scoped_by_agent_type():
+    db = _make_db()
+    db.upsert_session("s1", "claude_code", input_tokens=1000)
+    db.upsert_session("s1", "codex", input_tokens=2000)
+    db.commit()
+
+    rows = db.conn.execute(
+        "SELECT agent_type, input_tokens FROM sessions WHERE session_id = 's1' ORDER BY agent_type"
+    ).fetchall()
+    assert len(rows) == 2
+    assert rows[0]["input_tokens"] != rows[1]["input_tokens"]
+    db.close()
+
+
+def test_database_reprices_sessions_when_pricing_changes(tmp_path):
+    pricing_file = tmp_path / "pricing.json"
+    db_path = str(tmp_path / "data.db")
+    pricing_file.write_text(json.dumps({"custom-model": [1.0, 2.0, 0.0, 0.0]}))
+
+    with patch("agentic_metric.pricing.PRICING_FILE", pricing_file):
+        db = Database(db_path=db_path)
+        db.upsert_session("s1", "claude_code", model="custom-model", input_tokens=1_000_000)
+        db.commit()
+        db.close()
+
+        pricing_file.write_text(json.dumps({"custom-model": [3.0, 2.0, 0.0, 0.0]}))
+        db = Database(db_path=db_path)
+        row = db.conn.execute(
+            "SELECT estimated_cost_usd FROM sessions WHERE session_id = 's1' AND agent_type = 'claude_code'"
+        ).fetchone()
+        assert row["estimated_cost_usd"] == 3.0
+        db.close()
 
 
 def test_sync_state():
@@ -111,10 +172,11 @@ def test_daily_trends():
 
     trends = get_daily_trends(db, days=365 * 10)
     assert len(trends) == 2
-    assert trends[0].date == "2025-01-01"
-    assert trends[0].session_count == 1
-    assert trends[0].input_tokens == 10000
-    assert trends[1].date == "2025-01-02"
-    assert trends[1].session_count == 2
-    assert trends[1].input_tokens == 25000
+    # trends are ordered DESC (most recent first)
+    assert trends[0].date == "2025-01-02"
+    assert trends[0].session_count == 2
+    assert trends[0].input_tokens == 25000
+    assert trends[1].date == "2025-01-01"
+    assert trends[1].session_count == 1
+    assert trends[1].input_tokens == 10000
     db.close()

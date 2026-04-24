@@ -10,7 +10,7 @@ from .database import Database
 
 
 def get_today_overview(db: Database) -> TodayOverview:
-    """Get aggregated stats for today across all agents."""
+    """Get aggregated stats for today across all agents (local timezone)."""
     today = datetime.now().strftime("%Y-%m-%d")
     rows = db.conn.execute(
         """SELECT agent_type,
@@ -23,7 +23,7 @@ def get_today_overview(db: Database) -> TodayOverview:
                   SUM(cache_creation_tokens) AS cache_creation_tokens,
                   SUM(estimated_cost_usd) AS estimated_cost_usd
            FROM sessions
-           WHERE date(started_at) = ?
+           WHERE date(started_at, 'localtime') = ?
            GROUP BY agent_type
         """,
         (today,),
@@ -198,7 +198,7 @@ def get_daily_trends(db: Database, days: int = 30) -> list[DailyTrend]:
     """Get daily aggregated stats for the last N days."""
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
     rows = db.conn.execute(
-        """SELECT substr(started_at, 1, 10) AS date,
+        """SELECT date(started_at, 'localtime') AS date,
                   COUNT(*) AS session_count,
                   SUM(user_turns) AS user_turns,
                   SUM(message_count) AS message_count,
@@ -208,8 +208,8 @@ def get_daily_trends(db: Database, days: int = 30) -> list[DailyTrend]:
                   SUM(cache_creation_tokens) AS cache_creation_tokens,
                   SUM(estimated_cost_usd) AS estimated_cost_usd
            FROM sessions
-           WHERE substr(started_at, 1, 10) >= ?
-           GROUP BY substr(started_at, 1, 10)
+           WHERE date(started_at, 'localtime') >= ?
+           GROUP BY date(started_at, 'localtime')
            ORDER BY date DESC
         """,
         (cutoff,),
@@ -242,7 +242,7 @@ def get_model_breakdown(db: Database, days: int = 30) -> list[dict]:
                   SUM(cache_creation_tokens) AS cache_creation_tokens,
                   SUM(estimated_cost_usd) AS estimated_cost_usd
            FROM sessions
-           WHERE substr(started_at, 1, 10) >= ? AND model != ''
+           WHERE date(started_at, 'localtime') >= ? AND model != ''
            GROUP BY model
            ORDER BY estimated_cost_usd DESC
         """,
@@ -252,7 +252,7 @@ def get_model_breakdown(db: Database, days: int = 30) -> list[dict]:
 
 
 def get_today_sessions(db: Database) -> list[dict]:
-    """Get all sessions from today, ordered by started_at descending."""
+    """Get all sessions from today (local timezone), ordered by started_at desc."""
     today = datetime.now().strftime("%Y-%m-%d")
     rows = db.conn.execute(
         """SELECT session_id, agent_type, project_path, git_branch, model,
@@ -260,7 +260,7 @@ def get_today_sessions(db: Database) -> list[dict]:
                   cache_read_tokens, cache_creation_tokens, estimated_cost_usd,
                   started_at, ended_at, first_prompt, last_prompt
            FROM sessions
-           WHERE date(started_at) = ?
+           WHERE date(started_at, 'localtime') = ?
            ORDER BY started_at DESC
         """,
         (today,),
@@ -284,3 +284,404 @@ def get_top_projects(db: Database, limit: int = 10) -> list[dict]:
         (limit,),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ── Range-based queries (for CLI `report` and TUI) ──────────────────
+
+
+def resolve_range(kind: str, offset: int = 0) -> tuple[str, str, str]:
+    """Resolve a named range to ``(label, from_date, to_date)`` inclusive.
+
+    ``kind`` is one of: ``today``, ``week``, ``month``.
+    ``offset`` shifts the window backwards by that many units (days / weeks /
+    months). ``offset=0`` is the current period.
+    """
+    now = datetime.now()
+
+    if kind == "today":
+        d = (now - timedelta(days=offset)).date()
+        s = d.strftime("%Y-%m-%d")
+        if offset == 0:
+            label = "Today"
+        elif offset == 1:
+            label = "Yesterday"
+        else:
+            label = d.strftime("%b %-d")
+        return (label, s, s)
+
+    if kind == "week":
+        this_monday = now.date() - timedelta(days=now.weekday())
+        start_d = this_monday - timedelta(weeks=offset)
+        end_d = start_d + timedelta(days=6)
+        if offset == 0:
+            end_d = now.date()  # don't show future dates for current week
+            label = "This week"
+        elif offset == 1:
+            label = "Last week"
+        else:
+            label = f"{offset} weeks ago"
+        return (label, start_d.strftime("%Y-%m-%d"), end_d.strftime("%Y-%m-%d"))
+
+    if kind == "month":
+        y, m = now.year, now.month - offset
+        while m <= 0:
+            m += 12
+            y -= 1
+        start_d = datetime(y, m, 1).date()
+        # last day of that month
+        if m == 12:
+            next_month = datetime(y + 1, 1, 1).date()
+        else:
+            next_month = datetime(y, m + 1, 1).date()
+        end_d = next_month - timedelta(days=1)
+        if offset == 0:
+            end_d = now.date()
+            label = "This month"
+        elif offset == 1:
+            label = "Last month"
+        else:
+            label = start_d.strftime("%b %Y")
+        return (label, start_d.strftime("%Y-%m-%d"), end_d.strftime("%Y-%m-%d"))
+
+    raise ValueError(f"Unknown range kind: {kind}")
+
+
+def get_range_totals(db: Database, from_date: str, to_date: str) -> dict:
+    """Return summary totals for sessions within ``[from_date, to_date]`` inclusive."""
+    row = db.conn.execute(
+        """SELECT COUNT(*) AS session_count,
+                  COALESCE(SUM(message_count), 0) AS message_count,
+                  COALESCE(SUM(user_turns), 0) AS user_turns,
+                  COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                  COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                  COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+                  COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
+                  COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd
+           FROM sessions
+           WHERE date(started_at, 'localtime') BETWEEN ? AND ?
+        """,
+        (from_date, to_date),
+    ).fetchone()
+    return dict(row) if row else {}
+
+
+def get_range_by_agent(db: Database, from_date: str, to_date: str) -> list[dict]:
+    """Return per-agent aggregates within the given date range."""
+    rows = db.conn.execute(
+        """SELECT agent_type,
+                  COUNT(*) AS session_count,
+                  COALESCE(SUM(user_turns), 0) AS user_turns,
+                  COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                  COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                  COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+                  COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
+                  COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd
+           FROM sessions
+           WHERE date(started_at, 'localtime') BETWEEN ? AND ?
+           GROUP BY agent_type
+           ORDER BY estimated_cost_usd DESC
+        """,
+        (from_date, to_date),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_range_by_agent_model(db: Database, from_date: str, to_date: str) -> list[dict]:
+    """Return per-(agent, model) aggregates within the given date range.
+
+    Models reported as empty string are kept under ``"(unknown)"`` for clarity.
+    """
+    rows = db.conn.execute(
+        """SELECT agent_type,
+                  CASE WHEN model = '' THEN '(unknown)' ELSE model END AS model,
+                  COUNT(*) AS session_count,
+                  COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                  COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                  COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+                  COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
+                  COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd
+           FROM sessions
+           WHERE date(started_at, 'localtime') BETWEEN ? AND ?
+           GROUP BY agent_type, model
+           ORDER BY agent_type, estimated_cost_usd DESC
+        """,
+        (from_date, to_date),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_range_by_project(db: Database, from_date: str, to_date: str, limit: int = 10) -> list[dict]:
+    """Return per-project aggregates within the given date range, sorted by cost desc."""
+    rows = db.conn.execute(
+        """SELECT CASE WHEN project_path = '' THEN '(unspecified)'
+                       ELSE project_path END AS project_path,
+                  COUNT(*) AS session_count,
+                  COALESCE(SUM(user_turns), 0) AS user_turns,
+                  COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                  COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                  COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+                  COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
+                  COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd
+           FROM sessions
+           WHERE date(started_at, 'localtime') BETWEEN ? AND ?
+           GROUP BY project_path
+           ORDER BY estimated_cost_usd DESC
+           LIMIT ?
+        """,
+        (from_date, to_date, limit),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_range_daily(db: Database, from_date: str, to_date: str) -> list[dict]:
+    """Return per-day aggregates within the given date range (ascending)."""
+    rows = db.conn.execute(
+        """SELECT date(started_at, 'localtime') AS date,
+                  COUNT(*) AS session_count,
+                  COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                  COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                  COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+                  COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
+                  COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd
+           FROM sessions
+           WHERE date(started_at, 'localtime') BETWEEN ? AND ?
+           GROUP BY date(started_at, 'localtime')
+           ORDER BY date ASC
+        """,
+        (from_date, to_date),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_heatmap(
+    db: Database,
+    focus: str,
+    offset: int = 0,
+) -> list[dict]:
+    """Return per-bucket cost + tokens for the heatmap strip.
+
+    ``focus`` is one of ``today`` / ``week`` / ``month``. ``offset``
+    shifts the window back by that many units so navigation can reuse
+    the same function.
+
+    Each returned dict contains: ``label``, ``cost``, ``tokens``,
+    ``session_count``. Buckets with zero activity are included so the
+    strip layout stays stable.
+    """
+    from datetime import datetime as _dt, timedelta as _td
+
+    def _sum_tokens_row(r) -> int:
+        return (
+            (r["input_tokens"] or 0)
+            + (r["output_tokens"] or 0)
+            + (r["cache_read_tokens"] or 0)
+            + (r["cache_creation_tokens"] or 0)
+        )
+
+    now = _dt.now()
+    today = now.date()
+
+    if focus == "today":
+        day = today - _td(days=offset)
+        day_s = day.strftime("%Y-%m-%d")
+        rows = db.conn.execute(
+            """SELECT strftime('%H', started_at, 'localtime') AS hr,
+                      COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                      COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                      COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+                      COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
+                      COALESCE(SUM(estimated_cost_usd), 0) AS cost,
+                      COUNT(*) AS session_count
+               FROM sessions
+               WHERE date(started_at, 'localtime') = ?
+               GROUP BY hr""",
+            (day_s,),
+        ).fetchall()
+        seen = {r["hr"]: r for r in rows}
+        out = []
+        for h in range(24):
+            key = f"{h:02d}"
+            r = seen.get(key)
+            out.append({
+                "label": key,
+                "cost": (r["cost"] if r else 0.0),
+                "tokens": _sum_tokens_row(r) if r else 0,
+                "session_count": (r["session_count"] if r else 0),
+            })
+        return out
+
+    if focus == "week":
+        this_monday = today - _td(days=today.weekday())
+        start = this_monday - _td(weeks=offset)
+        days = [start + _td(days=i) for i in range(7)]
+        labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        from_d = days[0].strftime("%Y-%m-%d")
+        to_d = days[-1].strftime("%Y-%m-%d")
+        rows = db.conn.execute(
+            """SELECT date(started_at, 'localtime') AS d,
+                      COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                      COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                      COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+                      COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
+                      COALESCE(SUM(estimated_cost_usd), 0) AS cost,
+                      COUNT(*) AS session_count
+               FROM sessions
+               WHERE date(started_at, 'localtime') BETWEEN ? AND ?
+               GROUP BY d""",
+            (from_d, to_d),
+        ).fetchall()
+        seen = {r["d"]: r for r in rows}
+        out = []
+        for day, label in zip(days, labels):
+            key = day.strftime("%Y-%m-%d")
+            r = seen.get(key)
+            out.append({
+                "label": label,
+                "cost": (r["cost"] if r else 0.0),
+                "tokens": _sum_tokens_row(r) if r else 0,
+                "session_count": (r["session_count"] if r else 0),
+            })
+        return out
+
+    if focus == "month":
+        # Focused year/month (shifted by offset months)
+        y, m = now.year, now.month - offset
+        while m <= 0:
+            m += 12
+            y -= 1
+        month_start = _dt(y, m, 1).date()
+        if m == 12:
+            month_end = _dt(y + 1, 1, 1).date() - _td(days=1)
+        else:
+            month_end = _dt(y, m + 1, 1).date() - _td(days=1)
+
+        # Walk Mondays within the month; each bucket is Mon→Sun clipped
+        # to the month boundaries.
+        first_monday = month_start - _td(days=month_start.weekday())
+        weeks: list[tuple] = []
+        cursor = first_monday
+        week_num = 1
+        while cursor <= month_end:
+            wk_from = max(cursor, month_start)
+            wk_to = min(cursor + _td(days=6), month_end)
+            weeks.append((week_num, wk_from, wk_to))
+            cursor += _td(weeks=1)
+            week_num += 1
+
+        out = []
+        for wn, wf, wt in weeks:
+            row = db.conn.execute(
+                """SELECT COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                          COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                          COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+                          COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
+                          COALESCE(SUM(estimated_cost_usd), 0) AS cost,
+                          COUNT(*) AS session_count
+                   FROM sessions
+                   WHERE date(started_at, 'localtime') BETWEEN ? AND ?""",
+                (wf.strftime("%Y-%m-%d"), wt.strftime("%Y-%m-%d")),
+            ).fetchone()
+            out.append({
+                "label": f"W{wn}",
+                "sublabel": f"{wf.strftime('%m-%d')} – {wt.strftime('%m-%d')}",
+                "cost": row["cost"] if row else 0.0,
+                "tokens": _sum_tokens_row(row) if row else 0,
+                "session_count": row["session_count"] if row else 0,
+            })
+        return out
+
+    raise ValueError(f"Unknown focus: {focus}")
+
+
+def get_trend(db: Database, unit: str, count: int) -> list[tuple[str, float]]:
+    """Return the last ``count`` buckets of cost, one per unit.
+
+    ``unit`` is ``"day"``, ``"week"`` or ``"month"``. Missing buckets are
+    filled with 0 so the returned list always has ``count`` entries
+    (oldest → newest).
+    """
+    now = datetime.now()
+    today = now.date()
+
+    if unit == "hour":
+        # Today by hour. ``count`` is ignored — we always return 24 buckets.
+        today_s = today.strftime("%Y-%m-%d")
+        rows = db.conn.execute(
+            """SELECT strftime('%H', started_at, 'localtime') AS hr,
+                      COALESCE(SUM(estimated_cost_usd), 0) AS cost
+               FROM sessions
+               WHERE date(started_at, 'localtime') = ?
+               GROUP BY hr""",
+            (today_s,),
+        ).fetchall()
+        seen = {r["hr"]: r["cost"] for r in rows}
+        return [(f"{h:02d}", seen.get(f"{h:02d}", 0.0)) for h in range(24)]
+
+    if unit == "day":
+        buckets = [today - timedelta(days=i) for i in range(count - 1, -1, -1)]
+        keys = [d.strftime("%Y-%m-%d") for d in buckets]
+        labels = [d.strftime("%m-%d") for d in buckets]
+        from_d = buckets[0].strftime("%Y-%m-%d")
+        to_d = buckets[-1].strftime("%Y-%m-%d")
+        rows = db.conn.execute(
+            """SELECT date(started_at, 'localtime') AS bucket,
+                      COALESCE(SUM(estimated_cost_usd), 0) AS cost
+               FROM sessions
+               WHERE date(started_at, 'localtime') BETWEEN ? AND ?
+               GROUP BY bucket""",
+            (from_d, to_d),
+        ).fetchall()
+        seen = {r["bucket"]: r["cost"] for r in rows}
+        return list(zip(labels, [seen.get(k, 0.0) for k in keys]))
+
+    if unit == "week":
+        # Each bucket is a Monday-aligned week. Build Mondays oldest → newest.
+        this_monday = today - timedelta(days=today.weekday())
+        mondays = [this_monday - timedelta(weeks=i) for i in range(count - 1, -1, -1)]
+        buckets: list[tuple[str, str]] = []
+        for m in mondays:
+            sunday = m + timedelta(days=6)
+            buckets.append((m.strftime("%Y-%m-%d"), sunday.strftime("%Y-%m-%d")))
+        labels = [m.strftime("%m-%d") for m in mondays]
+
+        result: list[tuple[str, float]] = []
+        for (wk_from, wk_to), label in zip(buckets, labels):
+            row = db.conn.execute(
+                """SELECT COALESCE(SUM(estimated_cost_usd), 0) AS cost
+                   FROM sessions
+                   WHERE date(started_at, 'localtime') BETWEEN ? AND ?""",
+                (wk_from, wk_to),
+            ).fetchone()
+            result.append((label, row["cost"] if row else 0.0))
+        return result
+
+    if unit == "month":
+        # Build (year, month) pairs oldest → newest.
+        months: list[tuple[int, int]] = []
+        y, m = now.year, now.month
+        for _ in range(count):
+            months.append((y, m))
+            m -= 1
+            if m == 0:
+                m = 12
+                y -= 1
+        months.reverse()
+        labels = [f"{y % 100:02d}-{m:02d}" for (y, m) in months]
+
+        result = []
+        for (y, m) in months:
+            start = datetime(y, m, 1).date()
+            if m == 12:
+                end = datetime(y + 1, 1, 1).date() - timedelta(days=1)
+            else:
+                end = datetime(y, m + 1, 1).date() - timedelta(days=1)
+            row = db.conn.execute(
+                """SELECT COALESCE(SUM(estimated_cost_usd), 0) AS cost
+                   FROM sessions
+                   WHERE date(started_at, 'localtime') BETWEEN ? AND ?""",
+                (start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")),
+            ).fetchone()
+            result.append((labels[months.index((y, m))], row["cost"] if row else 0.0))
+        return result
+
+    raise ValueError(f"Unknown trend unit: {unit}")

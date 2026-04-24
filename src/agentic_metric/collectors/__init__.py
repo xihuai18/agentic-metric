@@ -57,7 +57,12 @@ class CollectorRegistry:
 
 
 def create_default_registry() -> CollectorRegistry:
-    """Create a registry with all available collectors."""
+    """Create a registry with all available collectors.
+
+    Supported agents:
+    - Claude Code (Anthropic CLI)
+    - Codex (OpenAI CLI)
+    """
     registry = CollectorRegistry()
 
     from .claude_code import ClaudeCodeCollector
@@ -65,14 +70,5 @@ def create_default_registry() -> CollectorRegistry:
 
     from .codex import CodexCollector
     registry.register(CodexCollector())
-
-    from .vscode import VscodeCollector
-    registry.register(VscodeCollector())
-
-    from .opencode import OpenCodeCollector
-    registry.register(OpenCodeCollector())
-
-    from .qwen_code import QwenCodeCollector
-    registry.register(QwenCodeCollector())
 
     return registry

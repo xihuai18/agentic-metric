@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 from ..config import CODEX_SESSIONS_DIR
@@ -32,6 +32,7 @@ class _SessionAccum:
         "user_turns",
         "message_count",
         "input_tokens",
+        "raw_input_tokens",
         "output_tokens",
         "cache_read",
         "cache_create",
@@ -52,6 +53,7 @@ class _SessionAccum:
         self.user_turns = 0
         self.message_count = 0
         self.input_tokens = 0
+        self.raw_input_tokens = 0
         self.output_tokens = 0
         self.cache_read = 0
         self.cache_create = 0
@@ -63,11 +65,33 @@ class _SessionAccum:
         self.model = ""
 
     def read_new_lines(self) -> None:
-        """Read only bytes appended since last call."""
+        """Read only bytes appended since last call.
+
+        If the file shrank (truncated or replaced), reset state and re-parse
+        from offset 0 — otherwise we'd silently miss data.
+        """
         try:
             size = self.file_path.stat().st_size
-            if size <= self.offset:
-                return
+        except OSError:
+            return
+        if size == self.offset:
+            return
+        if size < self.offset:
+            # File was truncated or replaced; reset accumulator-level state
+            # that comes from parsing, but keep identity fields.
+            self.offset = 0
+            self.user_turns = 0
+            self.message_count = 0
+            self.input_tokens = 0
+            self.raw_input_tokens = 0
+            self.output_tokens = 0
+            self.cache_read = 0
+            self.cache_create = 0
+            self.first_ts = ""
+            self.last_ts = ""
+            self.first_prompt = ""
+            self.last_prompt = ""
+        try:
             with open(self.file_path, "rb") as f:
                 f.seek(self.offset)
                 new_data = f.read()
@@ -136,10 +160,28 @@ class _SessionAccum:
             usage = info.get("total_token_usage", {})
             if not usage:
                 return
-            # Cumulative: overwrite, don't sum
-            self.input_tokens = usage.get("input_tokens", self.input_tokens)
-            self.output_tokens = usage.get("output_tokens", self.output_tokens)
-            self.cache_read = usage.get("cached_input_tokens", self.cache_read)
+            # Cumulative: overwrite, don't sum.
+            # OpenAI's ``input_tokens`` is the TOTAL (includes cached tokens),
+            # whereas ``cached_input_tokens`` is the cached subset. Store the
+            # non-cached portion as ``input_tokens`` so ``estimate_cost``
+            # doesn't double-charge — its formula charges ``cache_read`` at
+            # cache pricing AND ``input_tokens`` at full input pricing.
+            #
+            # Note: all three counters are cumulative. Update each only when
+            # its key is present; values of 0 are valid cumulative readings
+            # and should overwrite. We use a sentinel (``None``) to detect
+            # key absence vs. real-zero.
+            raw_input = usage.get("input_tokens")
+            cached = usage.get("cached_input_tokens")
+            out = usage.get("output_tokens")
+            if out is not None:
+                self.output_tokens = out
+            if raw_input is not None:
+                self.raw_input_tokens = raw_input
+            if cached is not None:
+                self.cache_read = cached
+            if raw_input is not None or cached is not None:
+                self.input_tokens = max(self.raw_input_tokens - self.cache_read, 0)
 
     def to_live_session(self) -> LiveSession:
         return LiveSession(
@@ -183,50 +225,65 @@ class _LiveMonitor:
             return []
 
         today = date.today()
-        today_dir = CODEX_SESSIONS_DIR / str(today.year) / f"{today.month:02d}" / f"{today.day:02d}"
-        if not today_dir.is_dir():
+        candidate_files: dict[Path, float] = {}
+        for day_offset in range(3):
+            day = today - timedelta(days=day_offset)
+            day_dir = CODEX_SESSIONS_DIR / str(day.year) / f"{day.month:02d}" / f"{day.day:02d}"
+            if not day_dir.is_dir():
+                continue
+            try:
+                for jsonl_file in day_dir.glob("rollout-*.jsonl"):
+                    candidate_files[jsonl_file] = jsonl_file.stat().st_mtime
+            except OSError:
+                continue
+
+        for jsonl_file in list(self._accums):
+            if not jsonl_file.exists():
+                continue
+            try:
+                candidate_files[jsonl_file] = jsonl_file.stat().st_mtime
+            except OSError:
+                continue
+
+        if not candidate_files:
             return []
 
-        # Get today's JSONL files sorted by mtime (most recent first)
-        try:
-            jsonl_files = sorted(
-                today_dir.glob("rollout-*.jsonl"),
-                key=lambda f: f.stat().st_mtime,
-                reverse=True,
-            )
-        except OSError:
-            return []
+        jsonl_files = sorted(candidate_files, key=lambda f: candidate_files[f], reverse=True)
 
-        if not jsonl_files:
-            return []
-
-        # Build cwd -> pid mapping
-        cwd_to_pid: dict[str, int] = {}
+        cwd_to_pids: dict[str, list[int]] = {}
         for pid, cwd in pid_cwds.items():
-            cwd_to_pid[cwd] = pid
+            cwd_to_pids.setdefault(cwd, []).append(pid)
+
+        cwd_to_files: dict[str, list[Path]] = {}
+        for jsonl_file in jsonl_files:
+            cwd = self._read_cwd(jsonl_file)
+            if not cwd or cwd not in cwd_to_pids:
+                continue
+            cwd_to_files.setdefault(cwd, []).append(jsonl_file)
 
         results: list[LiveSession] = []
         active_files: set[Path] = set()
-        matched_cwds: set[str] = set()
 
-        # Match each JSONL file's cwd to a running process
-        for jsonl_file in jsonl_files:
-            cwd = self._read_cwd(jsonl_file)
-            if not cwd or cwd not in cwd_to_pid or cwd in matched_cwds:
+        for cwd, pids in cwd_to_pids.items():
+            files = cwd_to_files.get(cwd, [])
+            if not files:
                 continue
-            matched_cwds.add(cwd)
-            active_files.add(jsonl_file)
+            for idx, jsonl_file in enumerate(files[: max(1, len(pids))]):
+                if jsonl_file in active_files:
+                    continue
+                active_files.add(jsonl_file)
 
-            accum = self._accums.get(jsonl_file)
-            if accum is None:
-                accum = _SessionAccum(jsonl_file, cwd, pid=cwd_to_pid[cwd])
-                self._accums[jsonl_file] = accum
-            else:
-                accum.pid = cwd_to_pid.get(cwd, accum.pid)
+                pid = pids[idx] if idx < len(pids) else 0
+                accum = self._accums.get(jsonl_file)
+                if accum is None:
+                    accum = _SessionAccum(jsonl_file, cwd, pid=pid)
+                    self._accums[jsonl_file] = accum
+                else:
+                    accum.pid = pid
 
-            accum.read_new_lines()
-            if accum.user_turns > 0:
-                results.append(accum.to_live_session())
+                accum.read_new_lines()
+                if accum.user_turns > 0:
+                    results.append(accum.to_live_session())
 
         # Prune stale accumulators
         stale = [k for k in self._accums if k not in active_files]
@@ -287,15 +344,16 @@ class CodexCollector(BaseCollector):
 
         for jsonl_file in CODEX_SESSIONS_DIR.rglob("rollout-*.jsonl"):
             sync_key = f"{sync_prefix}{jsonl_file}"
-            prev_offset_str = db.get_sync_state(sync_key)
-            prev_offset = int(prev_offset_str) if prev_offset_str else 0
+            prev_state = db.get_sync_state(sync_key)
 
             try:
-                file_size = jsonl_file.stat().st_size
+                stat = jsonl_file.stat()
             except OSError:
                 continue
+            file_size = stat.st_size
+            mtime_ns = stat.st_mtime_ns
 
-            if file_size <= prev_offset:
+            if _sync_state_matches(prev_state, file_size, mtime_ns):
                 continue
 
             # Full parse to get cumulative totals
@@ -303,7 +361,7 @@ class CodexCollector(BaseCollector):
             accum.read_new_lines()
 
             if accum.user_turns == 0:
-                db.set_sync_state(sync_key, str(file_size))
+                db.set_sync_state(sync_key, _sync_state_value(file_size, mtime_ns))
                 continue
 
             session_id = accum.session_id or jsonl_file.stem
@@ -335,5 +393,22 @@ class CodexCollector(BaseCollector):
                 last_prompt=accum.last_prompt,
             )
 
-            db.set_sync_state(sync_key, str(file_size))
+            db.set_sync_state(sync_key, _sync_state_value(file_size, mtime_ns))
 
+
+def _sync_state_value(file_size: int, mtime_ns: int) -> str:
+    """Return the on-disk sync stamp for a JSONL file."""
+    return f"{file_size}:{mtime_ns}"
+
+
+def _sync_state_matches(state: str | None, file_size: int, mtime_ns: int) -> bool:
+    """Return True when the persisted sync stamp matches the current file."""
+    if not state:
+        return False
+    parts = state.split(":", 1)
+    if len(parts) != 2:
+        return False
+    try:
+        return int(parts[0]) == file_size and int(parts[1]) == mtime_ns
+    except ValueError:
+        return False

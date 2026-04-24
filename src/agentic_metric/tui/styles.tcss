@@ -1,26 +1,108 @@
-/* Agentic Metric TUI stylesheet */
+/* agentic-metric TUI — theme-aware styles.
+ *
+ * Only Textual semantic variables are used here ($surface, $panel,
+ * $boost, $primary, $accent, $warning, $success, $text, $text-muted,
+ * $border). That lets Textual's theme machinery pick concrete colors
+ * from whatever theme the user chose (default: textual-dark; override
+ * via the App's theme setter or ``TEXTUAL_THEME=<name>``).
+ *
+ * Widget-level text colors are set in Python using 8-color ANSI names
+ * so they follow the terminal's palette instead of hard-coding hex.
+ */
 
-Screen {
-    background: $surface;
+Header {
+    background: $boost;
+    color: $text-muted;
 }
 
-#today-summary {
-    height: 3;
-    padding: 0 1;
+Footer {
     background: $boost;
 }
 
-#live-table {
-    height: 1fr;
-    min-height: 5;
+Footer > .footer--key {
+    background: $boost;
+    color: $warning;
+    text-style: bold;
 }
 
-#trend-chart {
-    height: 14;
-    min-height: 10;
+/* ─── Top summary row: 3 cells side by side ─── */
+
+#summary-row {
+    height: 7;
+    min-height: 5;
+    margin: 1 1 0 1;
 }
 
-#daily-table {
+SummaryCell {
+    width: 1fr;
     height: 1fr;
-    min-height: 5;
+    margin: 0 1;
+    padding: 0 2;
+    border: round $panel-lighten-2;
+    content-align: left top;
+}
+
+SummaryCell.-focused {
+    border: round $accent;
+    background: $boost;
+}
+
+/* ─── Hourly heatmap (today only) ─── */
+
+#heatmap-panel {
+    height: 6;
+    margin: 0 1;
+    padding: 0 1;
+    border: round $panel-lighten-2;
+}
+
+#heatmap-title {
+    height: 1;
+    color: $text-muted;
+    text-style: bold;
+}
+
+#heatmap {
+    height: 3;
+}
+
+/* ─── Chart ─── */
+
+#chart-panel {
+    height: 1fr;
+    min-height: 7;
+    max-height: 15;
+    margin: 0 1;
+    padding: 0 1;
+    border: round $panel-lighten-2;
+}
+
+#chart-title {
+    height: 1;
+    color: $text-muted;
+    text-style: bold;
+}
+
+#chart {
+    height: 1fr;
+}
+
+/* ─── Breakdown ─── */
+
+#breakdown-panel {
+    height: 1fr;
+    min-height: 4;
+    margin: 0 1 1 1;
+    padding: 0 1;
+    border: round $panel-lighten-2;
+}
+
+#breakdown-title {
+    height: 1;
+    color: $text-muted;
+    text-style: bold;
+}
+
+#breakdown-body {
+    height: 1fr;
 }

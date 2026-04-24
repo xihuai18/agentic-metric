@@ -1,47 +1,58 @@
 # Changelog
 
-## v0.1.8
+## v0.2.0 (2026-04-23)
 
-### Bug Fixes
+Focused fork: supports **Codex** and **Claude Code** only, with
+redesigned TUI, a unified `report` command, and several calculation
+correctness fixes.
 
-- **Fix multiple sessions in same directory only detecting one as active**: `cwd_to_pid` dict was overwriting duplicate CWDs; now tracks all PIDs per CWD and picks the corresponding number of recent JSONL files.
-- **Fix closed sessions incorrectly marked as active**: The agent-type fallback logic (designed for VS Code's PID-based session IDs) was triggering for Claude Code when a new session hadn't synced to DB yet, causing unrelated closed sessions to show a green active dot.
+### Breaking changes
 
-## v0.1.7
+- Removed collectors: VS Code Copilot Chat, OpenCode, Qwen Code. If you
+  still need these, stay on v0.1.8 upstream.
+- Replaced `today` / `history` / `status` CLI commands with a single
+  `report` command:
+  `report [--today|--week|--month|--range FROM:TO]`.
 
-### New Features
+### Bug fixes
 
-- **CLI pricing management**: New `agentic-metric pricing` subcommands (`list` / `set` / `reset`) for customizing model pricing. Overrides are stored in `pricing.json` and take precedence over built-in defaults.
-- **Model family fallback pricing**: Unknown models now automatically fall back to family-level pricing (e.g. `claude-sonnet-*`), instead of always defaulting to the most expensive model.
+- **Codex double-counting cached tokens**: OpenAI's `input_tokens` is
+  the total (including cached). The collector now stores
+  `input_tokens - cached_input_tokens`, so `estimate_cost` no longer
+  charges cached tokens at both input and cache-read pricing. This
+  dramatically lowers Codex session cost (observed -87% on a large
+  session with heavy prompt cache).
+- **Pricing prefix matching**: sort by prefix length descending, so
+  `gpt-5.4-mini` matches its own entry rather than `gpt-5.4`.
+- **Date aggregation timezone**: `date(started_at, 'localtime')` is
+  used everywhere, fixing UTC-vs-local off-by-one day in today / week /
+  month rollups.
+- **File truncation recovery**: if a JSONL file shrinks (truncated or
+  rewritten), the collector now re-parses from offset 0 instead of
+  silently skipping.
+- **`git_branch` upsert**: the branch column is now updated from later
+  syncs, not permanently pinned by the first insert.
+- **User-pricing I/O**: overrides are cached in memory keyed by file
+  mtime, avoiding a disk read on every cost estimation.
 
-### Bug Fixes
+### Pricing table
 
-- **Fix cross-day session token over-counting**: Sessions spanning midnight (e.g. started yesterday, still active today) now correctly show today-only token counts in the Today page, History page, and CLI output.
-- **Truncate long project/branch names in TUI**: Prevents table layout overflow when project paths or branch names are too long.
-- **Cross-day session start time display**: Sessions spanning midnight now show a `MM-DD` date prefix on start times for clarity.
+- Added: `claude-opus-4-7`, `gpt-5.4` / `-mini` / `-nano` / `-pro`,
+  `gemini-3.1-pro`, `gemini-3.1-flash`.
+- Family fallback now splits `gpt-5` from generic `gpt-` so modern
+  5.x models pick up 5.x pricing.
 
-## v0.1.6
+### TUI redesign
 
-- Improve OpenCode live session detection.
+- Top row: three summary cells — TODAY / WEEK / MONTH — switched with
+  `t` / `w` / `m`.
+- Active-now table stays compact; dim rows show today's idle sessions.
+- 30-day cost bar chart under the active table.
+- Agent × model nested breakdown with proportion bars, driven by the
+  currently-focused time range.
+- Subtle panel borders, muted titles, yellow cost highlights.
 
-## v0.1.5
+## v0.1.8 (upstream baseline)
 
-- Remove Cursor support (Cursor stopped writing local token data).
-- Simplify Agent Data Coverage docs.
-
-## v0.1.4
-
-- Add Qwen Code collector for tracking qwen-code CLI sessions.
-- Enable shell completion and `-h` help shorthand.
-
-## v0.1.3
-
-- Add `--version` / `-v` flag.
-- Fix History tab sort order: chart oldest→newest, table newest→oldest.
-- Fix SQLite cross-thread error in sync worker.
-- Unify live data merging across CLI and TUI.
-
-## v0.1.2
-
-- Initial release with TUI, CLI, and system tray support.
-- Collectors: Claude Code, Codex, VS Code, OpenCode.
+- Multiple live sessions in the same directory detected separately.
+- Fix closed sessions being marked active via VS Code-specific fallback.

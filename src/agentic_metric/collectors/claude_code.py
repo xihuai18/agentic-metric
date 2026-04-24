@@ -71,6 +71,7 @@ class _SessionAccum:
         "today_output_tokens",
         "today_cache_read",
         "today_cache_create",
+        "today_key",
     )
 
     def __init__(self, file_path: Path, project_path: str, pid: int = 0) -> None:
@@ -97,9 +98,14 @@ class _SessionAccum:
         self.today_output_tokens = 0
         self.today_cache_read = 0
         self.today_cache_create = 0
+        self.today_key = ""
 
     def read_new_lines(self) -> None:
         """Read only bytes appended since last call."""
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        if today_str != self.today_key:
+            self._reset_today_counters(today_str)
+
         try:
             size = self.file_path.stat().st_size
             if size <= self.offset:
@@ -111,7 +117,6 @@ class _SessionAccum:
         except OSError:
             return
 
-        today_str = datetime.now().strftime("%Y-%m-%d")
         for raw_line in new_data.split(b"\n"):
             raw_line = raw_line.strip()
             if not raw_line:
@@ -121,6 +126,16 @@ class _SessionAccum:
             except (json.JSONDecodeError, UnicodeDecodeError):
                 continue
             self._process_entry(entry, today_str)
+
+    def _reset_today_counters(self, today_str: str) -> None:
+        """Reset day-local counters when the local date changes."""
+        self.today_key = today_str
+        self.today_user_turns = 0
+        self.today_message_count = 0
+        self.today_input_tokens = 0
+        self.today_output_tokens = 0
+        self.today_cache_read = 0
+        self.today_cache_create = 0
 
     @staticmethod
     def _ts_local_date(ts: str) -> str:
@@ -435,15 +450,16 @@ class ClaudeCodeCollector(BaseCollector):
 
             for jsonl_file in jsonl_files:
                 sync_key = f"{sync_prefix}{jsonl_file}"
-                prev_offset_str = db.get_sync_state(sync_key)
-                prev_offset = int(prev_offset_str) if prev_offset_str else 0
+                prev_state = db.get_sync_state(sync_key)
 
                 try:
-                    file_size = jsonl_file.stat().st_size
+                    stat = jsonl_file.stat()
                 except OSError:
                     continue
+                file_size = stat.st_size
+                mtime_ns = stat.st_mtime_ns
 
-                if file_size <= prev_offset:
+                if _sync_state_matches(prev_state, file_size, mtime_ns):
                     continue
 
                 # Build an accumulator starting from the previous offset
@@ -454,7 +470,7 @@ class ClaudeCodeCollector(BaseCollector):
 
                 if accum.user_turns == 0:
                     # Mark as processed even if empty
-                    db.set_sync_state(sync_key, str(file_size))
+                    db.set_sync_state(sync_key, _sync_state_value(file_size, mtime_ns))
                     continue
 
                 cost = estimate_cost(
@@ -488,5 +504,22 @@ class ClaudeCodeCollector(BaseCollector):
                     last_prompt=accum.last_prompt,
                 )
 
-                db.set_sync_state(sync_key, str(file_size))
+                db.set_sync_state(sync_key, _sync_state_value(file_size, mtime_ns))
 
+
+def _sync_state_value(file_size: int, mtime_ns: int) -> str:
+    """Return the on-disk sync stamp for a JSONL file."""
+    return f"{file_size}:{mtime_ns}"
+
+
+def _sync_state_matches(state: str | None, file_size: int, mtime_ns: int) -> bool:
+    """Return True when the persisted sync stamp matches the current file."""
+    if not state:
+        return False
+    parts = state.split(":", 1)
+    if len(parts) != 2:
+        return False
+    try:
+        return int(parts[0]) == file_size and int(parts[1]) == mtime_ns
+    except ValueError:
+        return False

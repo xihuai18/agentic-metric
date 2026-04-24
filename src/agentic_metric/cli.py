@@ -3,16 +3,23 @@
 from __future__ import annotations
 
 from importlib.metadata import version as _pkg_version
+from pathlib import Path
 
 import typer
-from rich.console import Console
+from rich import box
+from rich.align import Align
+from rich.columns import Columns
+from rich.console import Console, Group
+from rich.panel import Panel
+from rich.rule import Rule
 from rich.table import Table
+from rich.text import Text
 
 app = typer.Typer(
     name="agentic-metric",
-    help="Monitor token usage and costs across AI coding agents.",
+    help="Monitor token usage and costs across Codex and Claude Code sessions.",
     invoke_without_command=True,
-    add_completion=True,
+    add_completion=False,
     context_settings={"help_option_names": ["-h", "--help"]},
 )
 pricing_app = typer.Typer(
@@ -23,14 +30,23 @@ pricing_app = typer.Typer(
 app.add_typer(pricing_app, name="pricing")
 
 
-@pricing_app.callback(invoke_without_command=True)
-def _pricing_default(ctx: typer.Context) -> None:
-    """Show help by default."""
-    if ctx.invoked_subcommand is None:
-        console.print(ctx.get_help())
-        raise typer.Exit()
-
 console = Console()
+
+
+# ANSI named colors — inherit the terminal's own palette / theme.
+# No hard-coded hex, so output adapts to light/dark terminals equally well.
+C_TEXT     = "default"
+C_SUBTEXT  = "bright_white"
+C_MUTED    = "bright_black"
+C_RED      = "red"
+C_PEACH    = "yellow"
+C_YELLOW   = "yellow"
+C_GREEN    = "green"
+C_TEAL     = "cyan"
+C_SKY      = "cyan"
+C_BLUE     = "blue"
+C_MAUVE    = "magenta"
+C_SURFACE1 = "bright_black"
 
 
 def _version_callback(value: bool) -> None:
@@ -52,156 +68,474 @@ def _default(
         tui()
 
 
+@pricing_app.callback(invoke_without_command=True)
+def _pricing_default(ctx: typer.Context) -> None:
+    if ctx.invoked_subcommand is None:
+        console.print(ctx.get_help())
+        raise typer.Exit()
+
+
 @app.command()
 def tui() -> None:
     """Launch the interactive TUI dashboard."""
     from .tui.app import AgenticMetricApp
-
     AgenticMetricApp().run()
 
 
 @app.command()
-def status() -> None:
-    """Show currently active agent sessions."""
+def sync() -> None:
+    """Force sync all collectors to the database."""
     from .collectors import create_default_registry
-    from .pricing import estimate_session_cost
-
-    registry = create_default_registry()
-    sessions = [s for s in registry.get_live_sessions()
-                if s.user_turns > 0 or s.output_tokens > 0]
-
-    if not sessions:
-        console.print("No active agents.")
-        return
-
-    table = Table(title="Active Agent Sessions")
-    table.add_column("PID", justify="right", style="cyan")
-    table.add_column("Agent", style="magenta")
-    table.add_column("Project", style="green")
-    table.add_column("Model", style="blue")
-    table.add_column("Turns", justify="right")
-    table.add_column("Messages", justify="right")
-    table.add_column("Tokens", justify="right")
-    table.add_column("Cost", justify="right", style="yellow")
-
-    for s in sessions:
-        cost = estimate_session_cost(s)
-        project = s.project_path.split("/")[-1] if s.project_path else ""
-        table.add_row(
-            str(s.pid),
-            s.agent_type,
-            project,
-            s.model or "-",
-            str(s.user_turns),
-            str(s.message_count),
-            _fmt_tokens(s.total_tokens),
-            f"${cost:.2f}",
-        )
-
-    console.print(table)
-
-
-@app.command()
-def today() -> None:
-    """Show today's usage overview."""
     from .store.database import Database
-    from .store import aggregator
-    from .collectors import create_default_registry
 
     db = Database()
     registry = create_default_registry()
+
+    console.print(f"[{C_SUBTEXT}]Syncing all collectors…[/]")
     registry.sync_all(db)
-
-    overview = aggregator.get_today_overview(db)
-    today_sessions = aggregator.get_today_sessions(db)
-    live_sessions = registry.get_live_sessions()
-    aggregator.merge_live_into_overview(overview, live_sessions, today_sessions)
-    overview.active_agents = sum(
-        1 for s in live_sessions if s.user_turns > 0 or s.output_tokens > 0
-    )
-
     db.close()
 
-    table = Table(title=f"Today's Overview  ({overview.date})")
-    table.add_column("Agent", style="magenta")
-    table.add_column("Sessions", justify="right")
-    table.add_column("Turns", justify="right")
-    table.add_column("Messages", justify="right")
-    table.add_column("Tokens", justify="right")
-    table.add_column("Cost", justify="right", style="yellow")
+    console.print(f"[bold {C_GREEN}]✓ Sync complete[/]")
+    for c in registry.get_all():
+        console.print(f"  [{C_MUTED}]•[/] [{C_MAUVE}]{c.agent_type}[/]")
 
-    if overview.by_agent:
-        for agent, data in overview.by_agent.items():
-            total_tokens = data["input_tokens"] + data["output_tokens"]
-            table.add_row(
-                agent,
-                str(data["session_count"]),
-                str(data["turns"]),
-                str(data["message_count"]),
-                _fmt_tokens(total_tokens),
-                f"${data['cost']:.2f}",
-            )
-        table.add_section()
 
-    active_str = f" ([green]{overview.active_agents} active[/green])" if overview.active_agents else ""
-    table.add_row(
-        "[bold]Total[/bold]",
-        f"[bold]{overview.session_count}[/bold]{active_str}",
-        f"[bold]{overview.tool_call_count}[/bold]",
-        f"[bold]{overview.message_count}[/bold]",
-        f"[bold]{_fmt_tokens(overview.total_tokens)}[/bold]",
-        f"[bold yellow]${overview.estimated_cost_usd:.2f}[/bold yellow]",
-    )
-
-    console.print(table)
+# ── report ─────────────────────────────────────────────────────────
 
 
 @app.command()
-def history(
-    days: int = typer.Option(30, "--days", "-d", help="Number of days to show."),
+def report(
+    today_: bool = typer.Option(False, "--today", help="Show today's usage."),
+    week: bool = typer.Option(False, "--week", help="Show this week's usage (Mon–today)."),
+    month: bool = typer.Option(False, "--month", help="Show this month's usage."),
+    range_: str = typer.Option(
+        None, "--range",
+        help="Custom date range FROM:TO, e.g. 2026-04-01:2026-04-23.",
+    ),
+    no_sync: bool = typer.Option(
+        False, "--no-sync", help="Skip syncing collectors before querying."
+    ),
 ) -> None:
-    """Show daily usage trends."""
+    """Show a usage report for a time range."""
+    from .collectors import create_default_registry
     from .store.database import Database
     from .store import aggregator
-    from .collectors import create_default_registry
+
+    flags = [today_, week, month, range_ is not None]
+    if sum(1 for f in flags if f) > 1:
+        console.print(f"[{C_RED}]Pick only one of --today / --week / --month / --range.[/]")
+        raise typer.Exit(1)
+
+    if range_:
+        try:
+            frm, to = range_.split(":", 1)
+            frm, to = frm.strip(), to.strip()
+            if len(frm) != 10 or len(to) != 10:
+                raise ValueError
+            label = f"{frm} → {to}"
+        except ValueError:
+            console.print(f"[{C_RED}]--range must look like 2026-04-01:2026-04-23.[/]")
+            raise typer.Exit(1)
+    else:
+        if week:
+            label, frm, to = aggregator.resolve_range("week")
+        elif month:
+            label, frm, to = aggregator.resolve_range("month")
+        else:
+            label, frm, to = aggregator.resolve_range("today")
 
     db = Database()
-    registry = create_default_registry()
-    registry.sync_all(db)
+    if not no_sync:
+        registry = create_default_registry()
+        registry.sync_all(db)
 
-    trends = aggregator.get_daily_trends(db, days=days)
-    today_sessions = aggregator.get_today_sessions(db)
-    live_sessions = registry.get_live_sessions()
-    aggregator.merge_live_into_trends(trends, live_sessions, today_sessions)
+    totals = aggregator.get_range_totals(db, frm, to)
+    by_agent = aggregator.get_range_by_agent(db, frm, to)
+    by_agent_model = aggregator.get_range_by_agent_model(db, frm, to)
+    by_project = aggregator.get_range_by_project(db, frm, to, limit=10)
+
+    # Periodic breakdown (hourly/daily/weekly) — only when the range
+    # corresponds to a named focus.
+    focus_kind = None
+    if not range_:
+        focus_kind = "week" if week else ("month" if month else "today")
+    periodic = aggregator.get_heatmap(db, focus_kind) if focus_kind else []
+
+    # Previous period totals for delta comparison.
+    prev_totals = None
+    if focus_kind:
+        _, p_frm, p_to = aggregator.resolve_range(focus_kind, offset=1)
+        prev_totals = aggregator.get_range_totals(db, p_frm, p_to)
+
     db.close()
 
-    if not trends:
-        console.print("No history data available.")
-        return
+    _print_report(label, frm, to, totals, by_agent, by_agent_model,
+                  by_project, periodic, focus_kind, prev_totals)
 
-    table = Table(title=f"Daily Trends (last {days} days)")
-    table.add_column("Date", style="cyan")
-    table.add_column("Sessions", justify="right")
-    table.add_column("Turns", justify="right")
-    table.add_column("Messages", justify="right")
-    table.add_column("Tokens", justify="right")
-    table.add_column("Cost", justify="right", style="yellow")
 
-    for t in trends:
-        table.add_row(
-            t.date,
-            str(t.session_count),
-            str(t.user_turns),
-            str(t.message_count),
-            _fmt_tokens(t.total_tokens),
-            f"${t.estimated_cost_usd:.2f}",
+def _print_report(
+    label: str, frm: str, to: str,
+    totals: dict, by_agent: list[dict],
+    by_agent_model: list[dict], by_project: list[dict],
+    periodic: list[dict], focus_kind: str | None,
+    prev_totals: dict | None = None,
+) -> None:
+    tot_tokens = _sum_tokens(totals)
+    tot_cost = totals.get("estimated_cost_usd") or 0.0
+    tot_sess = totals.get("session_count") or 0
+    tot_turns = totals.get("user_turns") or 0
+    cache_pct = _cache_hit_rate(totals)
+
+    # ─── Header panel (label + stats + auto summary line) ───
+    header_text = Text()
+    header_text.append(label, style=f"bold {C_PEACH}")
+    header_text.append(f"   {frm} → {to}", style=C_MUTED)
+
+    delta_line = _delta_line(tot_cost, prev_totals)
+    cost_cell = Group(
+        Text("COST", style=f"{C_MUTED}"),
+        Text(f"${tot_cost:,.2f}", style=f"bold {C_YELLOW}"),
+        delta_line if delta_line else Text(""),
+    )
+    stats = Table.grid(padding=(0, 4))
+    for _ in range(5):
+        stats.add_column(justify="left")
+    stats.add_row(
+        cost_cell,
+        _stat("Sessions", f"{tot_sess:,}", C_MAUVE),
+        _stat("Turns", f"{tot_turns:,}", C_SKY),
+        _stat("Tokens", _fmt_tokens(tot_tokens), C_TEAL),
+        _stat("Cache hit", f"{cache_pct:.0f}%" if cache_pct >= 0 else "—", C_GREEN),
+    )
+
+    summary_line = _auto_summary_line(
+        focus_kind, totals, periodic, prev_totals, cache_pct,
+    )
+    header_children = [header_text]
+    if summary_line:
+        header_children.append(summary_line)
+    header_children.extend([Text(""), stats])
+
+    header_panel = Panel(
+        Group(*header_children),
+        box=box.ROUNDED,
+        border_style=C_SURFACE1,
+        padding=(1, 2),
+    )
+
+    # ─── Heatmap strip (today/week/month scope) ───
+    heatmap_renderable = None
+    if periodic and focus_kind:
+        heatmap_renderable = _build_heatmap_panel(periodic, focus_kind)
+
+    # ─── Table renderables ───
+    agent_tbl = _build_by_agent_table(by_agent)
+    model_tbl = _build_by_agent_model_table(by_agent_model)
+    project_tbl = _build_top_projects_table(by_project)
+    periodic_tbl = _build_periodic_table(periodic, focus_kind)
+
+    # ─── Render ───
+    console.print()
+    console.print(header_panel)
+    if heatmap_renderable is not None:
+        console.print(heatmap_renderable)
+
+    # Two-column layout when the terminal is wide enough. Keeping the
+    # (agent, agent×model) stack on the left preserves the agent → model
+    # reading flow; (projects, periodic) live on the right.
+    tables_left = [t for t in (agent_tbl, model_tbl) if t is not None]
+    tables_right = [t for t in (project_tbl, periodic_tbl) if t is not None]
+
+    try:
+        term_width = console.size.width
+    except Exception:
+        term_width = 0
+
+    if term_width >= 160 and tables_left and tables_right:
+        left_col = Group(*tables_left)
+        right_col = Group(*tables_right)
+        console.print(Columns([left_col, right_col], expand=True, equal=False, padding=(0, 2)))
+    else:
+        for t in tables_left + tables_right:
+            console.print(t)
+
+    console.print()
+
+
+def _auto_summary_line(
+    focus_kind: str | None,
+    totals: dict,
+    periodic: list[dict],
+    prev_totals: dict | None,
+    cache_pct: float,
+) -> Text | None:
+    """Build a one-liner under the header: peak · cache · delta."""
+    parts: list[tuple[str, str]] = []
+
+    # Peak bucket within the periodic breakdown.
+    if periodic:
+        peak = max(periodic, key=lambda b: b.get("cost") or 0)
+        if (peak.get("cost") or 0) > 0:
+            peak_label = peak["label"]
+            if focus_kind == "today":
+                peak_label = f"{peak_label}:00"
+            parts.append(("yellow", f"peak {peak_label} ${peak['cost']:,.2f}"))
+
+    if cache_pct >= 0 and cache_pct >= 50:
+        parts.append(("green", f"cache {cache_pct:.0f}%"))
+
+    if prev_totals is not None:
+        prev = prev_totals.get("estimated_cost_usd") or 0.0
+        cur = totals.get("estimated_cost_usd") or 0.0
+        if prev > 0 and cur > 0:
+            ratio = cur / prev
+            if ratio >= 10:
+                parts.append(("red", "▲ ≫10× vs last"))
+            elif ratio > 1.01:
+                parts.append(("red", f"▲ +{(ratio - 1) * 100:.0f}% vs last"))
+            elif ratio < 0.99:
+                parts.append(("green", f"▼ -{(1 - ratio) * 100:.0f}% vs last"))
+
+    if not parts:
+        return None
+
+    line = Text()
+    for i, (color, text) in enumerate(parts):
+        if i > 0:
+            line.append("  ·  ", style=C_MUTED)
+        line.append(text, style=color)
+    return line
+
+
+def _build_heatmap_panel(buckets: list[dict], focus_kind: str) -> Panel:
+    """Render the activity heatmap as a CLI panel."""
+    blocks = [" ", "·", "░", "▒", "▓", "█", "█"]
+    colors = ["default", "bright_black", "blue", "cyan", "yellow", "red", "bright_red"]
+    levels = len(blocks)
+    max_v = max((b.get("cost") or 0) for b in buckets) or 1.0
+
+    n = len(buckets)
+    if n >= 20:
+        cell_w, label_every = 4, 3
+    elif n >= 10:
+        cell_w, label_every = 6, 1
+    elif n >= 6:
+        cell_w, label_every = 8, 1
+    else:
+        cell_w, label_every = 12, 1
+
+    import datetime as _dt
+    now = _dt.datetime.now()
+    highlight = None
+    if focus_kind == "today":
+        highlight = now.hour
+    elif focus_kind == "week":
+        highlight = now.weekday()
+    elif focus_kind == "month":
+        highlight = n - 1
+
+    row_blocks = Text(" ")
+    row_labels = Text(" ")
+    for i, b in enumerate(buckets):
+        ratio = (b.get("cost") or 0) / max_v
+        lvl = min(levels - 1, int(round(ratio * (levels - 1))))
+        style = colors[lvl]
+        if i == highlight:
+            style = f"bold {style} reverse"
+        row_blocks.append(blocks[lvl] * cell_w, style=style)
+        if i % label_every == 0:
+            row_labels.append(b["label"][:cell_w].center(cell_w), style="bright_black")
+        else:
+            row_labels.append(" " * cell_w, style="default")
+
+    # Summary below the strip
+    peak = max(buckets, key=lambda bb: bb.get("cost") or 0)
+    total_cost = sum((bb.get("cost") or 0) for bb in buckets)
+    total_tokens = sum((bb.get("tokens") or 0) for bb in buckets)
+    summary = Text(" ")
+    if (peak.get("cost") or 0) > 0:
+        summary.append("peak ", style=C_MUTED)
+        summary.append(peak["label"], style="bold")
+        summary.append(f"  ${peak['cost']:,.2f}", style=C_YELLOW)
+        summary.append(f"  {_fmt_tokens(peak.get('tokens') or 0)}", style=C_TEAL)
+        summary.append("    ")
+    summary.append("total ", style=C_MUTED)
+    summary.append(f"${total_cost:,.2f}", style=f"bold {C_YELLOW}")
+    summary.append(f"  {_fmt_tokens(total_tokens)} tokens", style=C_TEAL)
+
+    titles = {"today": "Today by hour",
+              "week":  "This week by day",
+              "month": "This month by week"}
+    return Panel(
+        Group(row_blocks, row_labels, Text(""), summary),
+        title=titles.get(focus_kind, "Heatmap"),
+        title_align="left",
+        box=box.ROUNDED,
+        border_style=C_SURFACE1,
+        padding=(0, 1),
+    )
+
+
+def _build_by_agent_table(by_agent: list[dict]) -> Table | None:
+    if not by_agent:
+        return None
+    tbl = Table(
+        show_header=True,
+        header_style=f"bold {C_SUBTEXT}",
+        box=box.SIMPLE_HEAVY,
+        pad_edge=False,
+        border_style=C_SURFACE1,
+        title="By agent",
+        title_style=f"bold {C_TEXT}",
+        title_justify="left",
+    )
+    tbl.add_column("Agent", style=C_MAUVE)
+    tbl.add_column("Sessions", justify="right", style=C_TEXT)
+    tbl.add_column("Turns", justify="right", style=C_TEXT)
+    tbl.add_column("Tokens", justify="right", style=C_TEAL)
+    tbl.add_column("Cache %", justify="right", style=C_GREEN)
+    tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}")
+    for r in by_agent:
+        cp = _cache_hit_rate(r)
+        tbl.add_row(
+            r["agent_type"],
+            f"{r['session_count']:,}",
+            f"{r['user_turns']:,}",
+            _fmt_tokens(_sum_tokens(r)),
+            f"{cp:.0f}%" if cp >= 0 else "—",
+            f"${r['estimated_cost_usd']:,.2f}",
         )
+    return tbl
 
-    console.print(table)
+
+def _build_by_agent_model_table(rows: list[dict]) -> Table | None:
+    nonzero = [r for r in rows if (r["estimated_cost_usd"] or 0) > 0]
+    if not nonzero:
+        return None
+    tbl = Table(
+        show_header=True,
+        header_style=f"bold {C_SUBTEXT}",
+        box=box.SIMPLE_HEAVY,
+        pad_edge=False,
+        border_style=C_SURFACE1,
+        title="By agent × model",
+        title_style=f"bold {C_TEXT}",
+        title_justify="left",
+    )
+    tbl.add_column("Agent", style=C_MAUVE)
+    tbl.add_column("Model", style=C_SKY)
+    tbl.add_column("Sessions", justify="right", style=C_TEXT)
+    tbl.add_column("Tokens", justify="right", style=C_TEAL)
+    tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}")
+    current_agent = None
+    for r in nonzero:
+        shown_agent = r["agent_type"] if r["agent_type"] != current_agent else ""
+        current_agent = r["agent_type"]
+        tbl.add_row(
+            shown_agent,
+            r["model"],
+            f"{r['session_count']:,}",
+            _fmt_tokens(_sum_tokens(r)),
+            f"${r['estimated_cost_usd']:,.2f}",
+        )
+    return tbl
+
+
+def _build_top_projects_table(rows: list[dict]) -> Table | None:
+    nonzero = [r for r in rows if (r["estimated_cost_usd"] or 0) > 0]
+    if not nonzero:
+        return None
+    tbl = Table(
+        show_header=True,
+        header_style=f"bold {C_SUBTEXT}",
+        box=box.SIMPLE_HEAVY,
+        pad_edge=False,
+        border_style=C_SURFACE1,
+        title="Top projects",
+        title_style=f"bold {C_TEXT}",
+        title_justify="left",
+    )
+    tbl.add_column("Project", style=C_BLUE, overflow="fold", max_width=48)
+    tbl.add_column("Sessions", justify="right", style=C_TEXT)
+    tbl.add_column("Tokens", justify="right", style=C_TEAL)
+    tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}")
+    home = str(Path.home())
+    for r in nonzero:
+        path = r["project_path"] or "(unspecified)"
+        if path.startswith(home):
+            path = "~" + path[len(home):]
+        tbl.add_row(
+            path,
+            f"{r['session_count']:,}",
+            _fmt_tokens(_sum_tokens(r)),
+            f"${r['estimated_cost_usd']:,.2f}",
+        )
+    return tbl
+
+
+def _build_periodic_table(periodic: list[dict], focus_kind: str | None) -> Table | None:
+    if not periodic:
+        return None
+    nonzero = [b for b in periodic if (b.get("cost") or 0) > 0]
+    if not nonzero:
+        return None
+    if focus_kind == "today":
+        periodic_title, bucket_col = "By hour", "Hour"
+    elif focus_kind == "week":
+        periodic_title, bucket_col = "By day", "Day"
+    else:
+        periodic_title, bucket_col = "By week", "Week"
+
+    max_cost = max(b["cost"] for b in nonzero) or 1e-9
+    tbl = Table(
+        show_header=True,
+        header_style=f"bold {C_SUBTEXT}",
+        box=box.SIMPLE_HEAVY,
+        pad_edge=False,
+        border_style=C_SURFACE1,
+        title=periodic_title,
+        title_style=f"bold {C_TEXT}",
+        title_justify="left",
+    )
+    tbl.add_column(bucket_col, style=C_BLUE)
+    tbl.add_column("Sessions", justify="right", style=C_TEXT)
+    tbl.add_column("Tokens", justify="right", style=C_TEAL)
+    tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}")
+    tbl.add_column("", justify="left", no_wrap=True)
+    for b in nonzero:
+        cost = b["cost"] or 0.0
+        ratio = cost / max_cost
+        bar_width = 14
+        fill = int(round(ratio * bar_width))
+        bar = Text()
+        bar.append("█" * fill, style=C_PEACH)
+        bar.append("░" * (bar_width - fill), style=C_SURFACE1)
+        label_col = b["label"]
+        if b.get("sublabel"):
+            label_col = f"{label_col}  [dim]{b['sublabel']}[/dim]"
+        tbl.add_row(
+            label_col,
+            f"{b['session_count']:,}",
+            _fmt_tokens(b.get("tokens") or 0),
+            f"${cost:,.2f}",
+            bar,
+        )
+    return tbl
+
+
+def _stat(label: str, value: str, color: str, big: bool = False) -> Group:
+    label_text = Text(label.upper(), style=f"{C_MUTED}")
+    value_style = f"bold {color}"
+    if big:
+        value_style = f"bold {color}"
+    return Group(label_text, Text(value, style=value_style))
+
+
+# ── helpers ────────────────────────────────────────────────────────
 
 
 def _fmt_tokens(n: int) -> str:
-    """Format token count for compact display: 1234 -> 1.2K, 1234567 -> 1.2M."""
+    """Compact token count: 1234 -> 1.2K, 1234567 -> 1.2M, 1.2B."""
     if n >= 1_000_000_000:
         return f"{n / 1_000_000_000:.1f}B"
     if n >= 1_000_000:
@@ -211,54 +545,53 @@ def _fmt_tokens(n: int) -> str:
     return str(n)
 
 
-@app.command()
-def bar() -> None:
-    """Print a one-line summary for status bars (i3blocks, waybar, etc.)."""
-    import sys
-    from .store.database import Database
-    from .store import aggregator
-    from .collectors import create_default_registry
-
-    try:
-        db = Database()
-        registry = create_default_registry()
-        registry.sync_all(db)
-        overview = aggregator.get_today_overview(db)
-        today_sessions = aggregator.get_today_sessions(db)
-        live_sessions = registry.get_live_sessions()
-        aggregator.merge_live_into_overview(overview, live_sessions, today_sessions)
-        db.close()
-    except Exception:
-        print("AM: --")
-        sys.exit(0)
-
-    all_tokens = (overview.input_tokens + overview.output_tokens
-                   + overview.cache_read_tokens + overview.cache_creation_tokens)
-    tokens = _fmt_tokens(all_tokens)
-    cost = f"${overview.estimated_cost_usd:.2f}"
-    # full_text
-    print(f"AM: {cost} | {tokens}")
-    # short_text
-    print(f"AM: {cost}")
+def _sum_tokens(r: dict) -> int:
+    return (
+        (r.get("input_tokens") or 0)
+        + (r.get("output_tokens") or 0)
+        + (r.get("cache_read_tokens") or 0)
+        + (r.get("cache_creation_tokens") or 0)
+    )
 
 
-@app.command()
-def sync() -> None:
-    """Force sync all collectors to the database."""
-    from .store.database import Database
-    from .collectors import create_default_registry
+def _cache_hit_rate(r: dict) -> float:
+    """Return cache-read share of prompt-side tokens in %, or -1 if N/A."""
+    cache_read = r.get("cache_read_tokens") or 0
+    input_tok = r.get("input_tokens") or 0
+    cache_create = r.get("cache_creation_tokens") or 0
+    prompt_side = cache_read + input_tok + cache_create
+    if prompt_side <= 0:
+        return -1.0
+    return 100.0 * cache_read / prompt_side
 
-    db = Database()
-    registry = create_default_registry()
 
-    console.print("Syncing all collectors...")
-    registry.sync_all(db)
-    db.close()
-
-    console.print("[green]Sync complete.[/green]")
-    console.print(f"  Collectors: {len(registry.get_all())}")
-    for c in registry.get_all():
-        console.print(f"    - {c.agent_type}")
+def _delta_line(current: float, prev_totals: dict | None) -> Text | None:
+    """Build a colored '▲ +23% vs $X' line, or None if no comparison."""
+    if prev_totals is None:
+        return None
+    prev = prev_totals.get("estimated_cost_usd") or 0.0
+    line = Text()
+    if prev <= 0 and current <= 0:
+        return None
+    if prev <= 0:
+        line.append("▲ new", style=C_PEACH)
+        return line
+    ratio = current / prev
+    if abs(current - prev) < 0.01 or abs(ratio - 1.0) < 0.01:
+        line.append("≈ same as last", style=C_MUTED)
+        return line
+    if current > prev:
+        # Anything above 10x is shown as ≫10× rather than a huge number
+        if ratio >= 10:
+            line.append("▲ ≫10× ", style=C_RED)
+        else:
+            pct = (ratio - 1) * 100
+            line.append(f"▲ +{pct:.0f}% ", style=C_RED)
+    else:
+        pct = (1 - ratio) * 100
+        line.append(f"▼ -{pct:.0f}% ", style=C_GREEN)
+    line.append(f"vs ${prev:,.2f}", style=C_MUTED)
+    return line
 
 
 # ── pricing subcommands ────────────────────────────────────────────
@@ -271,26 +604,36 @@ def pricing_list() -> None:
 
     user = _load_user_pricing()
 
-    table = Table(title="Model Pricing (USD per 1M tokens)")
-    table.add_column("Model", style="cyan")
-    table.add_column("Input", justify="right")
-    table.add_column("Output", justify="right")
-    table.add_column("Cache Read", justify="right")
-    table.add_column("Cache Write", justify="right")
-    table.add_column("Source", style="dim")
+    table = Table(
+        title="Model Pricing (USD per 1M tokens)",
+        title_style=f"bold {C_TEXT}",
+        box=box.SIMPLE_HEAVY,
+        border_style=C_SURFACE1,
+        header_style=f"bold {C_SUBTEXT}",
+        pad_edge=False,
+    )
+    table.add_column("Model", style=C_MAUVE)
+    table.add_column("Input", justify="right", style=C_TEAL)
+    table.add_column("Output", justify="right", style=C_TEAL)
+    table.add_column("Cache Read", justify="right", style=C_SKY)
+    table.add_column("Cache Write", justify="right", style=C_SKY)
+    table.add_column("Source", style=C_MUTED)
 
-    # Show all builtin models, marking overrides
     all_models = dict(_BUILTIN_PRICING)
     all_models.update(user)
 
     for model in sorted(all_models):
         p = all_models[model]
         if model in user and model in _BUILTIN_PRICING:
-            source = "[yellow]override[/yellow]"
+            # Don't scream "override" if the value equals builtin
+            if tuple(p) == tuple(_BUILTIN_PRICING[model]):
+                source = Text("builtin", style=C_MUTED)
+            else:
+                source = Text("override", style=C_PEACH)
         elif model in user:
-            source = "[green]custom[/green]"
+            source = Text("custom", style=C_GREEN)
         else:
-            source = "builtin"
+            source = Text("builtin", style=C_MUTED)
         table.add_row(
             model,
             f"${p[0]:.3f}",
@@ -306,57 +649,47 @@ def pricing_list() -> None:
 @pricing_app.command("set", context_settings={"help_option_names": ["-h", "--help"]})
 def pricing_set(
     ctx: typer.Context,
-    model: str = typer.Argument(None, help="Model name (e.g. claude-opus-4-6)."),
+    model: str = typer.Argument(None, help="Model name (e.g. claude-opus-4-7)."),
     input_price: float = typer.Option(None, "--input", "-i", help="Input price per 1M tokens."),
     output_price: float = typer.Option(None, "--output", "-o", help="Output price per 1M tokens."),
     cache_read: float = typer.Option(0.0, "--cache-read", "-cr", help="Cache read price per 1M tokens."),
     cache_write: float = typer.Option(0.0, "--cache-write", "-cw", help="Cache write price per 1M tokens."),
 ) -> None:
-    """Add or update pricing for a model.
-
-    Prices are in USD per 1M tokens.
-    """
+    """Add or update pricing for a model (USD per 1M tokens)."""
     if model is None or input_price is None or output_price is None:
         console.print(ctx.get_help())
         console.print()
-        console.print("[bold]Examples:[/bold]")
-        console.print("  # Add a new model")
-        console.print("  agentic-metric pricing set deepseek-r2 -i 0.5 -o 2.0")
-        console.print()
-        console.print("  # Override builtin pricing")
-        console.print("  agentic-metric pricing set claude-opus-4-6 -i 4.0 -o 20.0 -cr 0.4 -cw 5.0")
+        console.print(f"[bold {C_TEXT}]Examples:[/]")
+        console.print(f"  [{C_MUTED}]agentic-metric pricing set deepseek-r2 -i 0.5 -o 2.0[/]")
+        console.print(f"  [{C_MUTED}]agentic-metric pricing set claude-opus-4-7 -i 4.0 -o 20.0 -cr 0.4 -cw 5.0[/]")
         raise typer.Exit()
 
     from .pricing import set_user_pricing
 
     set_user_pricing(model, input_price, output_price, cache_read, cache_write)
     console.print(
-        f"[green]Set pricing for {model}:[/green] "
-        f"input=${input_price:.3f}  output=${output_price:.3f}  "
-        f"cache_read=${cache_read:.3f}  cache_write=${cache_write:.3f}"
+        f"[bold {C_GREEN}]✓[/] Set pricing for [bold {C_MAUVE}]{model}[/]: "
+        f"input=[{C_TEAL}]${input_price:.3f}[/]  output=[{C_TEAL}]${output_price:.3f}[/]  "
+        f"cache_read=[{C_SKY}]${cache_read:.3f}[/]  cache_write=[{C_SKY}]${cache_write:.3f}[/]"
     )
 
 
 @pricing_app.command("reset")
 def pricing_reset(
-    model: str = typer.Argument(
-        None, help="Model to reset. Omit to reset all.",
-    ),
-    all_models: bool = typer.Option(
-        False, "--all", help="Reset all user overrides.",
-    ),
+    model: str = typer.Argument(None, help="Model to reset. Omit to reset all."),
+    all_models: bool = typer.Option(False, "--all", help="Reset all user overrides."),
 ) -> None:
     """Reset pricing to builtin defaults."""
     from .pricing import remove_user_pricing, reset_all_user_pricing
 
     if all_models:
         reset_all_user_pricing()
-        console.print("[green]All user pricing overrides removed.[/green]")
+        console.print(f"[bold {C_GREEN}]✓[/] All user pricing overrides removed.")
     elif model:
         if remove_user_pricing(model):
-            console.print(f"[green]Reset {model} to builtin default.[/green]")
+            console.print(f"[bold {C_GREEN}]✓[/] Reset {model} to builtin default.")
         else:
-            console.print(f"[yellow]{model} has no user override.[/yellow]")
+            console.print(f"[{C_YELLOW}]{model} has no user override.[/]")
     else:
-        console.print("[red]Specify a model name or use --all.[/red]")
+        console.print(f"[{C_RED}]Specify a model name or use --all.[/]")
         raise typer.Exit(1)
