@@ -286,6 +286,102 @@ def test_codex_cross_day_live_session_uses_today_counters(tmp_path):
     assert live.today_user_turns == 1
 
 
+def test_codex_forked_session_subtracts_replayed_parent_baseline(tmp_path):
+    session_file = tmp_path / "rollout-forked.jsonl"
+    lines = [
+        {
+            "timestamp": "2026-04-24T03:05:12Z",
+            "type": "session_meta",
+            "payload": {
+                "id": "child",
+                "forked_from_id": "parent",
+                "cwd": "/tmp/project",
+                "source": {"subagent": {"thread_spawn": {"parent_thread_id": "parent"}}},
+            },
+        },
+        {
+            "timestamp": "2026-04-24T03:05:12Z",
+            "type": "session_meta",
+            "payload": {"id": "parent", "cwd": "/tmp/project"},
+        },
+        {
+            "timestamp": "2026-04-24T03:05:12Z",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "old parent prompt"},
+        },
+        {
+            "timestamp": "2026-04-24T03:05:12Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 1000,
+                        "cached_input_tokens": 800,
+                        "output_tokens": 100,
+                    }
+                },
+            },
+        },
+        {
+            "timestamp": "2026-04-24T03:05:16Z",
+            "type": "turn_context",
+            "payload": {"model": "gpt-5.5"},
+        },
+        {
+            "timestamp": "2026-04-24T03:05:16Z",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "child task"},
+        },
+        {
+            "timestamp": "2026-04-24T03:05:17Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 1000,
+                        "cached_input_tokens": 800,
+                        "output_tokens": 100,
+                    }
+                },
+            },
+        },
+        {
+            "timestamp": "2026-04-24T03:05:18Z",
+            "type": "event_msg",
+            "payload": {"type": "agent_message"},
+        },
+        {
+            "timestamp": "2026-04-24T03:05:19Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 1300,
+                        "cached_input_tokens": 900,
+                        "output_tokens": 120,
+                    }
+                },
+            },
+        },
+    ]
+    session_file.write_text("".join(json.dumps(line) + "\n" for line in lines))
+
+    accum = CodexSessionAccum(session_file, project_path="/tmp/project")
+    accum.read_new_lines()
+
+    assert accum.session_id == "child"
+    assert accum.model == "gpt-5.5"
+    assert accum.user_turns == 1
+    assert accum.message_count == 2
+    assert accum.first_prompt == "child task"
+    assert accum.input_tokens == 200
+    assert accum.cache_read == 100
+    assert accum.output_tokens == 20
+
+
 def test_codex_live_monitor_finds_older_active_session(tmp_path):
     class FakeDate(date):
         @classmethod

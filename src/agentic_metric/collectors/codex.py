@@ -56,6 +56,12 @@ class _SessionAccum:
         "partial_line",
         "file_id",
         "file_mtime_ns",
+        "is_forked",
+        "seen_turn_context",
+        "fork_baseline_raw_input",
+        "fork_baseline_output",
+        "fork_baseline_cache_read",
+        "fork_baseline_cache_create",
     )
 
     def __init__(self, file_path: Path, project_path: str, pid: int = 0) -> None:
@@ -91,6 +97,12 @@ class _SessionAccum:
         self.partial_line = b""
         self.file_id: tuple[int, int] | None = None
         self.file_mtime_ns = -1
+        self.is_forked = False
+        self.seen_turn_context = False
+        self.fork_baseline_raw_input = 0
+        self.fork_baseline_output = 0
+        self.fork_baseline_cache_read = 0
+        self.fork_baseline_cache_create = 0
 
     def read_new_lines(self) -> None:
         """Read only bytes appended since last call.
@@ -164,6 +176,12 @@ class _SessionAccum:
         self.git_branch = ""
         self.model = ""
         self.partial_line = b""
+        self.is_forked = False
+        self.seen_turn_context = False
+        self.fork_baseline_raw_input = 0
+        self.fork_baseline_output = 0
+        self.fork_baseline_cache_read = 0
+        self.fork_baseline_cache_create = 0
         self._reset_today_counters(today_str)
 
     def _reset_today_counters(self, today_str: str) -> None:
@@ -215,6 +233,11 @@ class _SessionAccum:
             payload = entry.get("payload", {})
             if not self.session_id:
                 self.session_id = payload.get("id", "")
+                source = payload.get("source", {})
+                self.is_forked = bool(
+                    payload.get("forked_from_id")
+                    or (isinstance(source, dict) and source.get("subagent"))
+                )
             if not self.project_path:
                 self.project_path = payload.get("cwd", "")
             git = payload.get("git", {})
@@ -226,12 +249,18 @@ class _SessionAccum:
             model = payload.get("model", "")
             if model:
                 self.model = model
+            self.seen_turn_context = True
 
         elif entry_type == "event_msg":
             self._process_event_msg(entry.get("payload", {}), is_today)
 
     def _process_event_msg(self, payload: dict, is_today: bool = True) -> None:
         msg_type = payload.get("type", "")
+
+        if self.is_forked and not self.seen_turn_context:
+            if msg_type == "token_count":
+                self._update_fork_baseline(payload)
+            return
 
         if msg_type == "user_message":
             self.user_turns += 1
@@ -273,11 +302,11 @@ class _SessionAccum:
             cached = usage.get("cached_input_tokens")
             out = usage.get("output_tokens")
             if out is not None:
-                self.output_tokens = out
+                self.output_tokens = max(out - self.fork_baseline_output, 0)
             if raw_input is not None:
-                self.raw_input_tokens = raw_input
+                self.raw_input_tokens = max(raw_input - self.fork_baseline_raw_input, 0)
             if cached is not None:
-                self.cache_read = cached
+                self.cache_read = max(cached - self.fork_baseline_cache_read, 0)
             if raw_input is not None or cached is not None:
                 self.input_tokens = max(self.raw_input_tokens - self.cache_read, 0)
             if is_today:
@@ -290,6 +319,27 @@ class _SessionAccum:
                 self.today_output_base = self.output_tokens
                 self.today_cache_read_base = self.cache_read
                 self.today_cache_create_base = self.cache_create
+
+    def _update_fork_baseline(self, payload: dict) -> None:
+        """Remember replayed parent cumulative usage before a forked run starts."""
+        info = payload.get("info")
+        if not info:
+            return
+        usage = info.get("total_token_usage", {})
+        if not usage:
+            return
+        raw_input = usage.get("input_tokens")
+        cached = usage.get("cached_input_tokens")
+        out = usage.get("output_tokens")
+        cache_create = usage.get("cache_creation_input_tokens")
+        if raw_input is not None:
+            self.fork_baseline_raw_input = raw_input
+        if cached is not None:
+            self.fork_baseline_cache_read = cached
+        if out is not None:
+            self.fork_baseline_output = out
+        if cache_create is not None:
+            self.fork_baseline_cache_create = cache_create
 
     def to_live_session(self) -> LiveSession:
         return LiveSession(
@@ -478,7 +528,7 @@ class CodexCollector(BaseCollector):
         if not CODEX_SESSIONS_DIR.exists():
             return
 
-        sync_prefix = "codex_jsonl:"
+        sync_prefix = "codex_jsonl:v2:"
 
         for jsonl_file in CODEX_SESSIONS_DIR.rglob("rollout-*.jsonl"):
             sync_key = f"{sync_prefix}{jsonl_file}"
