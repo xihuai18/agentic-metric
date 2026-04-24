@@ -88,6 +88,26 @@ def test_estimate_cost_with_cache():
     assert abs(cost - 7.25) < 0.001
 
 
+def test_estimate_cost_zero_usage_unknown_model_is_silent(caplog):
+    import agentic_metric.pricing as p
+
+    p._warned_models.clear()
+    caplog.set_level("WARNING", logger="agentic_metric.pricing")
+
+    assert estimate_cost("unknown-model-xyz") == 0.0
+    assert "Unknown model" not in caplog.text
+
+
+def test_synthetic_model_is_non_billable(caplog):
+    import agentic_metric.pricing as p
+
+    p._warned_models.clear()
+    caplog.set_level("WARNING", logger="agentic_metric.pricing")
+
+    assert estimate_cost("<synthetic>", input_tokens=1_000_000, output_tokens=1_000_000) == 0.0
+    assert "Unknown model" not in caplog.text
+
+
 def test_all_models_have_four_values():
     for model, prices in PRICING.items():
         assert len(prices) == 4, f"{model} has {len(prices)} values"
@@ -134,6 +154,8 @@ def test_pricing_fingerprint_includes_lookup_rules(tmp_path):
         with patch("agentic_metric.pricing._FAMILY_FALLBACK", [("gpt-5", (9.0, 9.0, 0.0, 0.0))]):
             assert get_pricing_fingerprint() != base
         with patch("agentic_metric.pricing._DEFAULT_PRICING", (9.0, 9.0, 0.0, 0.0)):
+            assert get_pricing_fingerprint() != base
+        with patch("agentic_metric.pricing._NON_BILLABLE_MODELS", {"<synthetic>", "<internal>"}):
             assert get_pricing_fingerprint() != base
     _reset_cache()
 

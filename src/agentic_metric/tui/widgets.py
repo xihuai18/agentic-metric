@@ -309,6 +309,7 @@ class Breakdown(Static):
         super().__init__(**kwargs)
         self._groups: list[dict] = []
         self._total_cost: float = 0.0
+        self._visible_model_limit = 4
 
     def update_data(self, groups: list[dict], total_cost: float) -> None:
         self._groups = groups
@@ -354,8 +355,8 @@ class Breakdown(Static):
             # Model rows: keep the panel readable, then roll up the tail.
             raw_models = g.get("models", []) or []
             nonzero = [m for m in raw_models if (m.get("cost") or 0) > 0]
-            visible = nonzero[:6]
-            hidden = nonzero[6:]
+            visible = nonzero[: self._visible_model_limit]
+            hidden = nonzero[self._visible_model_limit :]
             for j, m in enumerate(visible):
                 last = (j == len(visible) - 1 and not hidden)
                 connector = "└─" if last else "├─"

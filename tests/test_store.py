@@ -317,6 +317,50 @@ def test_session_usage_splits_cross_day_range_queries():
     db.close()
 
 
+def test_top_sessions_omits_synthetic_model_markers():
+    db = _make_db()
+    db.upsert_session(
+        "s1", "claude_code",
+        project_path="/tmp/project",
+        model="claude-opus-4-7",
+        started_at="2026-04-24T10:00:00Z",
+        first_prompt="hello",
+    )
+    db.replace_session_usage(
+        "s1",
+        "claude_code",
+        [
+            {
+                "usage_date": "2026-04-24",
+                "usage_hour": 10,
+                "project_path": "/tmp/project",
+                "model": "claude-opus-4-7",
+                "message_count": 2,
+                "user_turns": 1,
+                "input_tokens": 1_000,
+                "output_tokens": 100,
+            },
+            {
+                "usage_date": "2026-04-24",
+                "usage_hour": 10,
+                "project_path": "/tmp/project",
+                "model": "<synthetic>",
+                "message_count": 1,
+                "user_turns": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+            },
+        ],
+    )
+    db.commit()
+
+    rows = get_range_top_sessions(db, "2026-04-24", "2026-04-24", limit=1)
+    assert len(rows) == 1
+    assert rows[0]["session_id"] == "s1"
+    assert rows[0]["models"] == "claude-opus-4-7"
+    db.close()
+
+
 def test_merge_live_overview_matches_by_session_and_agent():
     today = datetime.now().strftime("%Y-%m-%d")
     today_sessions = [{

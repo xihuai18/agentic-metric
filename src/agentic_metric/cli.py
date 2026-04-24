@@ -33,6 +33,8 @@ app.add_typer(pricing_app, name="pricing")
 
 console = Console()
 
+_COMPACT_TOP_SESSIONS_LIMIT = 5
+
 
 # ANSI named colors — inherit the terminal's own palette / theme.
 # No hard-coded hex, so output adapts to light/dark terminals equally well.
@@ -122,6 +124,9 @@ def report(
     no_sync: bool = typer.Option(
         False, "--no-sync", help="Skip syncing collectors before querying."
     ),
+    full: bool = typer.Option(
+        False, "--full", help="Show the full drill-down with extra model/time tables."
+    ),
     limit: int = typer.Option(
         8, "--limit", "-n", min=1, max=25,
         help="Rows to show in driver tables.",
@@ -165,7 +170,12 @@ def report(
     by_agent_model = aggregator.get_range_by_agent_model(db, frm, to)
     by_project = aggregator.get_range_by_project(db, frm, to, limit=10)
     by_time_model = aggregator.get_range_by_time_model(db, frm, to, limit=limit)
-    top_sessions = aggregator.get_range_top_sessions(db, frm, to, limit=limit)
+    top_sessions = aggregator.get_range_top_sessions(
+        db,
+        frm,
+        to,
+        limit=limit if full else min(limit, _COMPACT_TOP_SESSIONS_LIMIT),
+    )
 
     # Periodic breakdown (hourly/daily/weekly) — only when the range
     # corresponds to a named focus.
@@ -184,41 +194,45 @@ def report(
 
     _print_report(
         label, frm, to, totals, by_agent, by_agent_model, by_project,
-        by_time_model, top_sessions, periodic, focus_kind, prev_totals,
+        by_time_model, top_sessions, periodic, focus_kind, prev_totals, full=full,
     )
 
 
 @app.command("today")
 def today_cmd(
     no_sync: bool = typer.Option(False, "--no-sync", help="Skip syncing collectors before querying."),
+    full: bool = typer.Option(False, "--full", help="Show the full drill-down with extra model/time tables."),
     limit: int = typer.Option(8, "--limit", "-n", min=1, max=25, help="Rows to show in driver tables."),
 ) -> None:
     """Shortcut for ``report --today``."""
-    report(today_=True, week=False, month=False, range_=None, no_sync=no_sync, limit=limit)
+    report(today_=True, week=False, month=False, range_=None, no_sync=no_sync, full=full, limit=limit)
 
 
 @app.command("week")
 def week_cmd(
     no_sync: bool = typer.Option(False, "--no-sync", help="Skip syncing collectors before querying."),
+    full: bool = typer.Option(False, "--full", help="Show the full drill-down with extra model/time tables."),
     limit: int = typer.Option(8, "--limit", "-n", min=1, max=25, help="Rows to show in driver tables."),
 ) -> None:
     """Shortcut for ``report --week``."""
-    report(today_=False, week=True, month=False, range_=None, no_sync=no_sync, limit=limit)
+    report(today_=False, week=True, month=False, range_=None, no_sync=no_sync, full=full, limit=limit)
 
 
 @app.command("month")
 def month_cmd(
     no_sync: bool = typer.Option(False, "--no-sync", help="Skip syncing collectors before querying."),
+    full: bool = typer.Option(False, "--full", help="Show the full drill-down with extra model/time tables."),
     limit: int = typer.Option(8, "--limit", "-n", min=1, max=25, help="Rows to show in driver tables."),
 ) -> None:
     """Shortcut for ``report --month``."""
-    report(today_=False, week=False, month=True, range_=None, no_sync=no_sync, limit=limit)
+    report(today_=False, week=False, month=True, range_=None, no_sync=no_sync, full=full, limit=limit)
 
 
 @app.command("history")
 def history_cmd(
     days: int = typer.Option(14, "--days", "-d", min=1, max=365, help="Number of days to include."),
     no_sync: bool = typer.Option(False, "--no-sync", help="Skip syncing collectors before querying."),
+    full: bool = typer.Option(False, "--full", help="Show the full drill-down with extra model/time tables."),
     limit: int = typer.Option(8, "--limit", "-n", min=1, max=25, help="Rows to show in driver tables."),
 ) -> None:
     """Show a recent multi-day usage report."""
@@ -230,6 +244,7 @@ def history_cmd(
         month=False,
         range_=f"{start.strftime('%Y-%m-%d')}:{today.strftime('%Y-%m-%d')}",
         no_sync=no_sync,
+        full=full,
         limit=limit,
     )
 
@@ -241,6 +256,8 @@ def _print_report(
     by_time_model: list[dict], top_sessions: list[dict],
     periodic: list[dict], focus_kind: str | None,
     prev_totals: dict | None = None,
+    *,
+    full: bool = False,
 ) -> None:
     tot_tokens = _sum_tokens(totals)
     tot_cost = totals.get("estimated_cost_usd") or 0.0
@@ -293,14 +310,15 @@ def _print_report(
     if periodic and focus_kind:
         heatmap_renderable = _build_heatmap_panel(periodic, focus_kind)
     drivers_renderable = _build_cost_drivers_panel(
-        totals, by_time_model, top_sessions, by_project,
+        totals, by_time_model, top_sessions, by_project, detailed=full,
     )
 
     # ─── Table renderables ───
     agent_tbl = _build_by_agent_table(by_agent)
-    model_tbl = _build_by_agent_model_table(by_agent_model)
+    session_tbl = _build_top_sessions_table(top_sessions, tot_cost)
     project_tbl = _build_top_projects_table(by_project)
-    periodic_tbl = _build_periodic_table(periodic, focus_kind)
+    model_tbl = _build_by_agent_model_table(by_agent_model) if full else None
+    periodic_tbl = _build_periodic_table(periodic, focus_kind) if full else None
 
     # ─── Render ───
     console.print()
@@ -310,24 +328,29 @@ def _print_report(
     if drivers_renderable is not None:
         console.print(drivers_renderable)
 
-    # Two-column layout when the terminal is wide enough. Keeping the
-    # (agent, agent×model) stack on the left preserves the agent → model
-    # reading flow; (projects, periodic) live on the right.
-    tables_left = [t for t in (agent_tbl, model_tbl) if t is not None]
-    tables_right = [t for t in (project_tbl, periodic_tbl) if t is not None]
-
     try:
         term_width = console.size.width
     except Exception:
         term_width = 0
 
-    if term_width >= 160 and tables_left and tables_right:
-        left_col = Group(*tables_left)
-        right_col = Group(*tables_right)
-        console.print(Columns([left_col, right_col], expand=True, equal=False, padding=(0, 2)))
+    if term_width >= 160 and agent_tbl is not None and project_tbl is not None:
+        console.print(Columns([agent_tbl, project_tbl], expand=True, equal=False, padding=(0, 2)))
     else:
-        for t in tables_left + tables_right:
-            console.print(t)
+        if agent_tbl is not None:
+            console.print(agent_tbl)
+        if project_tbl is not None:
+            console.print(project_tbl)
+
+    if session_tbl is not None:
+        console.print(session_tbl)
+
+    detail_tables = [t for t in (model_tbl, periodic_tbl) if t is not None]
+    if detail_tables:
+        if term_width >= 160 and len(detail_tables) == 2:
+            console.print(Columns(detail_tables, expand=True, equal=False, padding=(0, 2)))
+        else:
+            for t in detail_tables:
+                console.print(t)
 
     console.print()
 
@@ -464,6 +487,8 @@ def _build_cost_drivers_panel(
     by_time_model: list[dict],
     top_sessions: list[dict],
     by_project: list[dict],
+    *,
+    detailed: bool = False,
 ) -> Panel | None:
     """Render the report explanation panel: peak buckets and expensive sessions."""
     if not by_time_model and not top_sessions and not by_project:
@@ -472,26 +497,15 @@ def _build_cost_drivers_panel(
     total_cost = totals.get("estimated_cost_usd") or 0.0
     summary = _driver_summary_line(total_cost, by_time_model, top_sessions, by_project)
 
-    time_table = _build_time_model_table(by_time_model, total_cost)
-    session_table = _build_top_sessions_table(top_sessions, total_cost)
-    project_line = _top_project_line(by_project, total_cost)
-
     body: list[object] = []
     if summary:
         body.append(summary)
-        body.append(Text(""))
-    if project_line:
-        body.append(project_line)
-        body.append(Text(""))
-
-    tables = [t for t in (time_table, session_table) if t is not None]
-    if len(tables) == 2 and console.size.width >= 150:
-        body.append(Columns(tables, expand=True, equal=False, padding=(0, 2)))
-    else:
-        for i, table in enumerate(tables):
-            if i:
+    if detailed:
+        time_table = _build_time_model_table(by_time_model, total_cost)
+        if time_table is not None:
+            if body:
                 body.append(Text(""))
-            body.append(table)
+            body.append(time_table)
 
     if not body:
         return None

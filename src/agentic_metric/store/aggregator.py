@@ -540,7 +540,17 @@ def get_range_top_sessions(db: Database, from_date: str, to_date: str, limit: in
                   COALESCE(NULLIF(s.first_prompt, ''), '') AS first_prompt,
                   COALESCE(NULLIF(s.started_at, ''), '') AS started_at,
                   COALESCE(NULLIF(s.ended_at, ''), '') AS ended_at,
-                  COALESCE(GROUP_CONCAT(DISTINCT NULLIF(u.model, '')), '') AS models,
+                  COALESCE(NULLIF(s.model, ''), '') AS model,
+                  COALESCE(
+                      GROUP_CONCAT(
+                          DISTINCT CASE
+                              WHEN COALESCE(u.estimated_cost_usd, 0) > 0
+                               AND u.model NOT IN ('', '<synthetic>')
+                              THEN u.model
+                          END
+                      ),
+                      ''
+                  ) AS models,
                   SUM(u.message_count) AS message_count,
                   SUM(u.user_turns) AS user_turns,
                   COALESCE(SUM(u.input_tokens), 0) AS input_tokens,

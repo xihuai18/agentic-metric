@@ -86,7 +86,10 @@ _MODEL_ALIASES: dict[str, str] = {
     "gpt-5.1-codex-max": "gpt-5.1-codex",
 }
 
-_PRICING_FINGERPRINT_VERSION = 3
+# Internal placeholder/system responses that should never be billed as a model.
+_NON_BILLABLE_MODELS = {"<synthetic>"}
+
+_PRICING_FINGERPRINT_VERSION = 4
 
 # Track warned models to avoid spamming logs
 _warned_models: set[str] = set()
@@ -199,6 +202,9 @@ def get_pricing(model: str) -> tuple[float, float, float, float]:
     """
     model = normalize_model(model)
 
+    if model in _NON_BILLABLE_MODELS:
+        return (0.0, 0.0, 0.0, 0.0)
+
     # 1. User overrides (exact match only)
     user = _load_user_pricing()
     if model in user:
@@ -247,6 +253,7 @@ def get_pricing_fingerprint() -> str:
         "builtin": sorted((model, list(prices)) for model, prices in _BUILTIN_PRICING.items()),
         "default": list(_DEFAULT_PRICING),
         "family_fallback": sorted((model, list(prices)) for model, prices in _FAMILY_FALLBACK),
+        "non_billable": sorted(_NON_BILLABLE_MODELS),
         "user": sorted((model, list(prices)) for model, prices in _load_user_pricing().items()),
     }
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -266,6 +273,14 @@ def estimate_cost(
     provider's API semantics (Anthropic: already separate; OpenAI:
     ``input_tokens`` is total, subtract ``cached_input_tokens``).
     """
+    if (
+        input_tokens <= 0
+        and output_tokens <= 0
+        and cache_read_tokens <= 0
+        and cache_creation_tokens <= 0
+    ):
+        return 0.0
+
     p_in, p_out, p_cr, p_cw = get_pricing(model)
     cost = (
         input_tokens * p_in
