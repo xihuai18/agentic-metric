@@ -9,6 +9,12 @@ from agentic_metric.models import DailyTrend, LiveSession, TodayOverview
 from agentic_metric.store.database import Database
 from agentic_metric.store.aggregator import (
     get_daily_trends,
+    get_range_by_agent_model,
+    get_range_daily,
+    get_range_by_time_model,
+    get_range_top_sessions,
+    get_range_totals,
+    get_today_sessions,
     get_today_overview,
     merge_live_into_overview,
     merge_live_into_trends,
@@ -29,6 +35,7 @@ def test_database_creation():
     ).fetchall()
     names = {r["name"] for r in tables}
     assert "sessions" in names
+    assert "session_usage" in names
     assert "sync_state" in names
     db.close()
 
@@ -115,6 +122,55 @@ def test_database_reprices_sessions_when_pricing_changes(tmp_path):
         db.close()
 
 
+def test_database_reprices_session_usage_when_pricing_changes(tmp_path):
+    pricing_file = tmp_path / "pricing.json"
+    db_path = str(tmp_path / "data.db")
+    pricing_file.write_text(json.dumps({
+        "cheap-model": [1.0, 0.0, 0.0, 0.0],
+        "expensive-model": [10.0, 0.0, 0.0, 0.0],
+    }))
+
+    with patch("agentic_metric.pricing.PRICING_FILE", pricing_file):
+        db = Database(db_path=db_path)
+        db.upsert_session(
+            "s1", "codex",
+            model="expensive-model",
+            input_tokens=2_000_000,
+            estimated_cost_usd=11.0,
+        )
+        db.replace_session_usage(
+            "s1",
+            "codex",
+            [
+                {
+                    "usage_date": "2026-04-23",
+                    "usage_hour": 23,
+                    "model": "cheap-model",
+                    "input_tokens": 1_000_000,
+                },
+                {
+                    "usage_date": "2026-04-24",
+                    "usage_hour": 0,
+                    "model": "expensive-model",
+                    "input_tokens": 1_000_000,
+                },
+            ],
+        )
+        db.commit()
+        db.close()
+
+        pricing_file.write_text(json.dumps({
+            "cheap-model": [2.0, 0.0, 0.0, 0.0],
+            "expensive-model": [20.0, 0.0, 0.0, 0.0],
+        }))
+        db = Database(db_path=db_path)
+        row = db.conn.execute(
+            "SELECT estimated_cost_usd FROM sessions WHERE session_id = 's1' AND agent_type = 'codex'"
+        ).fetchone()
+        assert row["estimated_cost_usd"] == 22.0
+        db.close()
+
+
 def test_sync_state():
     db = _make_db()
     assert db.get_sync_state("test_key") is None
@@ -154,6 +210,110 @@ def test_today_overview_from_sessions():
     assert overview.output_tokens == 1500
     assert overview.message_count == 30
     assert len(overview.by_agent) == 2
+    db.close()
+
+
+def test_session_usage_splits_cross_day_range_queries():
+    class FakeDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 4, 24, 12, 0, 0)
+
+    db = _make_db()
+    db.upsert_session(
+        "cross", "codex",
+        project_path="/tmp/project",
+        model="gpt-5.4",
+        started_at="2026-04-23T23:50:00+08:00",
+        ended_at="2026-04-24T00:10:00+08:00",
+        input_tokens=300,
+        output_tokens=30,
+        cache_read_tokens=100,
+        cache_creation_tokens=10,
+        message_count=5,
+        user_turns=2,
+        first_prompt="cross day prompt",
+    )
+    db.replace_session_usage(
+        "cross",
+        "codex",
+        [
+            {
+                "usage_date": "2026-04-23",
+                "usage_hour": 23,
+                "project_path": "/tmp/project",
+                "model": "gpt-5.4",
+                "message_count": 2,
+                "user_turns": 1,
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cache_read_tokens": 20,
+                "cache_creation_tokens": 0,
+            },
+            {
+                "usage_date": "2026-04-24",
+                "usage_hour": 0,
+                "project_path": "/tmp/project",
+                "model": "gpt-5.4",
+                "message_count": 3,
+                "user_turns": 1,
+                "input_tokens": 200,
+                "output_tokens": 20,
+                "cache_read_tokens": 80,
+                "cache_creation_tokens": 10,
+            },
+        ],
+    )
+    db.commit()
+
+    full = get_range_totals(db, "2026-04-23", "2026-04-24")
+    assert full["session_count"] == 1
+    assert full["input_tokens"] == 300
+    assert full["output_tokens"] == 30
+
+    today = get_range_totals(db, "2026-04-24", "2026-04-24")
+    assert today["session_count"] == 1
+    assert today["message_count"] == 3
+    assert today["user_turns"] == 1
+    assert today["input_tokens"] == 200
+    assert today["output_tokens"] == 20
+    assert today["cache_read_tokens"] == 80
+    assert today["cache_creation_tokens"] == 10
+
+    daily = get_range_daily(db, "2026-04-23", "2026-04-24")
+    assert [(r["date"], r["input_tokens"]) for r in daily] == [
+        ("2026-04-23", 100),
+        ("2026-04-24", 200),
+    ]
+
+    model_rows = get_range_by_agent_model(db, "2026-04-24", "2026-04-24")
+    assert len(model_rows) == 1
+    assert model_rows[0]["agent_type"] == "codex"
+    assert model_rows[0]["model"] == "gpt-5.4"
+    assert model_rows[0]["input_tokens"] == 200
+
+    time_rows = get_range_by_time_model(db, "2026-04-23", "2026-04-24", limit=2)
+    assert time_rows[0]["usage_date"] == "2026-04-24"
+    assert time_rows[0]["usage_hour"] == 0
+    assert time_rows[0]["input_tokens"] == 200
+
+    top_sessions = get_range_top_sessions(db, "2026-04-24", "2026-04-24", limit=1)
+    assert len(top_sessions) == 1
+    assert top_sessions[0]["session_id"] == "cross"
+    assert top_sessions[0]["input_tokens"] == 200
+    assert top_sessions[0]["first_prompt"] == "cross day prompt"
+
+    with patch("agentic_metric.store.aggregator.datetime", FakeDateTime):
+        overview = get_today_overview(db)
+        today_sessions = get_today_sessions(db)
+
+    assert overview.session_count == 1
+    assert overview.input_tokens == 200
+    assert overview.output_tokens == 20
+    assert len(today_sessions) == 1
+    assert today_sessions[0]["session_id"] == "cross"
+    assert today_sessions[0]["started_at"].startswith("2026-04-23")
+    assert today_sessions[0]["input_tokens"] == 200
     db.close()
 
 

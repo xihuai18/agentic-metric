@@ -75,6 +75,9 @@ class _SessionAccum:
         "partial_line",
         "file_id",
         "file_mtime_ns",
+        "assistant_message_dates",
+        "assistant_usage_by_id",
+        "usage_buckets",
     )
 
     def __init__(self, file_path: Path, project_path: str, pid: int = 0) -> None:
@@ -105,6 +108,9 @@ class _SessionAccum:
         self.partial_line = b""
         self.file_id: tuple[int, int] | None = None
         self.file_mtime_ns = -1
+        self.assistant_message_dates: dict[str, tuple[str, int, str]] = {}
+        self.assistant_usage_by_id: dict[str, tuple[int, int, int, int, str, int, str]] = {}
+        self.usage_buckets: dict[tuple[str, int, str], dict] = {}
 
     def read_new_lines(self) -> None:
         """Read only bytes appended since last call."""
@@ -170,6 +176,9 @@ class _SessionAccum:
         self.git_branch = ""
         self.model = ""
         self.partial_line = b""
+        self.assistant_message_dates.clear()
+        self.assistant_usage_by_id.clear()
+        self.usage_buckets.clear()
         self._reset_today_counters(today_str)
 
     def _process_raw_line(self, raw_line: bytes, today_str: str) -> bool:
@@ -197,11 +206,62 @@ class _SessionAccum:
     @staticmethod
     def _ts_local_date(ts: str) -> str:
         """Convert ISO timestamp to local date string YYYY-MM-DD."""
-        try:
-            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            return dt.astimezone().strftime("%Y-%m-%d")
-        except (ValueError, TypeError):
-            return ts[:10] if len(ts) >= 10 else ""
+        day, _hour = _local_bucket(ts)
+        return day
+
+    def _add_usage_bucket(
+        self,
+        usage_date: str,
+        usage_hour: int,
+        *,
+        model: str | None = None,
+        user_turns: int = 0,
+        message_count: int = 0,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cache_read_tokens: int = 0,
+        cache_creation_tokens: int = 0,
+    ) -> None:
+        if not usage_date:
+            return
+        bucket_model = model if model is not None else self.model
+        key = (usage_date, usage_hour, bucket_model or "")
+        bucket = self.usage_buckets.setdefault(
+            key,
+            {
+                "usage_date": usage_date,
+                "usage_hour": usage_hour,
+                "project_path": self.project_path,
+                "model": bucket_model or "",
+                "message_count": 0,
+                "user_turns": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_creation_tokens": 0,
+            },
+        )
+        bucket["project_path"] = self.project_path
+        bucket["message_count"] += message_count
+        bucket["user_turns"] += user_turns
+        bucket["input_tokens"] += input_tokens
+        bucket["output_tokens"] += output_tokens
+        bucket["cache_read_tokens"] += cache_read_tokens
+        bucket["cache_creation_tokens"] += cache_creation_tokens
+
+    def usage_bucket_rows(self) -> list[dict]:
+        rows = []
+        for bucket in self.usage_buckets.values():
+            if (
+                bucket["message_count"]
+                or bucket["user_turns"]
+                or bucket["input_tokens"]
+                or bucket["output_tokens"]
+                or bucket["cache_read_tokens"]
+                or bucket["cache_creation_tokens"]
+            ):
+                rows.append(bucket)
+        return rows
 
     def _process_entry(self, entry: dict, today_str: str) -> None:
         ts = entry.get("timestamp", "")
@@ -224,8 +284,15 @@ class _SessionAccum:
                 for c in content
             )
             if not is_tool_result:
+                entry_date, entry_hour = _local_bucket(ts)
                 self.user_turns += 1
                 self.message_count += 1
+                self._add_usage_bucket(
+                    entry_date,
+                    entry_hour,
+                    user_turns=1,
+                    message_count=1,
+                )
                 if is_today:
                     self.today_user_turns += 1
                     self.today_message_count += 1
@@ -237,27 +304,150 @@ class _SessionAccum:
                         self.last_prompt = clean[:80]
 
         elif entry_type == "assistant":
-            self.message_count += 1
-            if is_today:
-                self.today_message_count += 1
             msg = entry.get("message", {})
+            msg_id = msg.get("id", "") if isinstance(msg, dict) else ""
+            msg_model = msg.get("model", "") if isinstance(msg, dict) else ""
+            if msg_model and not self.model:
+                self.model = msg_model
+            entry_date, entry_hour = _local_bucket(ts)
+            if not entry_date:
+                entry_date, entry_hour = today_str, 0
+            bucket_model = msg_model or self.model
+            self._count_assistant_message(
+                msg_id,
+                entry_date,
+                entry_hour,
+                today_str,
+                bucket_model,
+            )
+
             usage = msg.get("usage", {}) if isinstance(msg, dict) else {}
             if usage:
                 inp = usage.get("input_tokens", 0)
                 out = usage.get("output_tokens", 0)
                 cr = usage.get("cache_read_input_tokens", 0)
                 cw = usage.get("cache_creation_input_tokens", 0)
-                self.input_tokens += inp
-                self.output_tokens += out
-                self.cache_read += cr
-                self.cache_create += cw
-                if is_today:
-                    self.today_input_tokens += inp
-                    self.today_output_tokens += out
-                    self.today_cache_read += cr
-                    self.today_cache_create += cw
-            if not self.model and isinstance(msg, dict):
-                self.model = msg.get("model", "")
+                self._set_assistant_usage(
+                    msg_id,
+                    (inp, out, cr, cw),
+                    entry_date,
+                    entry_hour,
+                    today_str,
+                    bucket_model,
+                )
+
+    def _count_assistant_message(
+        self,
+        msg_id: str,
+        entry_date: str,
+        entry_hour: int,
+        today_str: str,
+        model: str,
+    ) -> None:
+        """Count each Claude Code assistant message once by message id."""
+        if not msg_id:
+            self.message_count += 1
+            self._add_usage_bucket(
+                entry_date,
+                entry_hour,
+                model=model,
+                message_count=1,
+            )
+            if entry_date == today_str:
+                self.today_message_count += 1
+            return
+
+        prev = self.assistant_message_dates.get(msg_id)
+        if prev is None:
+            self.assistant_message_dates[msg_id] = (entry_date, entry_hour, model)
+            self.message_count += 1
+            self._add_usage_bucket(
+                entry_date,
+                entry_hour,
+                model=model,
+                message_count=1,
+            )
+            if entry_date == today_str:
+                self.today_message_count += 1
+            return
+
+        prev_date, prev_hour, prev_model = prev
+        if (prev_date, prev_hour, prev_model) == (entry_date, entry_hour, model):
+            return
+
+        # A rare cross-midnight update for the same streamed message should
+        # move the day-local count without changing the session total.
+        self._add_usage_bucket(prev_date, prev_hour, model=prev_model, message_count=-1)
+        self._add_usage_bucket(entry_date, entry_hour, model=model, message_count=1)
+        if prev_date == today_str and entry_date != today_str:
+            self.today_message_count = max(0, self.today_message_count - 1)
+        elif prev_date != today_str and entry_date == today_str:
+            self.today_message_count += 1
+        self.assistant_message_dates[msg_id] = (entry_date, entry_hour, model)
+
+    def _set_assistant_usage(
+        self,
+        msg_id: str,
+        usage: tuple[int, int, int, int],
+        entry_date: str,
+        entry_hour: int,
+        today_str: str,
+        model: str,
+    ) -> None:
+        """Use the last usage snapshot for a Claude Code assistant message."""
+        inp, out, cr, cw = usage
+
+        if msg_id:
+            prev = self.assistant_usage_by_id.get(msg_id)
+            if prev is not None:
+                p_in, p_out, p_cr, p_cw, p_date, p_hour, p_model = prev
+                self.input_tokens = max(0, self.input_tokens - p_in)
+                self.output_tokens = max(0, self.output_tokens - p_out)
+                self.cache_read = max(0, self.cache_read - p_cr)
+                self.cache_create = max(0, self.cache_create - p_cw)
+                self._add_usage_bucket(
+                    p_date,
+                    p_hour,
+                    model=p_model,
+                    input_tokens=-p_in,
+                    output_tokens=-p_out,
+                    cache_read_tokens=-p_cr,
+                    cache_creation_tokens=-p_cw,
+                )
+                if p_date == today_str:
+                    self.today_input_tokens = max(0, self.today_input_tokens - p_in)
+                    self.today_output_tokens = max(0, self.today_output_tokens - p_out)
+                    self.today_cache_read = max(0, self.today_cache_read - p_cr)
+                    self.today_cache_create = max(0, self.today_cache_create - p_cw)
+
+            self.assistant_usage_by_id[msg_id] = (
+                inp,
+                out,
+                cr,
+                cw,
+                entry_date,
+                entry_hour,
+                model,
+            )
+
+        self.input_tokens += inp
+        self.output_tokens += out
+        self.cache_read += cr
+        self.cache_create += cw
+        self._add_usage_bucket(
+            entry_date,
+            entry_hour,
+            model=model,
+            input_tokens=inp,
+            output_tokens=out,
+            cache_read_tokens=cr,
+            cache_creation_tokens=cw,
+        )
+        if entry_date == today_str:
+            self.today_input_tokens += inp
+            self.today_output_tokens += out
+            self.today_cache_read += cr
+            self.today_cache_create += cw
 
     def to_live_session(self) -> LiveSession:
         return LiveSession(
@@ -493,15 +683,14 @@ class ClaudeCodeCollector(BaseCollector):
         if not PROJECTS_DIR.exists():
             return
 
-        # Load previously processed offsets: "cc_jsonl:<filepath>" -> byte offset
-        sync_prefix = "cc_jsonl:"
+        sync_prefix = "cc_jsonl:v3:"
 
         for project_dir in PROJECTS_DIR.iterdir():
             if not project_dir.is_dir():
                 continue
 
             try:
-                jsonl_files = list(project_dir.glob("*.jsonl"))
+                jsonl_files = list(project_dir.rglob("*.jsonl"))
             except OSError:
                 continue
 
@@ -530,20 +719,16 @@ class ClaudeCodeCollector(BaseCollector):
                     db.set_sync_state(sync_key, _sync_state_value(file_size, mtime_ns))
                     continue
 
-                cost = estimate_cost(
-                    accum.model,
-                    input_tokens=accum.input_tokens,
-                    output_tokens=accum.output_tokens,
-                    cache_read_tokens=accum.cache_read,
-                    cache_creation_tokens=accum.cache_create,
-                )
+                usage_rows = accum.usage_bucket_rows()
+                cost = _usage_rows_cost(usage_rows)
 
                 # Read the cwd from the JSONL to get the real project path
                 real_cwd = _LiveMonitor._read_cwd(jsonl_file)
                 project_path = real_cwd if real_cwd else str(project_dir)
+                session_id = _session_id_for_jsonl(project_dir, jsonl_file, accum.session_id)
 
                 db.upsert_session(
-                    accum.session_id,
+                    session_id,
                     self.agent_type,
                     project_path=project_path,
                     git_branch=accum.git_branch,
@@ -560,6 +745,7 @@ class ClaudeCodeCollector(BaseCollector):
                     first_prompt=accum.first_prompt,
                     last_prompt=accum.last_prompt,
                 )
+                db.replace_session_usage(session_id, self.agent_type, usage_rows)
 
                 db.set_sync_state(sync_key, _sync_state_value(file_size, mtime_ns))
 
@@ -580,3 +766,38 @@ def _sync_state_matches(state: str | None, file_size: int, mtime_ns: int) -> boo
         return int(parts[0]) == file_size and int(parts[1]) == mtime_ns
     except ValueError:
         return False
+
+
+def _session_id_for_jsonl(project_dir: Path, jsonl_file: Path, default: str) -> str:
+    """Return a stable session id for top-level and subagent Claude JSONL files."""
+    try:
+        rel = jsonl_file.relative_to(project_dir)
+    except ValueError:
+        return default
+    parts = rel.parts
+    if len(parts) >= 3 and parts[-2] == "subagents":
+        return f"{parts[-3]}:{jsonl_file.stem}"
+    return default
+
+
+def _usage_rows_cost(rows: list[dict]) -> float:
+    """Estimate cost using each bucket's own model."""
+    return sum(
+        estimate_cost(
+            row.get("model") or "",
+            input_tokens=int(row.get("input_tokens") or 0),
+            output_tokens=int(row.get("output_tokens") or 0),
+            cache_read_tokens=int(row.get("cache_read_tokens") or 0),
+            cache_creation_tokens=int(row.get("cache_creation_tokens") or 0),
+        )
+        for row in rows
+    )
+
+
+def _local_bucket(ts: str) -> tuple[str, int]:
+    """Return local (date, hour) for an ISO timestamp."""
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
+        return dt.strftime("%Y-%m-%d"), dt.hour
+    except (ValueError, TypeError):
+        return (ts[:10], 0) if len(ts) >= 10 else ("", 0)

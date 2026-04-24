@@ -62,6 +62,7 @@ class _SessionAccum:
         "fork_baseline_output",
         "fork_baseline_cache_read",
         "fork_baseline_cache_create",
+        "usage_buckets",
     )
 
     def __init__(self, file_path: Path, project_path: str, pid: int = 0) -> None:
@@ -103,6 +104,7 @@ class _SessionAccum:
         self.fork_baseline_output = 0
         self.fork_baseline_cache_read = 0
         self.fork_baseline_cache_create = 0
+        self.usage_buckets: dict[tuple[str, int, str], dict] = {}
 
     def read_new_lines(self) -> None:
         """Read only bytes appended since last call.
@@ -182,6 +184,7 @@ class _SessionAccum:
         self.fork_baseline_output = 0
         self.fork_baseline_cache_read = 0
         self.fork_baseline_cache_create = 0
+        self.usage_buckets.clear()
         self._reset_today_counters(today_str)
 
     def _reset_today_counters(self, today_str: str) -> None:
@@ -201,11 +204,49 @@ class _SessionAccum:
     @staticmethod
     def _ts_local_date(ts: str) -> str:
         """Convert ISO timestamp to local date string YYYY-MM-DD."""
-        try:
-            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            return dt.astimezone().strftime("%Y-%m-%d")
-        except (ValueError, TypeError):
-            return ts[:10] if len(ts) >= 10 else ""
+        day, _hour = _local_bucket(ts)
+        return day
+
+    def _add_usage_bucket(
+        self,
+        ts: str,
+        *,
+        user_turns: int = 0,
+        message_count: int = 0,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cache_read_tokens: int = 0,
+        cache_creation_tokens: int = 0,
+    ) -> None:
+        usage_date, usage_hour = _local_bucket(ts)
+        if not usage_date:
+            return
+        key = (usage_date, usage_hour, self.model or "")
+        bucket = self.usage_buckets.setdefault(
+            key,
+            {
+                "usage_date": usage_date,
+                "usage_hour": usage_hour,
+                "project_path": self.project_path,
+                "model": self.model or "",
+                "message_count": 0,
+                "user_turns": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_creation_tokens": 0,
+            },
+        )
+        bucket["project_path"] = self.project_path
+        bucket["message_count"] += message_count
+        bucket["user_turns"] += user_turns
+        bucket["input_tokens"] += input_tokens
+        bucket["output_tokens"] += output_tokens
+        bucket["cache_read_tokens"] += cache_read_tokens
+        bucket["cache_creation_tokens"] += cache_creation_tokens
+
+    def usage_bucket_rows(self) -> list[dict]:
+        return list(self.usage_buckets.values())
 
     def _process_raw_line(self, raw_line: bytes) -> bool:
         """Process one JSONL line. Return False for an unparsable line."""
@@ -252,9 +293,9 @@ class _SessionAccum:
             self.seen_turn_context = True
 
         elif entry_type == "event_msg":
-            self._process_event_msg(entry.get("payload", {}), is_today)
+            self._process_event_msg(entry.get("payload", {}), is_today, ts)
 
-    def _process_event_msg(self, payload: dict, is_today: bool = True) -> None:
+    def _process_event_msg(self, payload: dict, is_today: bool = True, ts: str = "") -> None:
         msg_type = payload.get("type", "")
 
         if self.is_forked and not self.seen_turn_context:
@@ -265,6 +306,7 @@ class _SessionAccum:
         if msg_type == "user_message":
             self.user_turns += 1
             self.message_count += 1
+            self._add_usage_bucket(ts, user_turns=1, message_count=1)
             if is_today:
                 self.today_user_turns += 1
                 self.today_message_count += 1
@@ -277,6 +319,7 @@ class _SessionAccum:
 
         elif msg_type == "agent_message":
             self.message_count += 1
+            self._add_usage_bucket(ts, message_count=1)
             if is_today:
                 self.today_message_count += 1
 
@@ -301,14 +344,33 @@ class _SessionAccum:
             raw_input = usage.get("input_tokens")
             cached = usage.get("cached_input_tokens")
             out = usage.get("output_tokens")
+            cache_create = usage.get("cache_creation_input_tokens")
+            prev_input = self.input_tokens
+            prev_output = self.output_tokens
+            prev_cache_read = self.cache_read
+            prev_cache_create = self.cache_create
             if out is not None:
                 self.output_tokens = max(out - self.fork_baseline_output, 0)
             if raw_input is not None:
                 self.raw_input_tokens = max(raw_input - self.fork_baseline_raw_input, 0)
             if cached is not None:
                 self.cache_read = max(cached - self.fork_baseline_cache_read, 0)
+            if cache_create is not None:
+                self.cache_create = max(cache_create - self.fork_baseline_cache_create, 0)
             if raw_input is not None or cached is not None:
                 self.input_tokens = max(self.raw_input_tokens - self.cache_read, 0)
+            d_input = self.input_tokens - prev_input
+            d_output = self.output_tokens - prev_output
+            d_cache_read = self.cache_read - prev_cache_read
+            d_cache_create = self.cache_create - prev_cache_create
+            if d_input or d_output or d_cache_read or d_cache_create:
+                self._add_usage_bucket(
+                    ts,
+                    input_tokens=d_input,
+                    output_tokens=d_output,
+                    cache_read_tokens=d_cache_read,
+                    cache_creation_tokens=d_cache_create,
+                )
             if is_today:
                 self.today_input_tokens = max(self.input_tokens - self.today_input_base, 0)
                 self.today_output_tokens = max(self.output_tokens - self.today_output_base, 0)
@@ -528,7 +590,7 @@ class CodexCollector(BaseCollector):
         if not CODEX_SESSIONS_DIR.exists():
             return
 
-        sync_prefix = "codex_jsonl:v2:"
+        sync_prefix = "codex_jsonl:v3:"
 
         for jsonl_file in CODEX_SESSIONS_DIR.rglob("rollout-*.jsonl"):
             sync_key = f"{sync_prefix}{jsonl_file}"
@@ -554,13 +616,8 @@ class CodexCollector(BaseCollector):
 
             session_id = accum.session_id or jsonl_file.stem
 
-            cost = estimate_cost(
-                accum.model,
-                input_tokens=accum.input_tokens,
-                output_tokens=accum.output_tokens,
-                cache_read_tokens=accum.cache_read,
-                cache_creation_tokens=accum.cache_create,
-            )
+            usage_rows = accum.usage_bucket_rows()
+            cost = _usage_rows_cost(usage_rows)
 
             db.upsert_session(
                 session_id,
@@ -580,6 +637,7 @@ class CodexCollector(BaseCollector):
                 first_prompt=accum.first_prompt,
                 last_prompt=accum.last_prompt,
             )
+            db.replace_session_usage(session_id, self.agent_type, usage_rows)
 
             db.set_sync_state(sync_key, _sync_state_value(file_size, mtime_ns))
 
@@ -600,3 +658,26 @@ def _sync_state_matches(state: str | None, file_size: int, mtime_ns: int) -> boo
         return int(parts[0]) == file_size and int(parts[1]) == mtime_ns
     except ValueError:
         return False
+
+
+def _usage_rows_cost(rows: list[dict]) -> float:
+    """Estimate cost using each bucket's own model."""
+    return sum(
+        estimate_cost(
+            row.get("model") or "",
+            input_tokens=int(row.get("input_tokens") or 0),
+            output_tokens=int(row.get("output_tokens") or 0),
+            cache_read_tokens=int(row.get("cache_read_tokens") or 0),
+            cache_creation_tokens=int(row.get("cache_creation_tokens") or 0),
+        )
+        for row in rows
+    )
+
+
+def _local_bucket(ts: str) -> tuple[str, int]:
+    """Return local (date, hour) for an ISO timestamp."""
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
+        return dt.strftime("%Y-%m-%d"), dt.hour
+    except (ValueError, TypeError):
+        return (ts[:10], 0) if len(ts) >= 10 else ("", 0)

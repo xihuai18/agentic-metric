@@ -7,7 +7,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from agentic_metric.collectors import CollectorRegistry, BaseCollector
-from agentic_metric.collectors.claude_code import _SessionAccum as ClaudeSessionAccum
+from agentic_metric.collectors.claude_code import (
+    ClaudeCodeCollector,
+    _SessionAccum as ClaudeSessionAccum,
+)
 from agentic_metric.collectors.codex import (
     CodexCollector,
     _LiveMonitor as CodexLiveMonitor,
@@ -81,14 +84,16 @@ def test_codex_cached_only_update_recomputes_input_tokens():
     accum._process_event_msg({
         "type": "token_count",
         "info": {"total_token_usage": {"input_tokens": 1000, "cached_input_tokens": 100, "output_tokens": 50}},
-    })
+    }, ts="2026-04-24T10:00:00Z")
     assert accum.input_tokens == 900
 
     accum._process_event_msg({
         "type": "token_count",
         "info": {"total_token_usage": {"cached_input_tokens": 200}},
-    })
+    }, ts="2026-04-24T10:01:00Z")
     assert accum.input_tokens == 800
+    assert sum(r["input_tokens"] for r in accum.usage_bucket_rows()) == 800
+    assert sum(r["cache_read_tokens"] for r in accum.usage_bucket_rows()) == 200
 
 
 def test_codex_partial_trailing_jsonl_is_retried(tmp_path):
@@ -189,6 +194,60 @@ def test_claude_accumulator_resets_after_truncation(tmp_path):
     assert accum.first_prompt == "second"
 
 
+def test_claude_duplicate_assistant_message_id_uses_last_usage(tmp_path):
+    session_file = tmp_path / "session.jsonl"
+    lines = [
+        {
+            "timestamp": "2026-04-23T10:00:00Z",
+            "type": "user",
+            "message": {"content": "hello"},
+        },
+        {
+            "timestamp": "2026-04-23T10:00:01Z",
+            "type": "assistant",
+            "message": {
+                "id": "msg-1",
+                "model": "claude-sonnet-4-6",
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 1,
+                    "cache_read_input_tokens": 100,
+                    "cache_creation_input_tokens": 5,
+                },
+            },
+        },
+        {
+            "timestamp": "2026-04-23T10:00:02Z",
+            "type": "assistant",
+            "message": {
+                "id": "msg-1",
+                "model": "claude-sonnet-4-6",
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 20,
+                    "cache_read_input_tokens": 100,
+                    "cache_creation_input_tokens": 5,
+                },
+            },
+        },
+    ]
+    session_file.write_text("".join(json.dumps(line) + "\n" for line in lines))
+
+    accum = ClaudeSessionAccum(session_file, project_path="/tmp/project")
+    accum.read_new_lines()
+
+    assert accum.message_count == 2
+    assert accum.input_tokens == 10
+    assert accum.output_tokens == 20
+    assert accum.cache_read == 100
+    assert accum.cache_create == 5
+    assert sum(r["message_count"] for r in accum.usage_bucket_rows()) == 2
+    assert sum(r["input_tokens"] for r in accum.usage_bucket_rows()) == 10
+    assert sum(r["output_tokens"] for r in accum.usage_bucket_rows()) == 20
+    assert sum(r["cache_read_tokens"] for r in accum.usage_bucket_rows()) == 100
+    assert sum(r["cache_creation_tokens"] for r in accum.usage_bucket_rows()) == 5
+
+
 def test_claude_today_counters_reset_after_midnight(tmp_path):
     class FakeDateTime(datetime):
         @classmethod
@@ -216,6 +275,47 @@ def test_claude_today_counters_reset_after_midnight(tmp_path):
     assert accum.today_output_tokens == 0
     assert accum.today_cache_read == 0
     assert accum.today_cache_create == 0
+
+
+def test_claude_history_sync_scans_subagent_jsonl(tmp_path):
+    projects = tmp_path / "projects"
+    subagents = projects / "-tmp-project" / "parent-session" / "subagents"
+    subagents.mkdir(parents=True)
+    subagent_file = subagents / "agent-a1.jsonl"
+    lines = [
+        {
+            "timestamp": "2026-04-23T10:00:00Z",
+            "type": "user",
+            "cwd": "/tmp/project",
+            "message": {"content": "sub task"},
+        },
+        {
+            "timestamp": "2026-04-23T10:00:01Z",
+            "type": "assistant",
+            "cwd": "/tmp/project",
+            "message": {
+                "id": "msg-sub",
+                "model": "claude-sonnet-4-6",
+                "usage": {"input_tokens": 100, "output_tokens": 20},
+            },
+        },
+    ]
+    subagent_file.write_text("".join(json.dumps(line) + "\n" for line in lines))
+
+    db = Database(db_path=str(tmp_path / "data.db"))
+    with patch("agentic_metric.collectors.claude_code.PROJECTS_DIR", projects):
+        ClaudeCodeCollector().sync_history(db)
+
+    row = db.conn.execute(
+        "SELECT project_path, input_tokens, output_tokens "
+        "FROM sessions WHERE session_id = 'parent-session:agent-a1' "
+        "AND agent_type = 'claude_code'"
+    ).fetchone()
+    assert row is not None
+    assert row["project_path"] == "/tmp/project"
+    assert row["input_tokens"] == 100
+    assert row["output_tokens"] == 20
+    db.close()
 
 
 def test_codex_cross_day_live_session_uses_today_counters(tmp_path):
@@ -284,6 +384,18 @@ def test_codex_cross_day_live_session_uses_today_counters(tmp_path):
     assert live.today_output_tokens == 50
     assert live.today_cache_read_tokens == 100
     assert live.today_user_turns == 1
+
+    buckets = {r["usage_date"]: r for r in accum.usage_bucket_rows()}
+    assert buckets["2026-04-23"]["message_count"] == 1
+    assert buckets["2026-04-23"]["user_turns"] == 1
+    assert buckets["2026-04-23"]["input_tokens"] == 800
+    assert buckets["2026-04-23"]["output_tokens"] == 100
+    assert buckets["2026-04-23"]["cache_read_tokens"] == 200
+    assert buckets["2026-04-24"]["message_count"] == 1
+    assert buckets["2026-04-24"]["user_turns"] == 1
+    assert buckets["2026-04-24"]["input_tokens"] == 400
+    assert buckets["2026-04-24"]["output_tokens"] == 50
+    assert buckets["2026-04-24"]["cache_read_tokens"] == 100
 
 
 def test_codex_forked_session_subtracts_replayed_parent_baseline(tmp_path):
@@ -474,5 +586,78 @@ def test_codex_history_sync_detects_same_size_file_edits(tmp_path):
             "SELECT output_tokens FROM sessions WHERE session_id = 'sid' AND agent_type = 'codex'"
         ).fetchone()
         assert row["output_tokens"] == 99
+
+    db.close()
+
+
+def test_codex_history_sync_cost_uses_bucket_models(tmp_path):
+    sessions_dir = tmp_path / "sessions" / "2026" / "04" / "23"
+    sessions_dir.mkdir(parents=True)
+    rollout = sessions_dir / "rollout-test.jsonl"
+    lines = [
+        {
+            "timestamp": "2026-04-23T10:00:00Z",
+            "type": "session_meta",
+            "payload": {"id": "sid", "cwd": "/tmp/project"},
+        },
+        {
+            "timestamp": "2026-04-23T10:00:00Z",
+            "type": "turn_context",
+            "payload": {"model": "gpt-5.4"},
+        },
+        {
+            "timestamp": "2026-04-23T10:00:01Z",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "first"},
+        },
+        {
+            "timestamp": "2026-04-23T10:00:02Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 1000,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 100,
+                    }
+                },
+            },
+        },
+        {
+            "timestamp": "2026-04-24T10:00:00Z",
+            "type": "turn_context",
+            "payload": {"model": "gpt-5.5"},
+        },
+        {
+            "timestamp": "2026-04-24T10:00:01Z",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "second"},
+        },
+        {
+            "timestamp": "2026-04-24T10:00:02Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 2000,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 200,
+                    }
+                },
+            },
+        },
+    ]
+    rollout.write_text("".join(json.dumps(line) + "\n" for line in lines))
+
+    db = Database(db_path=str(tmp_path / "data.db"))
+    with patch("agentic_metric.collectors.codex.CODEX_SESSIONS_DIR", tmp_path / "sessions"):
+        CodexCollector().sync_history(db)
+
+    row = db.conn.execute(
+        "SELECT estimated_cost_usd FROM sessions WHERE session_id = 'sid' AND agent_type = 'codex'"
+    ).fetchone()
+    assert abs(row["estimated_cost_usd"] - 0.012) < 1e-12
 
     db.close()

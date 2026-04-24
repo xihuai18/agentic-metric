@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -17,13 +18,15 @@ from ..models import LiveSession
 from ..store.aggregator import (
     get_heatmap,
     get_range_by_agent_model,
+    get_range_by_project,
+    get_range_by_time_model,
     get_range_totals,
     get_today_sessions,
     get_trend,
     resolve_range,
 )
 from ..store.database import Database
-from .widgets import Breakdown, PeriodicHeatmap, SummaryCell
+from .widgets import Breakdown, PeriodicHeatmap, SummaryCell, fmt_cost, fmt_tokens
 
 
 def _total_tokens(d: dict) -> int:
@@ -57,6 +60,39 @@ def _fmt_bar_label(v: float) -> str:
     if v > 0:
         return f"${v:.2f}"
     return ""
+
+
+def _bucket_label(row: dict) -> str:
+    date_s = row.get("usage_date") or ""
+    hour = int(row.get("usage_hour") or 0)
+    try:
+        dt = datetime.strptime(date_s, "%Y-%m-%d")
+        day = dt.strftime("%b %-d")
+    except ValueError:
+        day = date_s
+    return f"{day} {hour:02d}:00" if day else f"{hour:02d}:00"
+
+
+def _short_path(path: str, max_len: int = 38) -> str:
+    if not path:
+        return "(unspecified)"
+    home = str(Path.home())
+    if path.startswith(home):
+        path = "~" + path[len(home):]
+    if len(path) <= max_len:
+        return path
+    return path[: max_len - 1] + "…"
+
+
+def _split_label(row: dict) -> str:
+    cache = (row.get("cache_read_tokens") or row.get("cache") or 0) + (
+        row.get("cache_creation_tokens") or 0
+    )
+    return (
+        f"in {fmt_tokens(row.get('input_tokens') or row.get('input') or 0)}  "
+        f"out {fmt_tokens(row.get('output_tokens') or row.get('output') or 0)}  "
+        f"cache {fmt_tokens(cache)}"
+    )
 
 
 class AgenticMetricApp(App):
@@ -101,6 +137,7 @@ class AgenticMetricApp(App):
         with Vertical(id="heatmap-panel"):
             yield Static("Today by hour", id="heatmap-title")
             yield PeriodicHeatmap(id="heatmap")
+            yield Static("", id="driver-line")
         with Vertical(id="chart-panel"):
             yield Static("Trend", id="chart-title")
             yield PlotextPlot(id="chart")
@@ -178,6 +215,40 @@ class AgenticMetricApp(App):
         self.query_one("#heatmap-title", Static).update(
             Text.from_markup(f"[bold]{title}[/]")
         )
+        self._populate_driver_line()
+
+    def _populate_driver_line(self) -> None:
+        """Show the strongest cost driver for the focused period."""
+        _label, frm, to = resolve_range(self._focus, offset=self._offset)
+        peak_rows = get_range_by_time_model(self._db, frm, to, limit=1)
+        project_rows = get_range_by_project(self._db, frm, to, limit=1)
+
+        line = Text()
+        has_driver = False
+        if peak_rows:
+            peak = peak_rows[0]
+            line.append(" driver ", style="bright_black")
+            line.append(_bucket_label(peak), style="bold blue")
+            line.append("  ", style="bright_black")
+            line.append(f"{peak['agent_type']} / {peak['model']}", style="cyan")
+            line.append("  ", style="bright_black")
+            line.append(fmt_cost(peak["estimated_cost_usd"] or 0.0), style="bold yellow")
+            line.append("  ", style="bright_black")
+            line.append(_split_label(peak), style="bright_black")
+            has_driver = True
+        if project_rows and (project_rows[0].get("estimated_cost_usd") or 0) > 0:
+            if peak_rows:
+                line.append("    ", style="bright_black")
+            project = project_rows[0]
+            line.append(" project ", style="bright_black")
+            line.append(_short_path(project["project_path"]), style="blue")
+            line.append("  ", style="bright_black")
+            line.append(fmt_cost(project["estimated_cost_usd"] or 0.0), style="yellow")
+            has_driver = True
+        if not has_driver:
+            line.append(" no cost drivers in this period", style="bright_black")
+
+        self.query_one("#driver-line", Static).update(line)
 
     def _populate_summary(self) -> None:
         active_count = self._count_active()
@@ -267,15 +338,28 @@ class AgenticMetricApp(App):
         for r in rows:
             at = r["agent_type"]
             g = groups_by_agent.setdefault(at, {
-                "agent": at, "cost": 0.0, "tokens": 0, "models": []
+                "agent": at,
+                "cost": 0.0,
+                "tokens": 0,
+                "input": 0,
+                "output": 0,
+                "cache": 0,
+                "models": [],
             })
             model_tokens = _total_tokens(r)
+            model_cache = (r.get("cache_read_tokens") or 0) + (r.get("cache_creation_tokens") or 0)
             g["cost"] += r["estimated_cost_usd"] or 0.0
             g["tokens"] += model_tokens
+            g["input"] += r.get("input_tokens") or 0
+            g["output"] += r.get("output_tokens") or 0
+            g["cache"] += model_cache
             g["models"].append({
                 "model": r["model"],
                 "cost": r["estimated_cost_usd"] or 0.0,
                 "tokens": model_tokens,
+                "input": r.get("input_tokens") or 0,
+                "output": r.get("output_tokens") or 0,
+                "cache": model_cache,
             })
 
         groups = sorted(groups_by_agent.values(), key=lambda g: -g["cost"])

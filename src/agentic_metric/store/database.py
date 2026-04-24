@@ -30,11 +30,35 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 """
 
+_SESSION_USAGE_TABLE_SQL = """\
+CREATE TABLE IF NOT EXISTS session_usage (
+    session_id TEXT NOT NULL,
+    agent_type TEXT NOT NULL,
+    usage_date TEXT NOT NULL,
+    usage_hour INTEGER NOT NULL,
+    project_path TEXT DEFAULT '',
+    model TEXT DEFAULT '',
+    message_count INTEGER DEFAULT 0,
+    user_turns INTEGER DEFAULT 0,
+    input_tokens INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
+    cache_read_tokens INTEGER DEFAULT 0,
+    cache_creation_tokens INTEGER DEFAULT 0,
+    estimated_cost_usd REAL DEFAULT 0,
+    PRIMARY KEY (session_id, agent_type, usage_date, usage_hour, model)
+);
+"""
+
 _SCHEMA = _SESSIONS_TABLE_SQL + """\
 CREATE TABLE IF NOT EXISTS sync_state (
     key TEXT PRIMARY KEY,
     value TEXT
 );
+""" + _SESSION_USAGE_TABLE_SQL + """\
+CREATE INDEX IF NOT EXISTS idx_session_usage_date ON session_usage (usage_date);
+CREATE INDEX IF NOT EXISTS idx_session_usage_agent_date ON session_usage (agent_type, usage_date);
+CREATE INDEX IF NOT EXISTS idx_session_usage_model_date ON session_usage (model, usage_date);
+CREATE INDEX IF NOT EXISTS idx_session_usage_project_date ON session_usage (project_path, usage_date);
 """
 
 
@@ -61,6 +85,13 @@ class Database:
         pk_cols = [r[1] for r in sorted(info, key=lambda row: row[5]) if r[5] > 0]
         if pk_cols != ["session_id", "agent_type"]:
             self._rebuild_sessions_table()
+
+        self._conn.executescript(_SESSION_USAGE_TABLE_SQL + """\
+        CREATE INDEX IF NOT EXISTS idx_session_usage_date ON session_usage (usage_date);
+        CREATE INDEX IF NOT EXISTS idx_session_usage_agent_date ON session_usage (agent_type, usage_date);
+        CREATE INDEX IF NOT EXISTS idx_session_usage_model_date ON session_usage (model, usage_date);
+        CREATE INDEX IF NOT EXISTS idx_session_usage_project_date ON session_usage (project_path, usage_date);
+        """)
 
     def _rebuild_sessions_table(self) -> None:
         """Rebuild the sessions table with the current primary key."""
@@ -118,11 +149,52 @@ class Database:
         if self.get_sync_state(state_key) == fingerprint:
             return
 
+        usage_rows = self._conn.execute(
+            """SELECT session_id, agent_type, usage_date, usage_hour, model,
+                      input_tokens, output_tokens,
+                      cache_read_tokens, cache_creation_tokens
+               FROM session_usage"""
+        ).fetchall()
+        usage_updates = [
+            (
+                estimate_cost(
+                    row["model"] or "",
+                    input_tokens=row["input_tokens"] or 0,
+                    output_tokens=row["output_tokens"] or 0,
+                    cache_read_tokens=row["cache_read_tokens"] or 0,
+                    cache_creation_tokens=row["cache_creation_tokens"] or 0,
+                ),
+                row["session_id"],
+                row["agent_type"],
+                row["usage_date"],
+                row["usage_hour"],
+                row["model"] or "",
+            )
+            for row in usage_rows
+        ]
+        if usage_updates:
+            self._conn.executemany(
+                """UPDATE session_usage
+                   SET estimated_cost_usd = ?
+                   WHERE session_id = ?
+                     AND agent_type = ?
+                     AND usage_date = ?
+                     AND usage_hour = ?
+                     AND model = ?""",
+                usage_updates,
+            )
+
         rows = self._conn.execute(
             """SELECT session_id, agent_type, model,
                       input_tokens, output_tokens,
                       cache_read_tokens, cache_creation_tokens
-               FROM sessions"""
+               FROM sessions AS s
+               WHERE NOT EXISTS (
+                   SELECT 1
+                   FROM session_usage AS u
+                   WHERE u.session_id = s.session_id
+                     AND u.agent_type = s.agent_type
+               )"""
         ).fetchall()
 
         updates = [
@@ -146,6 +218,22 @@ class Database:
                    WHERE session_id = ? AND agent_type = ?""",
                 updates,
             )
+
+        self._conn.execute(
+            """UPDATE sessions
+               SET estimated_cost_usd = (
+                   SELECT COALESCE(SUM(u.estimated_cost_usd), 0)
+                   FROM session_usage AS u
+                   WHERE u.session_id = sessions.session_id
+                     AND u.agent_type = sessions.agent_type
+               )
+               WHERE EXISTS (
+                   SELECT 1
+                   FROM session_usage AS u
+                   WHERE u.session_id = sessions.session_id
+                     AND u.agent_type = sessions.agent_type
+               )"""
+        )
 
         self._conn.execute(
             "INSERT INTO sync_state (key, value) VALUES (?, ?) "
@@ -246,6 +334,58 @@ class Database:
                 SET {", ".join(updates)}
                 WHERE session_id = ? AND agent_type = ?""",
             params,
+        )
+
+    def replace_session_usage(
+        self,
+        session_id: str,
+        agent_type: str,
+        buckets: list[dict],
+    ) -> None:
+        """Replace one session's per-local-hour usage buckets."""
+        self._conn.execute(
+            "DELETE FROM session_usage WHERE session_id = ? AND agent_type = ?",
+            (session_id, agent_type),
+        )
+        if not buckets:
+            return
+
+        rows = []
+        for bucket in buckets:
+            model = bucket.get("model") or ""
+            input_tokens = int(bucket.get("input_tokens") or 0)
+            output_tokens = int(bucket.get("output_tokens") or 0)
+            cache_read_tokens = int(bucket.get("cache_read_tokens") or 0)
+            cache_creation_tokens = int(bucket.get("cache_creation_tokens") or 0)
+            rows.append((
+                session_id,
+                agent_type,
+                bucket.get("usage_date") or "",
+                int(bucket.get("usage_hour") or 0),
+                bucket.get("project_path") or "",
+                model,
+                int(bucket.get("message_count") or 0),
+                int(bucket.get("user_turns") or 0),
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
+                estimate_cost(
+                    model,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cache_read_tokens=cache_read_tokens,
+                    cache_creation_tokens=cache_creation_tokens,
+                ),
+            ))
+
+        self._conn.executemany(
+            """INSERT INTO session_usage
+                   (session_id, agent_type, usage_date, usage_hour, project_path,
+                    model, message_count, user_turns, input_tokens, output_tokens,
+                    cache_read_tokens, cache_creation_tokens, estimated_cost_usd)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            rows,
         )
 
     def commit(self) -> None:

@@ -190,7 +190,7 @@ class PeriodicHeatmap(Static):
         if not self._buckets:
             return Text("  (no data)", style="bright_black")
 
-        # 7-level cool → warm gradient. Keeps block-character steps so
+        # 7-level low → hot gradient. Keeps block-character steps so
         # the strip still reads without color support, but when colors
         # are available the transition across the strip forms a
         # continuous heat gradient.
@@ -198,8 +198,8 @@ class PeriodicHeatmap(Static):
         colors = [
             "default",      # 0: idle
             "bright_black", # 1: trace
-            "blue",         # 2: low
-            "cyan",         # 3: low-mid
+            "green",        # 2: low
+            "bright_green", # 3: low-mid
             "yellow",       # 4: mid
             "red",          # 5: high
             "bright_red",   # 6: peak
@@ -223,6 +223,11 @@ class PeriodicHeatmap(Static):
         else:
             cell_w = 12
             label_every = 1
+        try:
+            available = max(12, self.size.width - 2)
+            cell_w = min(cell_w, max(2, available // max(n, 1)))
+        except Exception:
+            pass
 
         row_blocks = Text()
         row_labels = Text()
@@ -318,6 +323,13 @@ class Breakdown(Static):
         bar.append("░" * (width - filled), style="bright_black")
         return bar
 
+    def _split(self, row: dict) -> str:
+        return (
+            f"in {fmt_tokens(row.get('input') or 0)}  "
+            f"out {fmt_tokens(row.get('output') or 0)}  "
+            f"cache {fmt_tokens(row.get('cache') or 0)}"
+        )
+
     def render(self) -> Text:
         if not self._groups:
             return Text("  No activity in the selected range.", style="bright_black")
@@ -335,18 +347,36 @@ class Breakdown(Static):
             t.append(f" {fmt_cost(cost):>10} ", style="bold yellow")
             t.append_text(self._bar(ratio))
             t.append(f" {pct:>4.1f}%\n", style="bright_black")
+            t.append("    ")
+            t.append(self._split(g), style="bright_black")
+            t.append("\n")
 
-            # Model rows: show all with cost > 0, full list (no rollup).
+            # Model rows: keep the panel readable, then roll up the tail.
             raw_models = g.get("models", []) or []
-            visible = [m for m in raw_models if (m.get("cost") or 0) > 0]
+            nonzero = [m for m in raw_models if (m.get("cost") or 0) > 0]
+            visible = nonzero[:6]
+            hidden = nonzero[6:]
             for j, m in enumerate(visible):
-                last = (j == len(visible) - 1)
+                last = (j == len(visible) - 1 and not hidden)
                 connector = "└─" if last else "├─"
                 t.append(f"    {connector} ", style="bright_black")
                 model_name = m.get("model") or "(unknown)"
                 t.append(f"{model_name:<28}", style="cyan")
                 t.append(f" {fmt_cost(m['cost']):>10}", style="yellow")
-                t.append(f"  {fmt_tokens(m['tokens']):>7}\n", style="bright_black")
+                t.append(f"  {self._split(m)}\n", style="bright_black")
+            if hidden:
+                hidden_cost = sum(m.get("cost") or 0 for m in hidden)
+                hidden_tokens = sum(m.get("tokens") or 0 for m in hidden)
+                hidden_row = {
+                    "input": sum(m.get("input") or 0 for m in hidden),
+                    "output": sum(m.get("output") or 0 for m in hidden),
+                    "cache": sum(m.get("cache") or 0 for m in hidden),
+                }
+                t.append("    └─ ", style="bright_black")
+                t.append(f"+{len(hidden)} more models".ljust(28), style="bright_black")
+                t.append(f" {fmt_cost(hidden_cost):>10}", style="yellow")
+                t.append(f"  {self._split(hidden_row)}")
+                t.append(f"  total {fmt_tokens(hidden_tokens)}\n", style="bright_black")
             t.append("\n")
 
         return t
