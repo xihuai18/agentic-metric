@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.2.1 (2026-04-24)
+
+Follow-up correctness fixes on top of v0.2.0.
+
+### Bug fixes
+
+- **Usage billing attribution**: per-session rows are now split into
+  `session_usage` per-day buckets so today/week/month rollups no longer
+  over-count cross-day sessions. `report` and the TUI both read from the
+  new bucketed view.
+- **Codex forked session accounting**: when Codex resumes or forks a
+  session it appends a new JSONL file that replays prior turns; the
+  collector now dedupes replayed events so the forked session does not
+  double-count the parent session's tokens.
+- **Backend usage accounting**: Claude Code and Codex collectors now
+  re-emit historical session totals on every sync (instead of only new
+  events), so pricing overrides and backfills consistently re-cost past
+  sessions. Aggregator queries and a large batch of tests were updated
+  alongside.
+
 ## v0.2.0 (2026-04-23)
 
 Focused fork: supports **Codex** and **Claude Code** only, with
