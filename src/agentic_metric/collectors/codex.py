@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from ..config import CODEX_SESSIONS_DIR
@@ -36,12 +36,26 @@ class _SessionAccum:
         "output_tokens",
         "cache_read",
         "cache_create",
+        "today_user_turns",
+        "today_message_count",
+        "today_input_tokens",
+        "today_output_tokens",
+        "today_cache_read",
+        "today_cache_create",
+        "today_input_base",
+        "today_output_base",
+        "today_cache_read_base",
+        "today_cache_create_base",
+        "today_key",
         "first_ts",
         "last_ts",
         "first_prompt",
         "last_prompt",
         "git_branch",
         "model",
+        "partial_line",
+        "file_id",
+        "file_mtime_ns",
     )
 
     def __init__(self, file_path: Path, project_path: str, pid: int = 0) -> None:
@@ -57,12 +71,26 @@ class _SessionAccum:
         self.output_tokens = 0
         self.cache_read = 0
         self.cache_create = 0
+        self.today_user_turns = 0
+        self.today_message_count = 0
+        self.today_input_tokens = 0
+        self.today_output_tokens = 0
+        self.today_cache_read = 0
+        self.today_cache_create = 0
+        self.today_input_base = 0
+        self.today_output_base = 0
+        self.today_cache_read_base = 0
+        self.today_cache_create_base = 0
+        self.today_key = ""
         self.first_ts = ""
         self.last_ts = ""
         self.first_prompt = ""
         self.last_prompt = ""
         self.git_branch = ""
         self.model = ""
+        self.partial_line = b""
+        self.file_id: tuple[int, int] | None = None
+        self.file_mtime_ns = -1
 
     def read_new_lines(self) -> None:
         """Read only bytes appended since last call.
@@ -70,44 +98,108 @@ class _SessionAccum:
         If the file shrank (truncated or replaced), reset state and re-parse
         from offset 0 — otherwise we'd silently miss data.
         """
+        today_str = date.today().strftime("%Y-%m-%d")
+        if today_str != self.today_key:
+            self._reset_today_counters(today_str)
+
         try:
-            size = self.file_path.stat().st_size
+            stat = self.file_path.stat()
+            size = stat.st_size
+            file_id = (stat.st_dev, stat.st_ino)
+            mtime_ns = stat.st_mtime_ns
         except OSError:
             return
+        same_size_rewrite = (
+            size == self.offset
+            and self.file_mtime_ns >= 0
+            and mtime_ns != self.file_mtime_ns
+        )
+        if (
+            (self.file_id is not None and file_id != self.file_id)
+            or size < self.offset
+            or same_size_rewrite
+        ):
+            self._reset_parsed_state(today_str)
+        self.file_id = file_id
         if size == self.offset:
+            self.file_mtime_ns = mtime_ns
             return
-        if size < self.offset:
-            # File was truncated or replaced; reset accumulator-level state
-            # that comes from parsing, but keep identity fields.
-            self.offset = 0
-            self.user_turns = 0
-            self.message_count = 0
-            self.input_tokens = 0
-            self.raw_input_tokens = 0
-            self.output_tokens = 0
-            self.cache_read = 0
-            self.cache_create = 0
-            self.first_ts = ""
-            self.last_ts = ""
-            self.first_prompt = ""
-            self.last_prompt = ""
         try:
             with open(self.file_path, "rb") as f:
                 f.seek(self.offset)
                 new_data = f.read()
             self.offset = size
+            self.file_mtime_ns = mtime_ns
         except OSError:
             return
 
-        for raw_line in new_data.split(b"\n"):
-            raw_line = raw_line.strip()
-            if not raw_line:
-                continue
-            try:
-                entry = json.loads(raw_line)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                continue
-            self._process_entry(entry)
+        data = self.partial_line + new_data
+        self.partial_line = b""
+        lines = data.split(b"\n")
+        tail = b""
+        if data and not data.endswith(b"\n"):
+            tail = lines.pop()
+
+        for raw_line in lines:
+            self._process_raw_line(raw_line)
+
+        if tail.strip() and not self._process_raw_line(tail):
+            self.partial_line = tail
+
+    def _reset_parsed_state(self, today_str: str) -> None:
+        """Reset parsed counters after file truncation/replacement."""
+        self.session_id = ""
+        self.offset = 0
+        self.user_turns = 0
+        self.message_count = 0
+        self.input_tokens = 0
+        self.raw_input_tokens = 0
+        self.output_tokens = 0
+        self.cache_read = 0
+        self.cache_create = 0
+        self.first_ts = ""
+        self.last_ts = ""
+        self.first_prompt = ""
+        self.last_prompt = ""
+        self.git_branch = ""
+        self.model = ""
+        self.partial_line = b""
+        self._reset_today_counters(today_str)
+
+    def _reset_today_counters(self, today_str: str) -> None:
+        """Reset day-local counters and use current totals as the baseline."""
+        self.today_key = today_str
+        self.today_user_turns = 0
+        self.today_message_count = 0
+        self.today_input_tokens = 0
+        self.today_output_tokens = 0
+        self.today_cache_read = 0
+        self.today_cache_create = 0
+        self.today_input_base = self.input_tokens
+        self.today_output_base = self.output_tokens
+        self.today_cache_read_base = self.cache_read
+        self.today_cache_create_base = self.cache_create
+
+    @staticmethod
+    def _ts_local_date(ts: str) -> str:
+        """Convert ISO timestamp to local date string YYYY-MM-DD."""
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            return dt.astimezone().strftime("%Y-%m-%d")
+        except (ValueError, TypeError):
+            return ts[:10] if len(ts) >= 10 else ""
+
+    def _process_raw_line(self, raw_line: bytes) -> bool:
+        """Process one JSONL line. Return False for an unparsable line."""
+        raw_line = raw_line.strip()
+        if not raw_line:
+            return True
+        try:
+            entry = json.loads(raw_line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return False
+        self._process_entry(entry)
+        return True
 
     def _process_entry(self, entry: dict) -> None:
         ts = entry.get("timestamp", "")
@@ -116,6 +208,7 @@ class _SessionAccum:
                 self.first_ts = ts
             self.last_ts = ts
 
+        is_today = self._ts_local_date(ts) == self.today_key if ts else True
         entry_type = entry.get("type", "")
 
         if entry_type == "session_meta":
@@ -135,14 +228,17 @@ class _SessionAccum:
                 self.model = model
 
         elif entry_type == "event_msg":
-            self._process_event_msg(entry.get("payload", {}))
+            self._process_event_msg(entry.get("payload", {}), is_today)
 
-    def _process_event_msg(self, payload: dict) -> None:
+    def _process_event_msg(self, payload: dict, is_today: bool = True) -> None:
         msg_type = payload.get("type", "")
 
         if msg_type == "user_message":
             self.user_turns += 1
             self.message_count += 1
+            if is_today:
+                self.today_user_turns += 1
+                self.today_message_count += 1
             text = payload.get("message", "")
             if isinstance(text, str) and text.strip():
                 clean = text.strip()[:80]
@@ -152,6 +248,8 @@ class _SessionAccum:
 
         elif msg_type == "agent_message":
             self.message_count += 1
+            if is_today:
+                self.today_message_count += 1
 
         elif msg_type == "token_count":
             info = payload.get("info")
@@ -182,6 +280,16 @@ class _SessionAccum:
                 self.cache_read = cached
             if raw_input is not None or cached is not None:
                 self.input_tokens = max(self.raw_input_tokens - self.cache_read, 0)
+            if is_today:
+                self.today_input_tokens = max(self.input_tokens - self.today_input_base, 0)
+                self.today_output_tokens = max(self.output_tokens - self.today_output_base, 0)
+                self.today_cache_read = max(self.cache_read - self.today_cache_read_base, 0)
+                self.today_cache_create = max(self.cache_create - self.today_cache_create_base, 0)
+            else:
+                self.today_input_base = self.input_tokens
+                self.today_output_base = self.output_tokens
+                self.today_cache_read_base = self.cache_read
+                self.today_cache_create_base = self.cache_create
 
     def to_live_session(self) -> LiveSession:
         return LiveSession(
@@ -201,6 +309,12 @@ class _SessionAccum:
             first_prompt=self.first_prompt,
             last_prompt=self.last_prompt,
             pid=self.pid,
+            today_input_tokens=self.today_input_tokens,
+            today_output_tokens=self.today_output_tokens,
+            today_cache_read_tokens=self.today_cache_read,
+            today_cache_creation_tokens=self.today_cache_create,
+            today_user_turns=self.today_user_turns,
+            today_message_count=self.today_message_count,
         )
 
 
@@ -224,6 +338,10 @@ class _LiveMonitor:
         if not pid_cwds:
             return []
 
+        cwd_to_pids: dict[str, list[int]] = {}
+        for pid, cwd in pid_cwds.items():
+            cwd_to_pids.setdefault(cwd, []).append(pid)
+
         today = date.today()
         candidate_files: dict[Path, float] = {}
         for day_offset in range(3):
@@ -245,21 +363,26 @@ class _LiveMonitor:
             except OSError:
                 continue
 
-        if not candidate_files:
+        cwd_to_files = self._files_by_active_cwd(candidate_files, cwd_to_pids)
+        missing_cwds = set(cwd_to_pids) - set(cwd_to_files)
+        if missing_cwds and CODEX_SESSIONS_DIR.exists():
+            try:
+                for jsonl_file in CODEX_SESSIONS_DIR.rglob("rollout-*.jsonl"):
+                    if jsonl_file in candidate_files:
+                        continue
+                    cwd = self._read_cwd(jsonl_file)
+                    if cwd not in missing_cwds:
+                        continue
+                    try:
+                        candidate_files[jsonl_file] = jsonl_file.stat().st_mtime
+                    except OSError:
+                        continue
+            except OSError:
+                pass
+            cwd_to_files = self._files_by_active_cwd(candidate_files, cwd_to_pids)
+
+        if not cwd_to_files:
             return []
-
-        jsonl_files = sorted(candidate_files, key=lambda f: candidate_files[f], reverse=True)
-
-        cwd_to_pids: dict[str, list[int]] = {}
-        for pid, cwd in pid_cwds.items():
-            cwd_to_pids.setdefault(cwd, []).append(pid)
-
-        cwd_to_files: dict[str, list[Path]] = {}
-        for jsonl_file in jsonl_files:
-            cwd = self._read_cwd(jsonl_file)
-            if not cwd or cwd not in cwd_to_pids:
-                continue
-            cwd_to_files.setdefault(cwd, []).append(jsonl_file)
 
         results: list[LiveSession] = []
         active_files: set[Path] = set()
@@ -292,6 +415,21 @@ class _LiveMonitor:
 
         results.sort(key=lambda s: s.last_active, reverse=True)
         return results
+
+    @staticmethod
+    def _files_by_active_cwd(
+        candidate_files: dict[Path, float],
+        cwd_to_pids: dict[str, list[int]],
+    ) -> dict[str, list[Path]]:
+        """Group candidate JSONL files by active process CWD, newest first."""
+        cwd_to_files: dict[str, list[Path]] = {}
+        jsonl_files = sorted(candidate_files, key=lambda f: candidate_files[f], reverse=True)
+        for jsonl_file in jsonl_files:
+            cwd = _LiveMonitor._read_cwd(jsonl_file)
+            if not cwd or cwd not in cwd_to_pids:
+                continue
+            cwd_to_files.setdefault(cwd, []).append(jsonl_file)
+        return cwd_to_files
 
     @staticmethod
     def _read_cwd(jsonl_file: Path) -> str:

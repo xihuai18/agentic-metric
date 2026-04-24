@@ -72,6 +72,9 @@ class _SessionAccum:
         "today_cache_read",
         "today_cache_create",
         "today_key",
+        "partial_line",
+        "file_id",
+        "file_mtime_ns",
     )
 
     def __init__(self, file_path: Path, project_path: str, pid: int = 0) -> None:
@@ -99,6 +102,9 @@ class _SessionAccum:
         self.today_cache_read = 0
         self.today_cache_create = 0
         self.today_key = ""
+        self.partial_line = b""
+        self.file_id: tuple[int, int] | None = None
+        self.file_mtime_ns = -1
 
     def read_new_lines(self) -> None:
         """Read only bytes appended since last call."""
@@ -107,25 +113,76 @@ class _SessionAccum:
             self._reset_today_counters(today_str)
 
         try:
-            size = self.file_path.stat().st_size
-            if size <= self.offset:
+            stat = self.file_path.stat()
+            size = stat.st_size
+            file_id = (stat.st_dev, stat.st_ino)
+            mtime_ns = stat.st_mtime_ns
+            same_size_rewrite = (
+                size == self.offset
+                and self.file_mtime_ns >= 0
+                and mtime_ns != self.file_mtime_ns
+            )
+            if (
+                (self.file_id is not None and file_id != self.file_id)
+                or size < self.offset
+                or same_size_rewrite
+            ):
+                self._reset_parsed_state(today_str)
+            self.file_id = file_id
+            if size == self.offset:
+                self.file_mtime_ns = mtime_ns
                 return
             with open(self.file_path, "rb") as f:
                 f.seek(self.offset)
                 new_data = f.read()
             self.offset = size
+            self.file_mtime_ns = mtime_ns
         except OSError:
             return
 
-        for raw_line in new_data.split(b"\n"):
-            raw_line = raw_line.strip()
-            if not raw_line:
-                continue
-            try:
-                entry = json.loads(raw_line)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                continue
-            self._process_entry(entry, today_str)
+        data = self.partial_line + new_data
+        self.partial_line = b""
+        lines = data.split(b"\n")
+        tail = b""
+        if data and not data.endswith(b"\n"):
+            tail = lines.pop()
+
+        for raw_line in lines:
+            self._process_raw_line(raw_line, today_str)
+
+        if tail.strip() and not self._process_raw_line(tail, today_str):
+            self.partial_line = tail
+
+    def _reset_parsed_state(self, today_str: str) -> None:
+        """Reset parsed counters after file truncation/replacement."""
+        self.session_id = self.file_path.stem
+        self.offset = 0
+        self.user_turns = 0
+        self.message_count = 0
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.cache_read = 0
+        self.cache_create = 0
+        self.first_ts = ""
+        self.last_ts = ""
+        self.first_prompt = ""
+        self.last_prompt = ""
+        self.git_branch = ""
+        self.model = ""
+        self.partial_line = b""
+        self._reset_today_counters(today_str)
+
+    def _process_raw_line(self, raw_line: bytes, today_str: str) -> bool:
+        """Process one JSONL line. Return False for an unparsable line."""
+        raw_line = raw_line.strip()
+        if not raw_line:
+            return True
+        try:
+            entry = json.loads(raw_line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return False
+        self._process_entry(entry, today_str)
+        return True
 
     def _reset_today_counters(self, today_str: str) -> None:
         """Reset day-local counters when the local date changes."""

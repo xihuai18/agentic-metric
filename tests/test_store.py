@@ -5,8 +5,14 @@ import tempfile
 from datetime import datetime
 from unittest.mock import patch
 
+from agentic_metric.models import DailyTrend, LiveSession, TodayOverview
 from agentic_metric.store.database import Database
-from agentic_metric.store.aggregator import get_today_overview, get_daily_trends
+from agentic_metric.store.aggregator import (
+    get_daily_trends,
+    get_today_overview,
+    merge_live_into_overview,
+    merge_live_into_trends,
+)
 
 
 def _make_db() -> Database:
@@ -149,6 +155,99 @@ def test_today_overview_from_sessions():
     assert overview.message_count == 30
     assert len(overview.by_agent) == 2
     db.close()
+
+
+def test_merge_live_overview_matches_by_session_and_agent():
+    today = datetime.now().strftime("%Y-%m-%d")
+    today_sessions = [{
+        "session_id": "same-id",
+        "agent_type": "claude_code",
+        "message_count": 4,
+        "user_turns": 2,
+        "input_tokens": 1000,
+        "output_tokens": 200,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
+        "estimated_cost_usd": 10.0,
+    }]
+    overview = TodayOverview(
+        date=today,
+        session_count=1,
+        message_count=4,
+        tool_call_count=2,
+        input_tokens=1000,
+        output_tokens=200,
+        estimated_cost_usd=10.0,
+        by_agent={
+            "claude_code": {
+                "session_count": 1,
+                "turns": 2,
+                "message_count": 4,
+                "input_tokens": 1000,
+                "output_tokens": 200,
+                "cost": 10.0,
+            }
+        },
+    )
+    live = LiveSession(
+        session_id="same-id",
+        agent_type="codex",
+        project_path="/tmp/project",
+        model="gpt-5.4",
+        message_count=2,
+        user_turns=1,
+        input_tokens=50,
+        output_tokens=5,
+    )
+
+    merge_live_into_overview(overview, [live], today_sessions)
+
+    assert overview.session_count == 2
+    assert overview.input_tokens == 1050
+    assert overview.output_tokens == 205
+    assert overview.by_agent["codex"]["session_count"] == 1
+
+
+def test_merge_live_trends_matches_by_session_and_agent():
+    today = datetime.now().strftime("%Y-%m-%d")
+    today_sessions = [{
+        "session_id": "same-id",
+        "agent_type": "claude_code",
+        "message_count": 4,
+        "user_turns": 2,
+        "input_tokens": 1000,
+        "output_tokens": 200,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
+        "estimated_cost_usd": 10.0,
+    }]
+    trends = [
+        DailyTrend(
+            date=today,
+            session_count=1,
+            user_turns=2,
+            message_count=4,
+            input_tokens=1000,
+            output_tokens=200,
+            estimated_cost_usd=10.0,
+        )
+    ]
+    live = LiveSession(
+        session_id="same-id",
+        agent_type="codex",
+        project_path="/tmp/project",
+        model="gpt-5.4",
+        message_count=2,
+        user_turns=1,
+        input_tokens=50,
+        output_tokens=5,
+    )
+
+    merge_live_into_trends(trends, [live], today_sessions)
+
+    assert trends[0].session_count == 2
+    assert trends[0].input_tokens == 1050
+    assert trends[0].output_tokens == 205
 
 
 def test_daily_trends():

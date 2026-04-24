@@ -11,6 +11,7 @@ from agentic_metric.pricing import (
     estimate_cost,
     get_all_pricing,
     get_pricing,
+    get_pricing_fingerprint,
     remove_user_pricing,
     reset_all_user_pricing,
     set_user_pricing,
@@ -110,6 +111,31 @@ def test_user_pricing_override(tmp_path):
 def test_alias_normalization_uses_canonical_pricing():
     p = get_pricing("claude-4.5-sonnet-thinking")
     assert p == (3.0, 15.0, 0.30, 3.75)
+
+
+def test_gpt_5_1_codex_max_alias_is_known(caplog):
+    import agentic_metric.pricing as p
+
+    p._warned_models.clear()
+    caplog.set_level("WARNING", logger="agentic_metric.pricing")
+
+    assert get_pricing("gpt-5.1-codex-max") == p._BUILTIN_PRICING["gpt-5.1-codex"]
+    assert "Unknown model" not in caplog.text
+
+
+def test_pricing_fingerprint_includes_lookup_rules(tmp_path):
+    pricing_file = tmp_path / "pricing.json"
+
+    _reset_cache()
+    with patch("agentic_metric.pricing.PRICING_FILE", pricing_file):
+        base = get_pricing_fingerprint()
+        with patch("agentic_metric.pricing._MODEL_ALIASES", {"alias-model": "claude-sonnet-4-6"}):
+            assert get_pricing_fingerprint() != base
+        with patch("agentic_metric.pricing._FAMILY_FALLBACK", [("gpt-5", (9.0, 9.0, 0.0, 0.0))]):
+            assert get_pricing_fingerprint() != base
+        with patch("agentic_metric.pricing._DEFAULT_PRICING", (9.0, 9.0, 0.0, 0.0)):
+            assert get_pricing_fingerprint() != base
+    _reset_cache()
 
 
 def test_user_pricing_override_is_exact_match(tmp_path):

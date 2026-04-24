@@ -2,13 +2,17 @@
 
 import json
 import os
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from unittest.mock import patch
 
 from agentic_metric.collectors import CollectorRegistry, BaseCollector
 from agentic_metric.collectors.claude_code import _SessionAccum as ClaudeSessionAccum
-from agentic_metric.collectors.codex import CodexCollector, _SessionAccum as CodexSessionAccum
+from agentic_metric.collectors.codex import (
+    CodexCollector,
+    _LiveMonitor as CodexLiveMonitor,
+    _SessionAccum as CodexSessionAccum,
+)
 from agentic_metric.models import LiveSession
 from agentic_metric.store.database import Database
 
@@ -87,6 +91,104 @@ def test_codex_cached_only_update_recomputes_input_tokens():
     assert accum.input_tokens == 800
 
 
+def test_codex_partial_trailing_jsonl_is_retried(tmp_path):
+    session_file = tmp_path / "rollout-test.jsonl"
+    token_line = {
+        "timestamp": "2026-04-23T10:00:02Z",
+        "type": "event_msg",
+        "payload": {
+            "type": "token_count",
+            "info": {"total_token_usage": {"input_tokens": 100, "output_tokens": 20}},
+        },
+    }
+    prefix = [
+        {
+            "timestamp": "2026-04-23T10:00:00Z",
+            "type": "session_meta",
+            "payload": {"id": "sid", "cwd": "/tmp/project"},
+        },
+        {
+            "timestamp": "2026-04-23T10:00:01Z",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "hello"},
+        },
+    ]
+    partial = json.dumps(token_line)[:-1]
+    session_file.write_text("".join(json.dumps(line) + "\n" for line in prefix) + partial)
+
+    accum = CodexSessionAccum(session_file, project_path="/tmp/project")
+    accum.read_new_lines()
+    assert accum.output_tokens == 0
+
+    with session_file.open("a") as f:
+        f.write("}\n")
+    accum.read_new_lines()
+    assert accum.output_tokens == 20
+
+
+def test_claude_partial_trailing_jsonl_is_retried(tmp_path):
+    session_file = tmp_path / "session.jsonl"
+    assistant_line = {
+        "timestamp": "2026-04-23T10:00:02Z",
+        "type": "assistant",
+        "message": {
+            "model": "claude-sonnet-4-6",
+            "usage": {"input_tokens": 100, "output_tokens": 20},
+        },
+    }
+    user_line = {
+        "timestamp": "2026-04-23T10:00:01Z",
+        "type": "user",
+        "message": {"content": "hello"},
+    }
+    session_file.write_text(json.dumps(user_line) + "\n" + json.dumps(assistant_line)[:-1])
+
+    accum = ClaudeSessionAccum(session_file, project_path="/tmp/project")
+    accum.read_new_lines()
+    assert accum.output_tokens == 0
+
+    with session_file.open("a") as f:
+        f.write("}\n")
+    accum.read_new_lines()
+    assert accum.output_tokens == 20
+
+
+def test_claude_accumulator_resets_after_truncation(tmp_path):
+    session_file = tmp_path / "session.jsonl"
+    first = [
+        {
+            "timestamp": "2026-04-23T10:00:00Z",
+            "type": "user",
+            "message": {"content": "first"},
+        },
+        {
+            "timestamp": "2026-04-23T10:00:01Z",
+            "type": "assistant",
+            "message": {
+                "model": "claude-sonnet-4-6",
+                "usage": {"input_tokens": 100, "output_tokens": 20},
+            },
+        },
+    ]
+    second = [{
+        "timestamp": "2026-04-23T10:00:02Z",
+        "type": "user",
+        "message": {"content": "second"},
+    }]
+    session_file.write_text("".join(json.dumps(line) + "\n" for line in first))
+
+    accum = ClaudeSessionAccum(session_file, project_path="/tmp/project")
+    accum.read_new_lines()
+    assert accum.user_turns == 1
+    assert accum.output_tokens == 20
+
+    session_file.write_text("".join(json.dumps(line) + "\n" for line in second))
+    accum.read_new_lines()
+    assert accum.user_turns == 1
+    assert accum.output_tokens == 0
+    assert accum.first_prompt == "second"
+
+
 def test_claude_today_counters_reset_after_midnight(tmp_path):
     class FakeDateTime(datetime):
         @classmethod
@@ -114,6 +216,110 @@ def test_claude_today_counters_reset_after_midnight(tmp_path):
     assert accum.today_output_tokens == 0
     assert accum.today_cache_read == 0
     assert accum.today_cache_create == 0
+
+
+def test_codex_cross_day_live_session_uses_today_counters(tmp_path):
+    class FakeDate(date):
+        @classmethod
+        def today(cls):
+            return cls(2026, 4, 24)
+
+    session_file = tmp_path / "rollout-test.jsonl"
+    lines = [
+        {
+            "timestamp": "2026-04-23T08:55:00Z",
+            "type": "session_meta",
+            "payload": {"id": "sid", "cwd": "/tmp/project"},
+        },
+        {
+            "timestamp": "2026-04-23T08:56:00Z",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "yesterday"},
+        },
+        {
+            "timestamp": "2026-04-23T08:57:00Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 1000,
+                        "cached_input_tokens": 200,
+                        "output_tokens": 100,
+                    }
+                },
+            },
+        },
+        {
+            "timestamp": "2026-04-24T08:01:00Z",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "today"},
+        },
+        {
+            "timestamp": "2026-04-24T08:02:00Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 1500,
+                        "cached_input_tokens": 300,
+                        "output_tokens": 150,
+                    }
+                },
+            },
+        },
+    ]
+    session_file.write_text("".join(json.dumps(line) + "\n" for line in lines))
+
+    accum = CodexSessionAccum(session_file, project_path="/tmp/project")
+    with patch("agentic_metric.collectors.codex.date", FakeDate):
+        accum.read_new_lines()
+
+    live = accum.to_live_session()
+    assert live.input_tokens == 1200
+    assert live.output_tokens == 150
+    assert live.cache_read_tokens == 300
+    assert live.today_input_tokens == 400
+    assert live.today_output_tokens == 50
+    assert live.today_cache_read_tokens == 100
+    assert live.today_user_turns == 1
+
+
+def test_codex_live_monitor_finds_older_active_session(tmp_path):
+    class FakeDate(date):
+        @classmethod
+        def today(cls):
+            return cls(2026, 4, 24)
+
+    sessions_root = tmp_path / "sessions"
+    old_dir = sessions_root / "2026" / "04" / "20"
+    old_dir.mkdir(parents=True)
+    rollout = old_dir / "rollout-old.jsonl"
+    lines = [
+        {
+            "timestamp": "2026-04-20T10:00:00Z",
+            "type": "session_meta",
+            "payload": {"id": "old-sid", "cwd": "/tmp/project"},
+        },
+        {
+            "timestamp": "2026-04-20T10:00:01Z",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "still running"},
+        },
+    ]
+    rollout.write_text("".join(json.dumps(line) + "\n" for line in lines))
+
+    monitor = CodexLiveMonitor()
+    with (
+        patch("agentic_metric.collectors.codex.CODEX_SESSIONS_DIR", sessions_root),
+        patch("agentic_metric.collectors.codex.get_running_cwds", return_value={123: "/tmp/project"}),
+        patch("agentic_metric.collectors.codex.date", FakeDate),
+    ):
+        sessions = monitor.refresh()
+
+    assert len(sessions) == 1
+    assert sessions[0].session_id == "old-sid"
 
 
 def test_codex_history_sync_detects_same_size_file_edits(tmp_path):

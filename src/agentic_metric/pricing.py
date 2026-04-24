@@ -37,10 +37,12 @@ _BUILTIN_PRICING: dict[str, tuple[float, float, float, float]] = {
     "claude-3-opus":         (15.0, 75.0, 1.50, 18.75),
     "claude-3-haiku":        (0.25, 1.25, 0.03,  0.30),
     # ── OpenAI ──
+    "gpt-5.5":               (5.0,  30.0,  0.50,  0.0),
     "gpt-5.4-pro":           (30.0, 180.0, 0.0,  0.0),
     "gpt-5.4-mini":          (0.75,   4.5, 0.075, 0.0),
     "gpt-5.4-nano":          (0.20,  1.25, 0.02,  0.0),
     "gpt-5.4":               (2.5,  15.0,  0.25,  0.0),
+    "gpt-5.1-codex":         (1.75, 14.0,  0.175, 0.0),
     "gpt-5.3-codex":         (1.75, 14.0,  0.175, 0.0),
     "gpt-5.3-chat-latest":   (1.75, 14.0,  0.175, 0.0),
     "gpt-5.3":               (1.75, 14.0,  0.175, 0.0),
@@ -68,6 +70,7 @@ _FAMILY_FALLBACK: list[tuple[str, tuple[float, float, float, float]]] = [
     ("claude-opus",   (5.0,  25.0, 0.50,  6.25)),
     ("claude-sonnet", (3.0,  15.0, 0.30,  3.75)),
     ("claude-haiku",  (1.0,   5.0, 0.10,  1.25)),
+    ("gpt-5.5",       (5.0,  30.0, 0.50,  0.0)),
     ("gpt-5.4",       (2.5,  15.0, 0.25,  0.0)),
     ("gpt-5",         (1.75, 14.0, 0.175, 0.0)),
     ("gemini-3",      (2.0,  12.0, 0.20,  0.0)),
@@ -83,7 +86,7 @@ _MODEL_ALIASES: dict[str, str] = {
     "gpt-5.1-codex-max": "gpt-5.1-codex",
 }
 
-_PRICING_FINGERPRINT_VERSION = 1
+_PRICING_FINGERPRINT_VERSION = 3
 
 # Track warned models to avoid spamming logs
 _warned_models: set[str] = set()
@@ -240,7 +243,10 @@ def get_pricing_fingerprint() -> str:
     """Return a stable fingerprint for repricing stored sessions."""
     payload = {
         "version": _PRICING_FINGERPRINT_VERSION,
+        "aliases": sorted(_MODEL_ALIASES.items()),
         "builtin": sorted((model, list(prices)) for model, prices in _BUILTIN_PRICING.items()),
+        "default": list(_DEFAULT_PRICING),
+        "family_fallback": sorted((model, list(prices)) for model, prices in _FAMILY_FALLBACK),
         "user": sorted((model, list(prices)) for model, prices in _load_user_pricing().items()),
     }
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))

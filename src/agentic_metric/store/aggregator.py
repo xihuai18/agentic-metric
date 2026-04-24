@@ -64,15 +64,16 @@ def merge_live_into_overview(
     - Live sessions not in today's DB rows (e.g. started yesterday but still
       running): add full live values.
     """
-    db_ids = {s["session_id"] for s in today_sessions}
-    db_by_id = {s["session_id"]: s for s in today_sessions}
+    db_ids = {(s["session_id"], s["agent_type"]) for s in today_sessions}
+    db_by_id = {(s["session_id"], s["agent_type"]): s for s in today_sessions}
 
     for ls in live_sessions:
         cost = estimate_session_cost(ls)
         at = ls.agent_type or ""
+        session_key = (ls.session_id, at)
 
-        if ls.session_id in db_ids:
-            db_s = db_by_id[ls.session_id]
+        if session_key in db_ids:
+            db_s = db_by_id[session_key]
             if ls.output_tokens > 0:
                 d_msg = max(0, ls.message_count - (db_s["message_count"] or 0))
                 d_turns = max(0, ls.user_turns - (db_s["user_turns"] or 0))
@@ -158,12 +159,13 @@ def merge_live_into_trends(
         today_trend = DailyTrend(date=today)
         trends.insert(0, today_trend)
 
-    db_ids = {s["session_id"] for s in today_sessions}
-    db_by_id = {s["session_id"]: s for s in today_sessions}
+    db_ids = {(s["session_id"], s["agent_type"]) for s in today_sessions}
+    db_by_id = {(s["session_id"], s["agent_type"]): s for s in today_sessions}
 
     for ls in live_sessions:
-        if ls.session_id in db_ids:
-            db_s = db_by_id[ls.session_id]
+        session_key = (ls.session_id, ls.agent_type or "")
+        if session_key in db_ids:
+            db_s = db_by_id[session_key]
             if ls.output_tokens > 0:
                 today_trend.user_turns += max(0, ls.user_turns - (db_s["user_turns"] or 0))
                 today_trend.message_count += max(0, ls.message_count - (db_s["message_count"] or 0))
