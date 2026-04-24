@@ -9,6 +9,7 @@ from unittest.mock import patch
 from agentic_metric.collectors import CollectorRegistry, BaseCollector
 from agentic_metric.collectors.claude_code import (
     ClaudeCodeCollector,
+    _LiveMonitor as ClaudeLiveMonitor,
     _SessionAccum as ClaudeSessionAccum,
 )
 from agentic_metric.collectors.codex import (
@@ -516,6 +517,126 @@ def test_claude_history_sync_scans_subagent_jsonl(tmp_path):
     assert row["input_tokens"] == 100
     assert row["output_tokens"] == 20
     db.close()
+
+
+def test_claude_history_sync_reads_utf8_jsonl_on_windows_locale(tmp_path):
+    projects = tmp_path / "projects"
+    project_dir = projects / "-Users-Leo-中文项目"
+    project_dir.mkdir(parents=True)
+    session_file = project_dir / "session.jsonl"
+    cwd = r"C:\Users\Leo\中文项目"
+    lines = [
+        {
+            "timestamp": "2026-04-23T10:00:00Z",
+            "type": "user",
+            "cwd": cwd,
+            "message": {"content": "hello"},
+        },
+        {
+            "timestamp": "2026-04-23T10:00:01Z",
+            "type": "assistant",
+            "cwd": cwd,
+            "message": {
+                "id": "msg-utf8",
+                "model": "claude-sonnet-4-6",
+                "usage": {"input_tokens": 100, "output_tokens": 20},
+            },
+        },
+    ]
+    session_file.write_bytes("".join(
+        json.dumps(line, ensure_ascii=False) + "\n" for line in lines
+    ).encode("utf-8"))
+
+    import builtins
+
+    real_open = builtins.open
+
+    def strict_locale_open(file, *args, **kwargs):
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if Path(file) == session_file and "b" not in mode and kwargs.get("encoding") is None:
+            raise UnicodeDecodeError("cp936", b"\x80", 0, 1, "invalid start byte")
+        return real_open(file, *args, **kwargs)
+
+    db = Database(db_path=str(tmp_path / "data.db"))
+    with (
+        patch("agentic_metric.collectors.claude_code.PROJECTS_DIR", projects),
+        patch("builtins.open", strict_locale_open),
+    ):
+        ClaudeCodeCollector().sync_history(db)
+
+    row = db.conn.execute(
+        "SELECT project_path, input_tokens, output_tokens "
+        "FROM sessions WHERE session_id = 'session' "
+        "AND agent_type = 'claude_code'"
+    ).fetchone()
+    assert row is not None
+    assert row["project_path"] == cwd
+    assert row["input_tokens"] == 100
+    assert row["output_tokens"] == 20
+    db.close()
+
+
+def test_claude_sessions_index_reads_utf8_on_windows_locale(tmp_path):
+    projects = tmp_path / "projects"
+    project_dir = projects / "-Users-Leo-中文项目"
+    project_dir.mkdir(parents=True)
+    index_file = project_dir / "sessions-index.json"
+    index_file.write_bytes(json.dumps({
+        "entries": [{
+            "sessionId": "indexed-session",
+            "projectPath": r"C:\Users\Leo\中文项目",
+            "gitBranch": "main",
+            "messageCount": 3,
+            "created": "2026-04-23T10:00:00Z",
+            "modified": "2026-04-23T10:05:00Z",
+            "summary": "中文 summary",
+        }],
+    }, ensure_ascii=False).encode("utf-8"))
+
+    real_read_text = Path.read_text
+
+    def strict_locale_read_text(self, *args, **kwargs):
+        if self == index_file and kwargs.get("encoding") is None:
+            raise UnicodeDecodeError("cp936", b"\x80", 0, 1, "invalid start byte")
+        return real_read_text(self, *args, **kwargs)
+
+    db = Database(db_path=str(tmp_path / "data.db"))
+    with (
+        patch("agentic_metric.collectors.claude_code.PROJECTS_DIR", projects),
+        patch.object(Path, "read_text", strict_locale_read_text),
+    ):
+        ClaudeCodeCollector().sync_history(db)
+
+    row = db.conn.execute(
+        "SELECT project_path, message_count "
+        "FROM sessions WHERE session_id = 'indexed-session' "
+        "AND agent_type = 'claude_code'"
+    ).fetchone()
+    assert row is not None
+    assert row["project_path"] == r"C:\Users\Leo\中文项目"
+    assert row["message_count"] == 3
+    db.close()
+
+
+def test_claude_read_cwd_uses_utf8(tmp_path):
+    session_file = tmp_path / "session.jsonl"
+    cwd = r"C:\Users\Leo\中文项目"
+    session_file.write_bytes(
+        (json.dumps({"cwd": cwd}, ensure_ascii=False) + "\n").encode("utf-8")
+    )
+
+    import builtins
+
+    real_open = builtins.open
+
+    def strict_locale_open(file, *args, **kwargs):
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if Path(file) == session_file and "b" not in mode and kwargs.get("encoding") is None:
+            raise UnicodeDecodeError("cp936", b"\x80", 0, 1, "invalid start byte")
+        return real_open(file, *args, **kwargs)
+
+    with patch("builtins.open", strict_locale_open):
+        assert ClaudeLiveMonitor._read_cwd(session_file) == cwd
 
 
 def test_codex_cross_day_live_session_uses_today_counters(tmp_path):

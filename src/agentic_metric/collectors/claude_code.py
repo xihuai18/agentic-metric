@@ -713,7 +713,7 @@ class _LiveMonitor:
     def _read_cwd(jsonl_file: Path) -> str:
         """Extract the cwd field from the first few lines of a JSONL file."""
         try:
-            with open(jsonl_file) as f:
+            with open(jsonl_file, encoding="utf-8") as f:
                 for i, line in enumerate(f):
                     if i > 10:
                         break
@@ -724,7 +724,7 @@ class _LiveMonitor:
                             return cwd
                     except json.JSONDecodeError:
                         continue
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             pass
         return ""
 
@@ -769,8 +769,8 @@ class ClaudeCodeCollector(BaseCollector):
 
         for index_file in PROJECTS_DIR.glob("*/sessions-index.json"):
             try:
-                data = json.loads(index_file.read_text())
-            except (json.JSONDecodeError, OSError):
+                data = json.loads(index_file.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
                 continue
 
             for entry in data.get("entries", []):
