@@ -1,7 +1,30 @@
+# Python
 __pycache__/
 *.pyc
+*.pyo
 *.egg-info/
 dist/
 build/
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtualenvs
+.venv/
+venv/
+.env
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+
+# Local data
 *.db
+
+# Tooling markers
+.codex
+.claude/

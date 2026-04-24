@@ -32,6 +32,11 @@ dependencies = [
     "typer>=0.9.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
 [project.urls]
 Homepage = "https://github.com/MrQianjinsi/agentic-metric"
 Repository = "https://github.com/MrQianjinsi/agentic-metric"
