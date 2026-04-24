@@ -1,6 +1,7 @@
 """Tests for store module."""
 
 import json
+import sqlite3
 import tempfile
 from datetime import datetime
 from unittest.mock import patch
@@ -9,6 +10,7 @@ from agentic_metric.models import DailyTrend, LiveSession, TodayOverview
 from agentic_metric.store.database import Database
 from agentic_metric.store.aggregator import (
     get_daily_trends,
+    get_range_by_project,
     get_range_by_agent_model,
     get_range_daily,
     get_range_by_time_model,
@@ -19,6 +21,7 @@ from agentic_metric.store.aggregator import (
     merge_live_into_overview,
     merge_live_into_trends,
 )
+from agentic_metric.tui.widgets import Breakdown
 
 
 def _make_db() -> Database:
@@ -169,6 +172,255 @@ def test_database_reprices_session_usage_when_pricing_changes(tmp_path):
         ).fetchone()
         assert row["estimated_cost_usd"] == 22.0
         db.close()
+
+
+def test_database_migrates_session_usage_service_tier_primary_key(tmp_path):
+    db_path = tmp_path / "old.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """CREATE TABLE session_usage (
+            session_id TEXT NOT NULL,
+            agent_type TEXT NOT NULL,
+            usage_date TEXT NOT NULL,
+            usage_hour INTEGER NOT NULL,
+            project_path TEXT DEFAULT '',
+            model TEXT DEFAULT '',
+            message_count INTEGER DEFAULT 0,
+            user_turns INTEGER DEFAULT 0,
+            input_tokens INTEGER DEFAULT 0,
+            output_tokens INTEGER DEFAULT 0,
+            cache_read_tokens INTEGER DEFAULT 0,
+            cache_creation_tokens INTEGER DEFAULT 0,
+            estimated_cost_usd REAL DEFAULT 0,
+            PRIMARY KEY (session_id, agent_type, usage_date, usage_hour, model)
+        )"""
+    )
+    conn.execute(
+        """INSERT INTO session_usage
+           (session_id, agent_type, usage_date, usage_hour, model, input_tokens, estimated_cost_usd)
+           VALUES ('s1', 'codex', '2026-04-24', 10, 'gpt-5.5', 1, 0.000005)"""
+    )
+    conn.commit()
+    conn.close()
+
+    db = Database(db_path=str(db_path))
+    pk_cols = [
+        row[1]
+        for row in sorted(
+            db.conn.execute("PRAGMA table_info(session_usage)").fetchall(),
+            key=lambda r: r[5],
+        )
+        if row[5] > 0
+    ]
+    assert pk_cols == ["session_id", "agent_type", "usage_date", "usage_hour", "model", "service_tier"]
+    row = db.conn.execute(
+        "SELECT service_tier FROM session_usage WHERE session_id = 's1' AND agent_type = 'codex'"
+    ).fetchone()
+    assert row["service_tier"] == ""
+    db.close()
+
+
+def test_replace_session_usage_preserves_collector_estimated_cost():
+    db = _make_db()
+    db.replace_session_usage(
+        "s1",
+        "codex",
+        [
+            {
+                "usage_date": "2026-04-24",
+                "usage_hour": 10,
+                "model": "gpt-5.4",
+                "input_tokens": 1,
+                "estimated_cost_usd": 123.45,
+            },
+        ],
+    )
+    db.commit()
+
+    row = db.conn.execute(
+        "SELECT estimated_cost_usd FROM session_usage WHERE session_id = 's1' AND agent_type = 'codex'"
+    ).fetchone()
+    assert row["estimated_cost_usd"] == 123.45
+    db.close()
+
+
+def test_replace_session_usage_keeps_service_tiers_distinct():
+    db = _make_db()
+    db.replace_session_usage(
+        "s1",
+        "codex",
+        [
+            {
+                "usage_date": "2026-04-24",
+                "usage_hour": 10,
+                "model": "gpt-5.5",
+                "input_tokens": 1_000_000,
+                "output_tokens": 1_000_000,
+            },
+            {
+                "usage_date": "2026-04-24",
+                "usage_hour": 10,
+                "model": "gpt-5.5",
+                "service_tier": "fast",
+                "input_tokens": 1_000_000,
+                "output_tokens": 1_000_000,
+            },
+        ],
+    )
+    db.commit()
+
+    rows = db.conn.execute(
+        """SELECT model, service_tier, estimated_cost_usd
+           FROM session_usage
+           WHERE session_id = 's1' AND agent_type = 'codex'
+           ORDER BY service_tier"""
+    ).fetchall()
+    assert len(rows) == 2
+    assert rows[0]["service_tier"] == ""
+    assert rows[0]["estimated_cost_usd"] == 35.0
+    assert rows[1]["service_tier"] == "fast"
+    assert rows[1]["estimated_cost_usd"] == 87.5
+
+    model_rows = get_range_by_agent_model(db, "2026-04-24", "2026-04-24")
+    labels = {row["model"] for row in model_rows}
+    assert labels == {"gpt-5.5", "gpt-5.5 [fast]"}
+    db.close()
+
+
+def test_explicit_usage_cost_survives_pricing_reprice(tmp_path):
+    pricing_file = tmp_path / "pricing.json"
+    db_path = str(tmp_path / "data.db")
+    explicit_cost = (300_000 * 5.0 + 1_000 * 22.5) / 1_000_000
+
+    with patch("agentic_metric.pricing.PRICING_FILE", pricing_file):
+        db = Database(db_path=db_path)
+        db.upsert_session(
+            "s1",
+            "codex",
+            model="gpt-5.4",
+            input_tokens=300_000,
+            output_tokens=1_000,
+            estimated_cost_usd=explicit_cost,
+        )
+        db.replace_session_usage(
+            "s1",
+            "codex",
+            [
+                {
+                    "usage_date": "2026-04-24",
+                    "usage_hour": 10,
+                    "model": "gpt-5.4",
+                    "input_tokens": 300_000,
+                    "output_tokens": 1_000,
+                    "estimated_cost_usd": explicit_cost,
+                },
+            ],
+        )
+        db.set_sync_state("codex_jsonl:v5:/tmp/rollout.jsonl", "1:1")
+        db.set_sync_state("pricing:fingerprint", "stale")
+        db.close()
+
+        db = Database(db_path=db_path)
+        row = db.conn.execute(
+            """SELECT estimated_cost_usd, cost_is_explicit
+               FROM session_usage
+               WHERE session_id = 's1' AND agent_type = 'codex'"""
+        ).fetchone()
+        session = db.conn.execute(
+            """SELECT estimated_cost_usd
+               FROM sessions
+               WHERE session_id = 's1' AND agent_type = 'codex'"""
+        ).fetchone()
+        assert abs(row["estimated_cost_usd"] - explicit_cost) < 0.001
+        assert row["cost_is_explicit"] == 1
+        assert abs(session["estimated_cost_usd"] - explicit_cost) < 0.001
+        assert db.get_sync_state("codex_jsonl:v5:/tmp/rollout.jsonl") is None
+        db.close()
+
+
+def test_unknown_model_cost_stays_null_and_surfaces_as_unknown(tmp_path):
+    import agentic_metric.pricing as pricing
+
+    pricing._user_cache = None
+    pricing._user_cache_mtime = -1.0
+    with patch("agentic_metric.pricing.PRICING_FILE", tmp_path / "pricing.json"):
+        db = _make_db()
+        db.upsert_session(
+            "s_unknown",
+            "codex",
+            project_path="/tmp/project",
+            model="gpt-5.4-pro",
+            input_tokens=1_000,
+            estimated_cost_usd=None,
+            started_at="2026-04-24T10:00:00Z",
+            first_prompt="unknown model prompt",
+        )
+        db.replace_session_usage(
+            "s_unknown",
+            "codex",
+            [
+                {
+                    "usage_date": "2026-04-24",
+                    "usage_hour": 10,
+                    "project_path": "/tmp/project",
+                    "model": "gpt-5.4-pro",
+                    "input_tokens": 1_000,
+                },
+            ],
+        )
+        db.commit()
+
+        row = db.conn.execute(
+            "SELECT estimated_cost_usd FROM session_usage WHERE session_id = 's_unknown'"
+        ).fetchone()
+        assert row["estimated_cost_usd"] is None
+
+        totals = get_range_totals(db, "2026-04-24", "2026-04-24")
+        assert totals["estimated_cost_usd"] == 0
+        assert totals["unknown_cost_count"] == 1
+
+        model_rows = get_range_by_agent_model(db, "2026-04-24", "2026-04-24")
+        assert model_rows[0]["model"] == "Unknown"
+        assert model_rows[0]["unknown_cost_count"] == 1
+
+        time_rows = get_range_by_time_model(db, "2026-04-24", "2026-04-24", limit=1)
+        assert time_rows[0]["model"] == "Unknown"
+        assert time_rows[0]["unknown_cost_count"] == 1
+
+        project_rows = get_range_by_project(db, "2026-04-24", "2026-04-24", limit=1)
+        assert project_rows[0]["unknown_cost_count"] == 1
+
+        top_sessions = get_range_top_sessions(db, "2026-04-24", "2026-04-24", limit=1)
+        assert top_sessions[0]["models"] == "Unknown"
+        assert top_sessions[0]["unknown_cost_count"] == 1
+        db.close()
+    pricing._user_cache = None
+    pricing._user_cache_mtime = -1.0
+
+
+def test_aggregate_usage_rows_do_not_trigger_long_context_surcharge():
+    db = _make_db()
+    db.replace_session_usage(
+        "s_agg",
+        "codex",
+        [
+            {
+                "usage_date": "2026-04-24",
+                "usage_hour": 10,
+                "model": "gpt-5.4",
+                "input_tokens": 300_000,
+                "output_tokens": 1_000,
+            },
+        ],
+    )
+    db.commit()
+
+    row = db.conn.execute(
+        "SELECT estimated_cost_usd FROM session_usage WHERE session_id = 's_agg'"
+    ).fetchone()
+    expected = (300_000 * 2.5 + 1_000 * 15.0) / 1_000_000
+    assert abs(row["estimated_cost_usd"] - expected) < 0.001
+    db.close()
 
 
 def test_sync_state():
@@ -322,7 +574,7 @@ def test_top_sessions_omits_synthetic_model_markers():
     db.upsert_session(
         "s1", "claude_code",
         project_path="/tmp/project",
-        model="claude-opus-4-7",
+        model="<synthetic>",
         started_at="2026-04-24T10:00:00Z",
         first_prompt="hello",
     )
@@ -357,8 +609,79 @@ def test_top_sessions_omits_synthetic_model_markers():
     rows = get_range_top_sessions(db, "2026-04-24", "2026-04-24", limit=1)
     assert len(rows) == 1
     assert rows[0]["session_id"] == "s1"
+    assert rows[0]["model"] == "claude-opus-4-7"
     assert rows[0]["models"] == "claude-opus-4-7"
     db.close()
+
+
+def test_today_sessions_prefer_real_usage_model_over_synthetic_session_model():
+    class FakeDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 4, 24, 12, 0, 0)
+
+    db = _make_db()
+    db.upsert_session(
+        "s1", "claude_code",
+        project_path="/tmp/project",
+        model="<synthetic>",
+        started_at="2026-04-24T10:00:00Z",
+    )
+    db.replace_session_usage(
+        "s1",
+        "claude_code",
+        [
+            {
+                "usage_date": "2026-04-24",
+                "usage_hour": 10,
+                "project_path": "/tmp/project",
+                "model": "claude-opus-4-7",
+                "message_count": 1,
+                "input_tokens": 1_000,
+                "estimated_cost_usd": 1.0,
+            },
+        ],
+    )
+    db.commit()
+
+    with patch("agentic_metric.store.aggregator.datetime", FakeDateTime):
+        rows = get_today_sessions(db)
+
+    assert rows[0]["model"] == "claude-opus-4-7"
+    db.close()
+
+
+def test_tui_breakdown_keeps_unknown_visible_before_model_limit():
+    widget = Breakdown()
+    widget._total_cost = 10.0
+    widget._groups = [
+        {
+            "agent": "codex",
+            "cost": 10.0,
+            "unknown_cost_count": 1,
+            "input": 0,
+            "output": 0,
+            "cache": 0,
+            "models": [
+                {"model": "known-1", "cost": 4.0, "input": 1, "output": 0, "cache": 0},
+                {"model": "known-2", "cost": 3.0, "input": 1, "output": 0, "cache": 0},
+                {"model": "known-3", "cost": 2.0, "input": 1, "output": 0, "cache": 0},
+                {"model": "known-4", "cost": 1.0, "input": 1, "output": 0, "cache": 0},
+                {
+                    "model": "Unknown",
+                    "cost": 0.0,
+                    "unknown_cost_count": 1,
+                    "input": 1,
+                    "output": 0,
+                    "cache": 0,
+                },
+            ],
+        }
+    ]
+
+    rendered = widget.render().plain
+    assert "Unknown" in rendered
+    assert "?" in rendered
 
 
 def test_merge_live_overview_matches_by_session_and_agent():

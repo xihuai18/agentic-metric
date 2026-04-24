@@ -15,6 +15,7 @@ class LiveSession:
     project_path: str
     git_branch: str = ""
     model: str = ""
+    service_tier: str = ""
     message_count: int = 0
     user_turns: int = 0
     input_tokens: int = 0
@@ -80,6 +81,7 @@ class TodayOverview:
     cache_read_tokens: int = 0
     cache_creation_tokens: int = 0
     estimated_cost_usd: float = 0.0
+    unknown_cost_count: int = 0
     by_agent: dict[str, dict] = field(default_factory=dict)
 
     @property
@@ -106,6 +108,7 @@ class DailyTrend:
     cache_read_tokens: int = 0
     cache_creation_tokens: int = 0
     estimated_cost_usd: float = 0.0
+    unknown_cost_count: int = 0
 
     @property
     def total_tokens(self) -> int:

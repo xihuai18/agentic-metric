@@ -7,7 +7,7 @@
 
 本地化的 AI coding agent 指标监控工具 — 类似 `top`,但监控的是你的 coding agent。追踪 **Claude Code** 和 **Codex** 的 token 用量和成本,提供 TUI 仪表盘和 CLI 命令。
 
-**支持平台:Linux 和 macOS。**
+**支持平台:Linux、macOS 和 Windows。**
 
 **所有数据完全存储在本地,使用过程不会联网。** 工具仅读取本机的 agent 数据文件(`~/.claude/`、`~/.codex/`)和进程信息,不发送任何数据到外部服务器。
 
@@ -91,7 +91,7 @@ agentic-metric pricing reset deepseek-r2                                   # 恢
 agentic-metric pricing reset --all                                         # 恢复所有定价为默认
 ```
 
-对于未知模型,会按模型族自动匹配定价(如 `claude-sonnet-*` 使用 Sonnet 定价,`gpt-5*` 使用 GPT-5 定价),最后才使用全局默认值。
+未知模型不会自动套用默认价或模型族价格。界面会显示为 `Unknown`,费用显示为 `?`,直到你用 `agentic-metric pricing set` 添加明确价格。
 
 ### TUI 快捷键
 
@@ -108,9 +108,9 @@ agentic-metric pricing reset --all                                         # 恢
 
 数据路径因平台而异,下表中 `$DATA` 含义如下:
 
-| | Linux | macOS |
-|--|-------|-------|
-| `$DATA` | `~/.local/share` | `~/Library/Application Support` |
+| | Linux | macOS | Windows |
+|--|-------|-------|---------|
+| `$DATA` | `~/.local/share` | `~/Library/Application Support` | `%LOCALAPPDATA%` |
 
 | Agent | 数据路径 | 采集内容 |
 |-------|---------|---------|
@@ -137,7 +137,7 @@ Claude Code 支持 `CLAUDE_CONFIG_DIR`,Codex 支持 `CODEX_HOME`,如果你改了
 - 不联网,不发送任何数据
 - 不修改 agent 的配置或数据文件(只读)
 - 所有统计数据存储在本地 SQLite 数据库
-- 可随时删除数据目录清除所有数据(Linux: `~/.local/share/agentic_metric/`,macOS: `~/Library/Application Support/agentic_metric/`)
+- 可随时删除数据目录清除所有数据(Linux: `~/.local/share/agentic_metric/`,macOS: `~/Library/Application Support/agentic_metric/`,Windows: `%LOCALAPPDATA%\agentic_metric\`)
 
 ## 开发
 

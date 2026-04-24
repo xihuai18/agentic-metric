@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.2.2 (2026-04-25)
+
+Pricing and platform compatibility fixes for the v0.2.x fork.
+
+### Bug fixes
+
+- **Provider-specific billing**: removed default/family pricing fallbacks.
+  Unknown models now surface as `Unknown` with cost `?` until explicit
+  pricing is configured.
+- **Codex/OpenAI token accounting**: cached input is no longer charged twice;
+  per-request pricing handles Codex `fast` tier and OpenAI/Gemini long-context
+  tiers only when event-level usage is available.
+- **Claude cache accounting**: cache-read and cache-write tokens remain
+  separate from input tokens, and observable 1-hour cache writes use the
+  Anthropic 1-hour cache multiplier.
+- **Codex code review pricing**: `codex-auto-review` is mapped to
+  `gpt-5.3-codex`, matching OpenAI's Codex rate-card note that Code Review
+  uses GPT-5.3-Codex.
+- **Stored-cost repricing**: historical rows with collector-computed
+  event-level costs are preserved across pricing fingerprint migrations, while
+  aggregate-only rows are repriced without triggering request-size tiers.
+- **Windows support**: process detection now uses `psutil`/`tasklist`
+  fallbacks, CWD matching normalizes Windows paths, date formatting avoids
+  POSIX-only flags, and the app data directory uses `%LOCALAPPDATA%`.
+
 ## v0.2.1 (2026-04-24)
 
 Follow-up correctness fixes on top of v0.2.0.

@@ -5,10 +5,17 @@ import platform
 from pathlib import Path
 
 _HOME = Path.home()
-_IS_MAC = platform.system() == "Darwin"
+_SYSTEM = platform.system()
+_IS_MAC = _SYSTEM == "Darwin"
+_IS_WINDOWS = _SYSTEM == "Windows"
 
 # Platform-specific base directories
 _APP_SUPPORT = _HOME / "Library" / "Application Support" if _IS_MAC else None
+_WINDOWS_APPDATA = Path(
+    os.environ.get("LOCALAPPDATA")
+    or os.environ.get("APPDATA")
+    or str(_HOME / "AppData" / "Local")
+) if _IS_WINDOWS else None
 
 
 def _env_path(var: str, default: Path) -> Path:
@@ -33,6 +40,7 @@ CODEX_SESSIONS_DIR = CODEX_HOME / "sessions"
 # Application data (this tool's own DB + pricing overrides).
 DATA_DIR = (
     (_APP_SUPPORT / "agentic_metric") if _IS_MAC
+    else (_WINDOWS_APPDATA / "agentic_metric") if _IS_WINDOWS
     else (_HOME / ".local" / "share" / "agentic_metric")
 )
 DB_PATH = DATA_DIR / "data.db"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -67,7 +68,7 @@ def _bucket_label(row: dict) -> str:
     hour = int(row.get("usage_hour") or 0)
     try:
         dt = datetime.strptime(date_s, "%Y-%m-%d")
-        day = dt.strftime("%b %-d")
+        day = f"{dt.strftime('%b')} {dt.day}"
     except ValueError:
         day = date_s
     return f"{day} {hour:02d}:00" if day else f"{hour:02d}:00"
@@ -76,12 +77,26 @@ def _bucket_label(row: dict) -> str:
 def _short_path(path: str, max_len: int = 38) -> str:
     if not path:
         return "(unspecified)"
-    home = str(Path.home())
-    if path.startswith(home):
-        path = "~" + path[len(home):]
+    path = _shorten_home(path)
     if len(path) <= max_len:
         return path
     return path[: max_len - 1] + "…"
+
+
+def _shorten_home(path: str) -> str:
+    if not path:
+        return path
+    try:
+        home = os.path.normpath(str(Path.home()))
+        candidate = os.path.normpath(os.path.expanduser(path))
+        home_key = os.path.normcase(home)
+        candidate_key = os.path.normcase(candidate)
+        if os.path.commonpath([home_key, candidate_key]) == home_key:
+            rel = os.path.relpath(candidate, home)
+            return "~" if rel == "." else str(Path("~") / rel)
+    except (OSError, ValueError):
+        pass
+    return path
 
 
 def _split_label(row: dict) -> str:
@@ -207,7 +222,7 @@ class AgenticMetricApp(App):
         if self._offset > 0:
             if self._focus == "today":
                 d = (datetime.now() - timedelta(days=self._offset)).date()
-                title = f"{d.strftime('%b %-d')} by hour"
+                title = f"{d.strftime('%b')} {d.day} by hour"
             elif self._focus == "week":
                 title = f"{self._offset} week(s) ago by day"
             elif self._focus == "month":
@@ -227,23 +242,34 @@ class AgenticMetricApp(App):
         has_driver = False
         if peak_rows:
             peak = peak_rows[0]
+            peak_unknown = _has_unknown_cost(peak)
             line.append(" driver ", style="white")
             line.append(_bucket_label(peak), style="bold bright_blue")
             line.append("  ", style="white")
             line.append(f"{peak['agent_type']} / {peak['model']}", style="bright_cyan")
             line.append("  ", style="white")
-            line.append(fmt_cost(peak["estimated_cost_usd"] or 0.0), style="bold bright_yellow")
+            line.append(
+                fmt_cost(peak.get("estimated_cost_usd"), unknown=peak_unknown),
+                style="bold bright_yellow",
+            )
             line.append("  ", style="white")
             line.append(_split_label(peak), style="white")
             has_driver = True
-        if project_rows and (project_rows[0].get("estimated_cost_usd") or 0) > 0:
+        if project_rows and (
+            (project_rows[0].get("estimated_cost_usd") or 0) > 0
+            or _has_unknown_cost(project_rows[0])
+        ):
             if peak_rows:
                 line.append("    ", style="white")
             project = project_rows[0]
+            project_unknown = _has_unknown_cost(project)
             line.append(" project ", style="white")
             line.append(_short_path(project["project_path"]), style="bright_blue")
             line.append("  ", style="white")
-            line.append(fmt_cost(project["estimated_cost_usd"] or 0.0), style="bright_yellow")
+            line.append(
+                fmt_cost(project.get("estimated_cost_usd"), unknown=project_unknown),
+                style="bright_yellow",
+            )
             has_driver = True
         if not has_driver:
             line.append(" no cost drivers in this period", style="white")
@@ -266,6 +292,7 @@ class AgenticMetricApp(App):
             _, frm, to = resolve_range(kind)
             totals = get_range_totals(self._db, frm, to)
             cost = totals.get("estimated_cost_usd") or 0.0
+            cost_unknown = _has_unknown_cost(totals)
             sess = totals.get("session_count") or 0
             tokens = _total_tokens(totals)
 
@@ -273,6 +300,7 @@ class AgenticMetricApp(App):
             _, p_frm, p_to = resolve_range(kind, offset=1)
             prev = get_range_totals(self._db, p_frm, p_to)
             prev_cost = prev.get("estimated_cost_usd") or 0.0
+            prev_cost_unknown = _has_unknown_cost(prev)
 
             # Sparkline of the last N buckets for this focus
             unit, count = spark_cfg[kind]
@@ -285,6 +313,8 @@ class AgenticMetricApp(App):
                 active=active_count if kind == "today" else 0,
                 prev_cost=prev_cost,
                 sparkline=sparkline,
+                cost_unknown=cost_unknown,
+                prev_cost_unknown=prev_cost_unknown,
             )
             cell.set_focused(kind == self._focus)
 
@@ -332,7 +362,7 @@ class AgenticMetricApp(App):
     def _populate_breakdown(self) -> None:
         label, frm, to = resolve_range(self._focus, offset=self._offset)
         rows = get_range_by_agent_model(self._db, frm, to)
-        rows = [r for r in rows if (r["estimated_cost_usd"] or 0) > 0]
+        rows = [r for r in rows if (r["estimated_cost_usd"] or 0) > 0 or _has_unknown_cost(r)]
 
         groups_by_agent: dict[str, dict] = {}
         for r in rows:
@@ -344,6 +374,7 @@ class AgenticMetricApp(App):
                 "input": 0,
                 "output": 0,
                 "cache": 0,
+                "unknown_cost_count": 0,
                 "models": [],
             })
             model_tokens = _total_tokens(r)
@@ -353,9 +384,11 @@ class AgenticMetricApp(App):
             g["input"] += r.get("input_tokens") or 0
             g["output"] += r.get("output_tokens") or 0
             g["cache"] += model_cache
+            g["unknown_cost_count"] += r.get("unknown_cost_count") or 0
             g["models"].append({
                 "model": r["model"],
                 "cost": r["estimated_cost_usd"] or 0.0,
+                "unknown_cost_count": r.get("unknown_cost_count") or 0,
                 "tokens": model_tokens,
                 "input": r.get("input_tokens") or 0,
                 "output": r.get("output_tokens") or 0,
@@ -364,7 +397,7 @@ class AgenticMetricApp(App):
 
         groups = sorted(groups_by_agent.values(), key=lambda g: -g["cost"])
         for g in groups:
-            g["models"].sort(key=lambda m: -m["cost"])
+            g["models"].sort(key=lambda m: (0 if _has_unknown_cost(m) else 1, -(m.get("cost") or 0)))
 
         total_cost = sum(g["cost"] for g in groups)
 
@@ -403,6 +436,8 @@ class AgenticMetricApp(App):
             active=self._count_active(),
             prev_cost=cell.prev_cost,
             sparkline=cell.sparkline,
+            cost_unknown=cell.cost_unknown,
+            prev_cost_unknown=cell.prev_cost_unknown,
         )
 
     # ── Periodic sync (5 min) ─────────────────────────────────────────
@@ -464,3 +499,7 @@ class AgenticMetricApp(App):
     def action_refresh_all(self) -> None:
         self.notify("Syncing…")
         self.run_worker(self._sync_worker, thread=True, exclusive=True, group="sync")
+
+
+def _has_unknown_cost(row: dict | None) -> bool:
+    return bool(row and (row.get("unknown_cost_count") or 0) > 0)

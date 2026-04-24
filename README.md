@@ -7,7 +7,7 @@
 
 A local-only monitoring tool for AI coding agents — like `top`, but for your coding agents. Track token usage and costs across **Claude Code** and **Codex** — with a TUI dashboard and CLI.
 
-**Supported platforms: Linux and macOS.**
+**Supported platforms: Linux, macOS, and Windows.**
 
 **All data stays on your machine. No network requests, no telemetry, no data leaves your computer.** The tool only reads local agent data files (`~/.claude/`, `~/.codex/`) and process info.
 
@@ -93,7 +93,8 @@ agentic-metric pricing reset deepseek-r2                                   # Res
 agentic-metric pricing reset --all                                         # Reset all overrides
 ```
 
-For unknown models, pricing falls back by model family (e.g. `claude-sonnet-*` uses Sonnet pricing, `gpt-5*` uses GPT-5 pricing) before using the global default.
+Unknown models are not priced by default. They are displayed as `Unknown` with
+cost `?` until you add explicit pricing with `agentic-metric pricing set`.
 
 ### TUI Keybindings
 
@@ -110,9 +111,9 @@ For unknown models, pricing falls back by model family (e.g. `claude-sonnet-*` u
 
 Paths differ by platform. `$DATA` refers to:
 
-| | Linux | macOS |
-|--|-------|-------|
-| `$DATA` | `~/.local/share` | `~/Library/Application Support` |
+| | Linux | macOS | Windows |
+|--|-------|-------|---------|
+| `$DATA` | `~/.local/share` | `~/Library/Application Support` | `%LOCALAPPDATA%` |
 
 | Agent | Path | Data |
 |-------|------|------|
@@ -141,7 +142,7 @@ All aggregated data is stored locally in `$DATA/agentic_metric/data.db` (SQLite)
 - **Fully offline** — no network requests, no data sent anywhere
 - **Read-only** — never modifies agent config or data files
 - All stats stored in a local SQLite database
-- Delete the data directory at any time to remove all data (`~/.local/share/agentic_metric/` on Linux, `~/Library/Application Support/agentic_metric/` on macOS)
+- Delete the data directory at any time to remove all data (`~/.local/share/agentic_metric/` on Linux, `~/Library/Application Support/agentic_metric/` on macOS, `%LOCALAPPDATA%\agentic_metric\` on Windows)
 
 ## Development
 

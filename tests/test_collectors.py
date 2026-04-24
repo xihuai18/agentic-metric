@@ -16,7 +16,9 @@ from agentic_metric.collectors.codex import (
     _LiveMonitor as CodexLiveMonitor,
     _SessionAccum as CodexSessionAccum,
 )
+from agentic_metric.collectors._process import find_pids, get_pid_cwd, normalize_cwd_key
 from agentic_metric.models import LiveSession
+from agentic_metric.pricing import estimate_cost
 from agentic_metric.store.database import Database
 
 
@@ -94,6 +96,121 @@ def test_codex_cached_only_update_recomputes_input_tokens():
     assert accum.input_tokens == 800
     assert sum(r["input_tokens"] for r in accum.usage_bucket_rows()) == 800
     assert sum(r["cache_read_tokens"] for r in accum.usage_bucket_rows()) == 200
+
+
+def test_codex_last_token_usage_drives_long_context_cost():
+    accum = CodexSessionAccum(Path("/tmp/fake.jsonl"), project_path="/test")
+    accum.model = "gpt-5.4"
+    accum._process_event_msg({
+        "type": "token_count",
+        "info": {
+            "total_token_usage": {
+                "input_tokens": 300_000,
+                "cached_input_tokens": 0,
+                "output_tokens": 1_000,
+            },
+            "last_token_usage": {
+                "input_tokens": 300_000,
+                "cached_input_tokens": 0,
+                "output_tokens": 1_000,
+            },
+        },
+    }, ts="2026-04-24T10:00:00Z")
+
+    expected = estimate_cost("gpt-5.4", input_tokens=300_000, output_tokens=1_000)
+    assert abs(sum(r["estimated_cost_usd"] for r in accum.usage_bucket_rows()) - expected) < 1e-12
+
+
+def test_codex_cumulative_fallback_does_not_apply_long_context_cost():
+    accum = CodexSessionAccum(Path("/tmp/fake.jsonl"), project_path="/test")
+    accum.model = "gpt-5.4"
+    accum._process_event_msg({
+        "type": "token_count",
+        "info": {
+            "total_token_usage": {
+                "input_tokens": 300_000,
+                "cached_input_tokens": 0,
+                "output_tokens": 1_000,
+            },
+        },
+    }, ts="2026-04-24T10:00:00Z")
+
+    expected = estimate_cost(
+        "gpt-5.4",
+        input_tokens=300_000,
+        output_tokens=1_000,
+        apply_long_context=False,
+    )
+    assert abs(sum(r["estimated_cost_usd"] for r in accum.usage_bucket_rows()) - expected) < 1e-12
+
+
+def test_codex_fast_mode_tier_drives_event_cost():
+    accum = CodexSessionAccum(Path("/tmp/fake.jsonl"), project_path="/test")
+    accum._process_entry({
+        "timestamp": "2026-04-24T09:59:59Z",
+        "type": "turn_context",
+        "payload": {"model": "gpt-5.5", "service_tier": "fast"},
+    })
+    accum._process_event_msg({
+        "type": "token_count",
+        "info": {
+            "total_token_usage": {
+                "input_tokens": 1_000_000,
+                "cached_input_tokens": 0,
+                "output_tokens": 1_000_000,
+            },
+            "last_token_usage": {
+                "input_tokens": 1_000_000,
+                "cached_input_tokens": 0,
+                "output_tokens": 1_000_000,
+            },
+        },
+    }, ts="2026-04-24T10:00:00Z")
+
+    rows = accum.usage_bucket_rows()
+    expected = estimate_cost(
+        "gpt-5.5",
+        input_tokens=1_000_000,
+        output_tokens=1_000_000,
+        service_tier="fast",
+    )
+    assert rows[0]["service_tier"] == "fast"
+    assert abs(sum(r["estimated_cost_usd"] for r in rows) - expected) < 1e-12
+
+
+def test_codex_unknown_model_event_cost_stays_unknown(tmp_path):
+    import agentic_metric.pricing as pricing
+
+    pricing._user_cache = None
+    pricing._user_cache_mtime = -1.0
+    with patch("agentic_metric.pricing.PRICING_FILE", tmp_path / "pricing.json"):
+        accum = CodexSessionAccum(Path("/tmp/fake.jsonl"), project_path="/test")
+        accum._process_entry({
+            "timestamp": "2026-04-24T09:59:59Z",
+            "type": "turn_context",
+            "payload": {"model": "gpt-5.4-pro"},
+        })
+        accum._process_event_msg({
+            "type": "token_count",
+            "info": {
+                "total_token_usage": {
+                    "input_tokens": 1_000,
+                    "cached_input_tokens": 0,
+                    "output_tokens": 100,
+                },
+                "last_token_usage": {
+                    "input_tokens": 1_000,
+                    "cached_input_tokens": 0,
+                    "output_tokens": 100,
+                },
+            },
+        }, ts="2026-04-24T10:00:00Z")
+    pricing._user_cache = None
+    pricing._user_cache_mtime = -1.0
+
+    rows = accum.usage_bucket_rows()
+    assert rows[0]["model"] == "gpt-5.4-pro"
+    assert rows[0]["estimated_cost_usd"] is None
 
 
 def test_codex_partial_trailing_jsonl_is_retried(tmp_path):
@@ -246,6 +363,89 @@ def test_claude_duplicate_assistant_message_id_uses_last_usage(tmp_path):
     assert sum(r["output_tokens"] for r in accum.usage_bucket_rows()) == 20
     assert sum(r["cache_read_tokens"] for r in accum.usage_bucket_rows()) == 100
     assert sum(r["cache_creation_tokens"] for r in accum.usage_bucket_rows()) == 5
+    expected_cost = estimate_cost(
+        "claude-sonnet-4-6",
+        input_tokens=10,
+        output_tokens=20,
+        cache_read_tokens=100,
+        cache_creation_tokens=5,
+    )
+    assert abs(sum(r["estimated_cost_usd"] for r in accum.usage_bucket_rows()) - expected_cost) < 1e-12
+
+
+def test_claude_real_model_replaces_initial_synthetic(tmp_path):
+    session_file = tmp_path / "session.jsonl"
+    lines = [
+        {
+            "timestamp": "2026-04-23T10:00:00Z",
+            "type": "user",
+            "message": {"content": "hello"},
+        },
+        {
+            "timestamp": "2026-04-23T10:00:01Z",
+            "type": "assistant",
+            "message": {
+                "id": "synthetic",
+                "model": "<synthetic>",
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            },
+        },
+        {
+            "timestamp": "2026-04-23T10:00:02Z",
+            "type": "assistant",
+            "message": {
+                "id": "real",
+                "model": "claude-opus-4-7",
+                "usage": {"input_tokens": 10, "output_tokens": 20},
+            },
+        },
+    ]
+    session_file.write_text("".join(json.dumps(line) + "\n" for line in lines))
+
+    accum = ClaudeSessionAccum(session_file, project_path="/tmp/project")
+    accum.read_new_lines()
+
+    assert accum.model == "claude-opus-4-7"
+    assert any(r["model"] == "claude-opus-4-7" for r in accum.usage_bucket_rows())
+
+
+def test_claude_fast_mode_tier_drives_usage_cost(tmp_path):
+    session_file = tmp_path / "session.jsonl"
+    lines = [
+        {
+            "timestamp": "2026-04-23T10:00:00Z",
+            "type": "user",
+            "message": {"content": "hello"},
+        },
+        {
+            "timestamp": "2026-04-23T10:00:01Z",
+            "type": "assistant",
+            "message": {
+                "id": "fast",
+                "model": "claude-opus-4-6",
+                "usage": {
+                    "input_tokens": 1_000_000,
+                    "output_tokens": 1_000_000,
+                    "service_tier": "fast",
+                },
+            },
+        },
+    ]
+    session_file.write_text("".join(json.dumps(line) + "\n" for line in lines))
+
+    accum = ClaudeSessionAccum(session_file, project_path="/tmp/project")
+    accum.read_new_lines()
+
+    rows = accum.usage_bucket_rows()
+    expected = estimate_cost(
+        "claude-opus-4-6",
+        input_tokens=1_000_000,
+        output_tokens=1_000_000,
+        service_tier="fast",
+    )
+    assert accum.to_live_session().service_tier == "fast"
+    assert any(r["service_tier"] == "fast" for r in rows)
+    assert abs(sum(r["estimated_cost_usd"] for r in rows) - expected) < 1e-12
 
 
 def test_claude_today_counters_reset_after_midnight(tmp_path):
@@ -528,6 +728,90 @@ def test_codex_live_monitor_finds_older_active_session(tmp_path):
 
     assert len(sessions) == 1
     assert sessions[0].session_id == "old-sid"
+
+
+def test_windows_cwd_normalization_matches_codex_live_session(tmp_path):
+    class FakeDate(date):
+        @classmethod
+        def today(cls):
+            return cls(2026, 4, 24)
+
+    with patch("agentic_metric.collectors._process.platform.system", return_value="Windows"):
+        assert normalize_cwd_key(r"C:\Users\Leo\Repo") == normalize_cwd_key("c:/users/leo/repo")
+
+    sessions_root = tmp_path / "sessions"
+    old_dir = sessions_root / "2026" / "04" / "24"
+    old_dir.mkdir(parents=True)
+    rollout = old_dir / "rollout-win.jsonl"
+    lines = [
+        {
+            "timestamp": "2026-04-24T10:00:00Z",
+            "type": "session_meta",
+            "payload": {"id": "win-sid", "cwd": r"C:\Users\Leo\Repo"},
+        },
+        {
+            "timestamp": "2026-04-24T10:00:01Z",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "still running"},
+        },
+    ]
+    rollout.write_text("".join(json.dumps(line) + "\n" for line in lines))
+
+    monitor = CodexLiveMonitor()
+    with (
+        patch("agentic_metric.collectors.codex.CODEX_SESSIONS_DIR", sessions_root),
+        patch("agentic_metric.collectors.codex.get_running_cwds", return_value={123: "c:/users/leo/repo"}),
+        patch("agentic_metric.collectors.codex.date", FakeDate),
+        patch("agentic_metric.collectors._process.platform.system", return_value="Windows"),
+    ):
+        sessions = monitor.refresh()
+
+    assert len(sessions) == 1
+    assert sessions[0].session_id == "win-sid"
+
+
+def test_get_pid_cwd_falls_back_when_psutil_cwd_fails():
+    import agentic_metric.collectors._process as proc
+
+    class FakeAccessDenied(Exception):
+        pass
+
+    class FakePsutil:
+        NoSuchProcess = RuntimeError
+        AccessDenied = FakeAccessDenied
+        ZombieProcess = RuntimeError
+
+        class Process:
+            def __init__(self, pid):
+                self.pid = pid
+
+            def cwd(self):
+                raise FakeAccessDenied()
+
+    with (
+        patch.object(proc, "psutil", FakePsutil),
+        patch("agentic_metric.collectors._process.platform.system", return_value="Linux"),
+        patch("agentic_metric.collectors._process.Path.resolve", return_value=Path("/tmp/fallback")),
+    ):
+        assert get_pid_cwd(123) == "/tmp/fallback"
+
+
+def test_find_pids_uses_windows_tasklist_fallback():
+    import subprocess
+    import agentic_metric.collectors._process as proc
+
+    result = subprocess.CompletedProcess(
+        ["tasklist"],
+        0,
+        stdout='"codex.exe","123","Console","1","10,000 K"\n"other.exe","999","Console","1","1,000 K"\n',
+        stderr="",
+    )
+    with (
+        patch.object(proc, "psutil", None),
+        patch("agentic_metric.collectors._process.platform.system", return_value="Windows"),
+        patch("agentic_metric.collectors._process.subprocess.run", return_value=result),
+    ):
+        assert find_pids("codex", exact=True) == [123]
 
 
 def test_codex_history_sync_detects_same_size_file_edits(tmp_path):

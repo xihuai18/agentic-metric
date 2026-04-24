@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 from ..models import DailyTrend, LiveSession, TodayOverview
-from ..pricing import estimate_cost
+from ..pricing import estimate_cost, is_model_priced
 from .database import Database
 
 
@@ -16,6 +16,7 @@ _USAGE_SOURCE = """(
            usage_hour,
            project_path,
            model,
+           service_tier,
            message_count,
            user_turns,
            input_tokens,
@@ -31,6 +32,7 @@ _USAGE_SOURCE = """(
            CAST(strftime('%H', s.started_at, 'localtime') AS INTEGER) AS usage_hour,
            s.project_path,
            s.model,
+           '' AS service_tier,
            s.message_count,
            s.user_turns,
            s.input_tokens,
@@ -57,6 +59,45 @@ def _session_count_expr(column: str = "session_id") -> str:
     return f"COUNT(DISTINCT agent_type || ':' || {column})"
 
 
+def _preferred_session_model_expr(session_alias: str = "s", usage_alias: str = "u") -> str:
+    return f"""COALESCE(
+        NULLIF(
+            CASE
+                WHEN {session_alias}.model = '<synthetic>' THEN ''
+                ELSE COALESCE({session_alias}.model, '')
+            END,
+            ''
+        ),
+        MAX(CASE
+            WHEN {usage_alias}.model NOT IN ('', '<synthetic>') THEN {usage_alias}.model
+        END),
+        ''
+    )"""
+
+
+def _model_tier_label_expr(model_expr: str = "model", tier_expr: str = "service_tier") -> str:
+    return f"""CASE
+        WHEN {model_expr} = '' THEN '(unknown)'
+        WHEN COALESCE({tier_expr}, '') = '' THEN {model_expr}
+        ELSE {model_expr} || ' [' || {tier_expr} || ']'
+    END"""
+
+
+def _model_label(model: str, service_tier: str = "") -> str:
+    """Return a display label, hiding unpriced model ids as Unknown."""
+    model = model or ""
+    service_tier = service_tier or ""
+    if not model:
+        return "(unknown)"
+    if not is_model_priced(model):
+        return "Unknown"
+    return model if not service_tier else f"{model} [{service_tier}]"
+
+
+def _unknown_cost_expr(column: str = "estimated_cost_usd") -> str:
+    return f"SUM(CASE WHEN {column} IS NULL THEN 1 ELSE 0 END)"
+
+
 def get_today_overview(db: Database) -> TodayOverview:
     """Get aggregated stats for today across all agents (local timezone)."""
     today = datetime.now().strftime("%Y-%m-%d")
@@ -70,7 +111,8 @@ def get_today_overview(db: Database) -> TodayOverview:
                    SUM(output_tokens) AS output_tokens,
                    SUM(cache_read_tokens) AS cache_read_tokens,
                    SUM(cache_creation_tokens) AS cache_creation_tokens,
-                   SUM(estimated_cost_usd) AS estimated_cost_usd
+                   COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd,
+                   {_unknown_cost_expr()} AS unknown_cost_count
            FROM {usage}
            WHERE usage_date = ?
            GROUP BY agent_type
@@ -90,6 +132,7 @@ def get_today_overview(db: Database) -> TodayOverview:
         overview.cache_read_tokens += r["cache_read_tokens"] or 0
         overview.cache_creation_tokens += r["cache_creation_tokens"] or 0
         overview.estimated_cost_usd += r["estimated_cost_usd"] or 0
+        overview.unknown_cost_count += r["unknown_cost_count"] or 0
         overview.by_agent[at] = {
             "session_count": r["session_count"] or 0,
             "turns": r["user_turns"] or 0,
@@ -97,6 +140,7 @@ def get_today_overview(db: Database) -> TodayOverview:
             "input_tokens": r["input_tokens"] or 0,
             "output_tokens": r["output_tokens"] or 0,
             "cost": r["estimated_cost_usd"] or 0,
+            "unknown_cost_count": r["unknown_cost_count"] or 0,
         }
     return overview
 
@@ -125,7 +169,17 @@ def merge_live_into_overview(
         t_out = ls.today_output_tokens if ls.today_output_tokens >= 0 else ls.output_tokens
         t_cr = ls.today_cache_read_tokens if ls.today_cache_read_tokens >= 0 else ls.cache_read_tokens
         t_cw = ls.today_cache_creation_tokens if ls.today_cache_creation_tokens >= 0 else ls.cache_creation_tokens
-        t_cost = estimate_cost(ls.model, t_in, t_out, t_cr, t_cw)
+        t_cost = estimate_cost(
+            ls.model,
+            t_in,
+            t_out,
+            t_cr,
+            t_cw,
+            service_tier=ls.service_tier,
+            apply_long_context=False,
+        )
+        t_unknown = 1 if t_cost is None else 0
+        t_cost_value = 0.0 if t_cost is None else t_cost
 
         if session_key in db_ids:
             db_s = db_by_id[session_key]
@@ -136,7 +190,8 @@ def merge_live_into_overview(
                 d_out = max(0, t_out - (db_s["output_tokens"] or 0))
                 d_cr = max(0, t_cr - (db_s["cache_read_tokens"] or 0))
                 d_cw = max(0, t_cw - (db_s["cache_creation_tokens"] or 0))
-                d_cost = max(0, t_cost - (db_s["estimated_cost_usd"] or 0))
+                d_cost = 0.0 if t_cost is None else max(0, t_cost - (db_s["estimated_cost_usd"] or 0))
+                d_unknown = max(0, t_unknown - (db_s.get("unknown_cost_count") or 0))
 
                 overview.message_count += d_msg
                 overview.tool_call_count += d_turns
@@ -145,6 +200,7 @@ def merge_live_into_overview(
                 overview.cache_read_tokens += d_cr
                 overview.cache_creation_tokens += d_cw
                 overview.estimated_cost_usd += d_cost
+                overview.unknown_cost_count += d_unknown
 
                 if at in overview.by_agent:
                     ba = overview.by_agent[at]
@@ -153,6 +209,7 @@ def merge_live_into_overview(
                     ba["input_tokens"] = ba.get("input_tokens", 0) + d_in
                     ba["output_tokens"] = ba.get("output_tokens", 0) + d_out
                     ba["cost"] = ba.get("cost", 0) + d_cost
+                    ba["unknown_cost_count"] = ba.get("unknown_cost_count", 0) + d_unknown
         else:
             if ls.user_turns == 0 and ls.output_tokens == 0:
                 continue
@@ -163,7 +220,8 @@ def merge_live_into_overview(
             overview.output_tokens += t_out
             overview.cache_read_tokens += t_cr
             overview.cache_creation_tokens += t_cw
-            overview.estimated_cost_usd += t_cost
+            overview.estimated_cost_usd += t_cost_value
+            overview.unknown_cost_count += t_unknown
 
             ba = overview.by_agent.get(at)
             if ba:
@@ -172,7 +230,8 @@ def merge_live_into_overview(
                 ba["message_count"] = ba.get("message_count", 0) + t_msgs
                 ba["input_tokens"] = ba.get("input_tokens", 0) + t_in
                 ba["output_tokens"] = ba.get("output_tokens", 0) + t_out
-                ba["cost"] = ba.get("cost", 0) + t_cost
+                ba["cost"] = ba.get("cost", 0) + t_cost_value
+                ba["unknown_cost_count"] = ba.get("unknown_cost_count", 0) + t_unknown
             else:
                 overview.by_agent[at] = {
                     "session_count": 1,
@@ -180,7 +239,8 @@ def merge_live_into_overview(
                     "message_count": t_msgs,
                     "input_tokens": t_in,
                     "output_tokens": t_out,
-                    "cost": t_cost,
+                    "cost": t_cost_value,
+                    "unknown_cost_count": t_unknown,
                 }
 
 
@@ -216,7 +276,17 @@ def merge_live_into_trends(
         t_out = ls.today_output_tokens if ls.today_output_tokens >= 0 else ls.output_tokens
         t_cr = ls.today_cache_read_tokens if ls.today_cache_read_tokens >= 0 else ls.cache_read_tokens
         t_cw = ls.today_cache_creation_tokens if ls.today_cache_creation_tokens >= 0 else ls.cache_creation_tokens
-        t_cost = estimate_cost(ls.model, t_in, t_out, t_cr, t_cw)
+        t_cost = estimate_cost(
+            ls.model,
+            t_in,
+            t_out,
+            t_cr,
+            t_cw,
+            service_tier=ls.service_tier,
+            apply_long_context=False,
+        )
+        t_unknown = 1 if t_cost is None else 0
+        t_cost_value = 0.0 if t_cost is None else t_cost
         if session_key in db_ids:
             db_s = db_by_id[session_key]
             if ls.output_tokens > 0:
@@ -226,8 +296,9 @@ def merge_live_into_trends(
                 today_trend.output_tokens += max(0, t_out - (db_s["output_tokens"] or 0))
                 today_trend.cache_read_tokens += max(0, t_cr - (db_s["cache_read_tokens"] or 0))
                 today_trend.cache_creation_tokens += max(0, t_cw - (db_s["cache_creation_tokens"] or 0))
-                d_cost = max(0, t_cost - (db_s["estimated_cost_usd"] or 0))
+                d_cost = 0.0 if t_cost is None else max(0, t_cost - (db_s["estimated_cost_usd"] or 0))
                 today_trend.estimated_cost_usd += d_cost
+                today_trend.unknown_cost_count += max(0, t_unknown - (db_s.get("unknown_cost_count") or 0))
         else:
             if ls.user_turns == 0 and ls.output_tokens == 0:
                 continue
@@ -239,7 +310,8 @@ def merge_live_into_trends(
             today_trend.output_tokens += t_out
             today_trend.cache_read_tokens += t_cr
             today_trend.cache_creation_tokens += t_cw
-            today_trend.estimated_cost_usd += t_cost
+            today_trend.estimated_cost_usd += t_cost_value
+            today_trend.unknown_cost_count += t_unknown
 
 
 def get_daily_trends(db: Database, days: int = 30) -> list[DailyTrend]:
@@ -255,7 +327,8 @@ def get_daily_trends(db: Database, days: int = 30) -> list[DailyTrend]:
                   SUM(output_tokens) AS output_tokens,
                   SUM(cache_read_tokens) AS cache_read_tokens,
                   SUM(cache_creation_tokens) AS cache_creation_tokens,
-                  SUM(estimated_cost_usd) AS estimated_cost_usd
+                  COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd,
+                  {_unknown_cost_expr()} AS unknown_cost_count
            FROM {usage}
            WHERE usage_date >= ?
            GROUP BY usage_date
@@ -275,6 +348,7 @@ def get_daily_trends(db: Database, days: int = 30) -> list[DailyTrend]:
             cache_read_tokens=r["cache_read_tokens"] or 0,
             cache_creation_tokens=r["cache_creation_tokens"] or 0,
             estimated_cost_usd=r["estimated_cost_usd"] or 0,
+            unknown_cost_count=r["unknown_cost_count"] or 0,
         )
         for r in rows
     ]
@@ -285,20 +359,27 @@ def get_model_breakdown(db: Database, days: int = 30) -> list[dict]:
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
     usage = _usage_source(db)
     rows = db.conn.execute(
-        f"""SELECT model,
+        f"""SELECT model AS raw_model,
+                  service_tier,
                   SUM(input_tokens) AS input_tokens,
                   SUM(output_tokens) AS output_tokens,
                   SUM(cache_read_tokens) AS cache_read_tokens,
                   SUM(cache_creation_tokens) AS cache_creation_tokens,
-                  SUM(estimated_cost_usd) AS estimated_cost_usd
+                  COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd,
+                  {_unknown_cost_expr()} AS unknown_cost_count
            FROM {usage}
            WHERE usage_date >= ? AND model != ''
-           GROUP BY model
-           ORDER BY estimated_cost_usd DESC
+           GROUP BY model, service_tier
+           ORDER BY unknown_cost_count DESC, estimated_cost_usd DESC
         """,
         (cutoff,),
     ).fetchall()
-    return [dict(r) for r in rows]
+    out = []
+    for r in rows:
+        row = dict(r)
+        row["model"] = _model_label(row.pop("raw_model") or "", row.get("service_tier") or "")
+        out.append(row)
+    return out
 
 
 def get_today_sessions(db: Database) -> list[dict]:
@@ -310,14 +391,15 @@ def get_today_sessions(db: Database) -> list[dict]:
                    u.agent_type,
                    COALESCE(NULLIF(s.project_path, ''), MAX(NULLIF(u.project_path, '')), '') AS project_path,
                    COALESCE(s.git_branch, '') AS git_branch,
-                   COALESCE(NULLIF(s.model, ''), MAX(NULLIF(u.model, '')), '') AS model,
+                   {_preferred_session_model_expr()} AS model,
                    SUM(u.message_count) AS message_count,
                    SUM(u.user_turns) AS user_turns,
                    SUM(u.input_tokens) AS input_tokens,
                    SUM(u.output_tokens) AS output_tokens,
                    SUM(u.cache_read_tokens) AS cache_read_tokens,
                    SUM(u.cache_creation_tokens) AS cache_creation_tokens,
-                   SUM(u.estimated_cost_usd) AS estimated_cost_usd,
+                   COALESCE(SUM(u.estimated_cost_usd), 0) AS estimated_cost_usd,
+                   {_unknown_cost_expr("u.estimated_cost_usd")} AS unknown_cost_count,
                    COALESCE(s.started_at, '') AS started_at,
                    COALESCE(s.ended_at, '') AS ended_at,
                    COALESCE(s.first_prompt, '') AS first_prompt,
@@ -331,7 +413,12 @@ def get_today_sessions(db: Database) -> list[dict]:
         """,
         (today,),
     ).fetchall()
-    return [dict(r) for r in rows]
+    out = []
+    for r in rows:
+        row = dict(r)
+        row["model"] = _model_label(row.get("model") or "")
+        out.append(row)
+    return out
 
 
 def get_top_projects(db: Database, limit: int = 10) -> list[dict]:
@@ -372,7 +459,7 @@ def resolve_range(kind: str, offset: int = 0) -> tuple[str, str, str]:
         elif offset == 1:
             label = "Yesterday"
         else:
-            label = d.strftime("%b %-d")
+            label = f"{d.strftime('%b')} {d.day}"
         return (label, s, s)
 
     if kind == "week":
@@ -423,7 +510,8 @@ def get_range_totals(db: Database, from_date: str, to_date: str) -> dict:
                   COALESCE(SUM(output_tokens), 0) AS output_tokens,
                   COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
                   COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
-                  COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd
+                  COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd,
+                  {_unknown_cost_expr()} AS unknown_cost_count
            FROM {usage}
            WHERE usage_date BETWEEN ? AND ?
         """,
@@ -443,11 +531,12 @@ def get_range_by_agent(db: Database, from_date: str, to_date: str) -> list[dict]
                   COALESCE(SUM(output_tokens), 0) AS output_tokens,
                   COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
                   COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
-                  COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd
+                  COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd,
+                  {_unknown_cost_expr()} AS unknown_cost_count
            FROM {usage}
            WHERE usage_date BETWEEN ? AND ?
            GROUP BY agent_type
-           ORDER BY estimated_cost_usd DESC
+           ORDER BY unknown_cost_count DESC, estimated_cost_usd DESC
         """,
         (from_date, to_date),
     ).fetchall()
@@ -462,21 +551,28 @@ def get_range_by_agent_model(db: Database, from_date: str, to_date: str) -> list
     usage = _usage_source(db)
     rows = db.conn.execute(
         f"""SELECT agent_type,
-                  CASE WHEN model = '' THEN '(unknown)' ELSE model END AS model,
+                  model AS raw_model,
+                  service_tier,
                   COUNT(DISTINCT session_id) AS session_count,
                   COALESCE(SUM(input_tokens), 0) AS input_tokens,
                   COALESCE(SUM(output_tokens), 0) AS output_tokens,
                   COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
                   COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
-                  COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd
+                  COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd,
+                  {_unknown_cost_expr()} AS unknown_cost_count
            FROM {usage}
            WHERE usage_date BETWEEN ? AND ?
-           GROUP BY agent_type, model
-           ORDER BY agent_type, estimated_cost_usd DESC
+           GROUP BY agent_type, model, service_tier
+           ORDER BY agent_type, unknown_cost_count DESC, estimated_cost_usd DESC
         """,
         (from_date, to_date),
     ).fetchall()
-    return [dict(r) for r in rows]
+    out = []
+    for r in rows:
+        row = dict(r)
+        row["model"] = _model_label(row.pop("raw_model") or "", row.get("service_tier") or "")
+        out.append(row)
+    return out
 
 
 def get_range_by_project(db: Database, from_date: str, to_date: str, limit: int = 10) -> list[dict]:
@@ -491,11 +587,12 @@ def get_range_by_project(db: Database, from_date: str, to_date: str, limit: int 
                   COALESCE(SUM(output_tokens), 0) AS output_tokens,
                   COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
                   COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
-                  COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd
+                  COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd,
+                  {_unknown_cost_expr()} AS unknown_cost_count
            FROM {usage}
            WHERE usage_date BETWEEN ? AND ?
            GROUP BY project_path
-           ORDER BY estimated_cost_usd DESC
+           ORDER BY unknown_cost_count DESC, estimated_cost_usd DESC
            LIMIT ?
         """,
         (from_date, to_date, limit),
@@ -510,24 +607,31 @@ def get_range_by_time_model(db: Database, from_date: str, to_date: str, limit: i
         f"""SELECT usage_date,
                   usage_hour,
                   agent_type,
-                  CASE WHEN model = '' THEN '(unknown)' ELSE model END AS model,
+                  model AS raw_model,
+                  service_tier,
                   {_session_count_expr()} AS session_count,
                   COALESCE(SUM(user_turns), 0) AS user_turns,
                   COALESCE(SUM(input_tokens), 0) AS input_tokens,
                   COALESCE(SUM(output_tokens), 0) AS output_tokens,
                   COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
                   COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
-                  COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd
+                  COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd,
+                  {_unknown_cost_expr()} AS unknown_cost_count
            FROM {usage}
            WHERE usage_date BETWEEN ? AND ?
-           GROUP BY usage_date, usage_hour, agent_type, model
-           HAVING COALESCE(SUM(estimated_cost_usd), 0) > 0
-           ORDER BY estimated_cost_usd DESC
+           GROUP BY usage_date, usage_hour, agent_type, model, service_tier
+           HAVING COALESCE(SUM(estimated_cost_usd), 0) > 0 OR {_unknown_cost_expr()} > 0
+           ORDER BY unknown_cost_count DESC, estimated_cost_usd DESC
            LIMIT ?
         """,
         (from_date, to_date, limit),
     ).fetchall()
-    return [dict(r) for r in rows]
+    out = []
+    for r in rows:
+        row = dict(r)
+        row["model"] = _model_label(row.pop("raw_model") or "", row.get("service_tier") or "")
+        out.append(row)
+    return out
 
 
 def get_range_top_sessions(db: Database, from_date: str, to_date: str, limit: int = 10) -> list[dict]:
@@ -540,13 +644,16 @@ def get_range_top_sessions(db: Database, from_date: str, to_date: str, limit: in
                   COALESCE(NULLIF(s.first_prompt, ''), '') AS first_prompt,
                   COALESCE(NULLIF(s.started_at, ''), '') AS started_at,
                   COALESCE(NULLIF(s.ended_at, ''), '') AS ended_at,
-                  COALESCE(NULLIF(s.model, ''), '') AS model,
+                  {_preferred_session_model_expr()} AS model,
                   COALESCE(
                       GROUP_CONCAT(
                           DISTINCT CASE
                               WHEN COALESCE(u.estimated_cost_usd, 0) > 0
                                AND u.model NOT IN ('', '<synthetic>')
-                              THEN u.model
+                              THEN CASE
+                                  WHEN COALESCE(u.service_tier, '') = '' THEN u.model
+                                  ELSE u.model || ' [' || u.service_tier || ']'
+                              END
                           END
                       ),
                       ''
@@ -557,19 +664,30 @@ def get_range_top_sessions(db: Database, from_date: str, to_date: str, limit: in
                   COALESCE(SUM(u.output_tokens), 0) AS output_tokens,
                   COALESCE(SUM(u.cache_read_tokens), 0) AS cache_read_tokens,
                   COALESCE(SUM(u.cache_creation_tokens), 0) AS cache_creation_tokens,
-                  COALESCE(SUM(u.estimated_cost_usd), 0) AS estimated_cost_usd
+                  COALESCE(SUM(u.estimated_cost_usd), 0) AS estimated_cost_usd,
+                  {_unknown_cost_expr("u.estimated_cost_usd")} AS unknown_cost_count
            FROM {usage} AS u
            LEFT JOIN sessions AS s
              ON s.session_id = u.session_id AND s.agent_type = u.agent_type
            WHERE u.usage_date BETWEEN ? AND ?
            GROUP BY u.session_id, u.agent_type
-           HAVING COALESCE(SUM(u.estimated_cost_usd), 0) > 0
-           ORDER BY estimated_cost_usd DESC
+           HAVING COALESCE(SUM(u.estimated_cost_usd), 0) > 0 OR {_unknown_cost_expr("u.estimated_cost_usd")} > 0
+           ORDER BY unknown_cost_count DESC, estimated_cost_usd DESC
            LIMIT ?
         """,
         (from_date, to_date, limit),
     ).fetchall()
-    return [dict(r) for r in rows]
+    out = []
+    for r in rows:
+        row = dict(r)
+        row["model"] = _model_label(row.get("model") or "")
+        if row.get("unknown_cost_count"):
+            models = [m.strip() for m in (row.get("models") or "").split(",") if m.strip()]
+            if "Unknown" not in models:
+                models.append("Unknown")
+            row["models"] = ",".join(models)
+        out.append(row)
+    return out
 
 
 def get_range_daily(db: Database, from_date: str, to_date: str) -> list[dict]:
@@ -582,7 +700,8 @@ def get_range_daily(db: Database, from_date: str, to_date: str) -> list[dict]:
                   COALESCE(SUM(output_tokens), 0) AS output_tokens,
                   COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
                   COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
-                  COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd
+                  COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd,
+                  {_unknown_cost_expr()} AS unknown_cost_count
            FROM {usage}
            WHERE usage_date BETWEEN ? AND ?
            GROUP BY usage_date
@@ -632,6 +751,7 @@ def get_heatmap(
                       COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
                       COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
                       COALESCE(SUM(estimated_cost_usd), 0) AS cost,
+                      {_unknown_cost_expr()} AS unknown_cost_count,
                       {_session_count_expr()} AS session_count
                FROM {usage}
                WHERE usage_date = ?
@@ -646,6 +766,7 @@ def get_heatmap(
             out.append({
                 "label": key,
                 "cost": (r["cost"] if r else 0.0),
+                "unknown_cost_count": (r["unknown_cost_count"] if r else 0),
                 "tokens": _sum_tokens_row(r) if r else 0,
                 "session_count": (r["session_count"] if r else 0),
             })
@@ -665,6 +786,7 @@ def get_heatmap(
                       COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
                       COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
                       COALESCE(SUM(estimated_cost_usd), 0) AS cost,
+                      {_unknown_cost_expr()} AS unknown_cost_count,
                       {_session_count_expr()} AS session_count
                FROM {usage}
                WHERE usage_date BETWEEN ? AND ?
@@ -679,6 +801,7 @@ def get_heatmap(
             out.append({
                 "label": label,
                 "cost": (r["cost"] if r else 0.0),
+                "unknown_cost_count": (r["unknown_cost_count"] if r else 0),
                 "tokens": _sum_tokens_row(r) if r else 0,
                 "session_count": (r["session_count"] if r else 0),
             })
@@ -717,6 +840,7 @@ def get_heatmap(
                           COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
                           COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
                           COALESCE(SUM(estimated_cost_usd), 0) AS cost,
+                          {_unknown_cost_expr()} AS unknown_cost_count,
                           {_session_count_expr()} AS session_count
                    FROM {usage}
                    WHERE usage_date BETWEEN ? AND ?""",
@@ -726,6 +850,7 @@ def get_heatmap(
                 "label": f"W{wn}",
                 "sublabel": f"{wf.strftime('%m-%d')} – {wt.strftime('%m-%d')}",
                 "cost": row["cost"] if row else 0.0,
+                "unknown_cost_count": row["unknown_cost_count"] if row else 0,
                 "tokens": _sum_tokens_row(row) if row else 0,
                 "session_count": row["session_count"] if row else 0,
             })

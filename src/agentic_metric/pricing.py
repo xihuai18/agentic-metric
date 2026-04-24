@@ -10,14 +10,18 @@ from .config import PRICING_FILE
 log = logging.getLogger(__name__)
 
 # (input, output, cache_read, cache_write) — USD per million tokens.
-# Only OpenAI / Anthropic / Google Gemini. Prices verified against the
-# official pricing pages on 2026-04-23:
+# Core OpenAI / Anthropic / Google Gemini prices were verified against
+# official pricing docs on 2026-04-25:
 #   https://openai.com/api/pricing/
+#   https://developers.openai.com/api/docs/models/gpt-5.4/
 #   https://platform.claude.com/docs/en/docs/about-claude/pricing
 #   https://ai.google.dev/gemini-api/docs/pricing
-# Cache-write uses the 5-minute rate for Anthropic (matches Claude Code's
-# default cache TTL). Gemini's tiered pricing (≤200k vs >200k) is
-# represented with the ≤200k rate — good enough for a personal tracker.
+# Cache-write uses the 5-minute rate for Anthropic unless a collector can
+# observe a different cache duration. OpenAI Codex Fast mode is applied when a
+# collector can observe ``service_tier=fast``. Other processing tiers such as
+# Priority/Flex are standard-priced unless the collector can observe the tier.
+# Request-size tiers are applied in ``estimate_cost`` when per-request usage is
+# available.
 _BUILTIN_PRICING: dict[str, tuple[float, float, float, float]] = {
     # ── Anthropic Claude ──
     "claude-opus-4-7":       (5.0,  25.0, 0.50,  6.25),
@@ -38,11 +42,19 @@ _BUILTIN_PRICING: dict[str, tuple[float, float, float, float]] = {
     "claude-3-haiku":        (0.25, 1.25, 0.03,  0.30),
     # ── OpenAI ──
     "gpt-5.5":               (5.0,  30.0,  0.50,  0.0),
-    "gpt-5.4-pro":           (30.0, 180.0, 0.0,  0.0),
     "gpt-5.4-mini":          (0.75,   4.5, 0.075, 0.0),
     "gpt-5.4-nano":          (0.20,  1.25, 0.02,  0.0),
     "gpt-5.4":               (2.5,  15.0,  0.25,  0.0),
-    "gpt-5.1-codex":         (1.75, 14.0,  0.175, 0.0),
+    "gpt-5.2-codex":         (1.75, 14.0,  0.175, 0.0),
+    "gpt-5.2-chat-latest":   (1.75, 14.0,  0.175, 0.0),
+    "gpt-5.2":               (1.75, 14.0,  0.175, 0.0),
+    "gpt-5.1-codex-max":     (1.25, 10.0,  0.125, 0.0),
+    "gpt-5.1-codex":         (1.25, 10.0,  0.125, 0.0),
+    "gpt-5.1-chat-latest":   (1.25, 10.0,  0.125, 0.0),
+    "gpt-5.1":               (1.25, 10.0,  0.125, 0.0),
+    "gpt-5-codex":           (1.25, 10.0,  0.125, 0.0),
+    "gpt-5-chat-latest":     (1.25, 10.0,  0.125, 0.0),
+    "gpt-5":                 (1.25, 10.0,  0.125, 0.0),
     "gpt-5.3-codex":         (1.75, 14.0,  0.175, 0.0),
     "gpt-5.3-chat-latest":   (1.75, 14.0,  0.175, 0.0),
     "gpt-5.3":               (1.75, 14.0,  0.175, 0.0),
@@ -62,37 +74,87 @@ _BUILTIN_PRICING: dict[str, tuple[float, float, float, float]] = {
     "glm-5.1":               (0.95,  3.15, 0.10, 0.0),
 }
 
-# Family-based fallback: prefix → pricing tuple.
-# Used when an exact/prefix match fails, so new model revisions get a
-# reasonable estimate before they're added to the table above. Prefixes
-# are tried in list order, so put more specific ones first.
-_FAMILY_FALLBACK: list[tuple[str, tuple[float, float, float, float]]] = [
-    ("claude-opus",   (5.0,  25.0, 0.50,  6.25)),
-    ("claude-sonnet", (3.0,  15.0, 0.30,  3.75)),
-    ("claude-haiku",  (1.0,   5.0, 0.10,  1.25)),
-    ("gpt-5.5",       (5.0,  30.0, 0.50,  0.0)),
-    ("gpt-5.4",       (2.5,  15.0, 0.25,  0.0)),
-    ("gpt-5",         (1.75, 14.0, 0.175, 0.0)),
-    ("gemini-3",      (2.0,  12.0, 0.20,  0.0)),
-    ("gemini-2.5",    (1.25, 10.0, 0.125, 0.0)),
-    ("gemini-2",      (0.30,  2.5, 0.03,  0.0)),
-]
-
-_DEFAULT_PRICING = (3.0, 15.0, 0.30, 3.75)  # fallback to mid-range (sonnet)
-
 _MODEL_ALIASES: dict[str, str] = {
     "claude-4.5-sonnet-thinking": "claude-sonnet-4-5",
     "claude-4.5-opus-high-thinking": "claude-opus-4-5",
-    "gpt-5.1-codex-max": "gpt-5.1-codex",
+    "codex-auto-review": "gpt-5.3-codex",
+    "gpt-5.1-codex-max": "gpt-5.1-codex-max",
 }
 
 # Internal placeholder/system responses that should never be billed as a model.
 _NON_BILLABLE_MODELS = {"<synthetic>"}
 
-_PRICING_FINGERPRINT_VERSION = 4
+# Explicitly unsupported paid-model families. Keep these before builtin prefix
+# matching so ``gpt-5.4-pro`` cannot accidentally inherit ``gpt-5.4`` pricing.
+_UNKNOWN_MODEL_PREFIXES = (
+    "gpt-5.5-pro",
+    "gpt-5.4-pro",
+    "gpt-5.3-pro",
+    "gpt-5.2-pro",
+    "gpt-5.1-pro",
+    "gpt-5-pro",
+)
+
+_PRICING_FINGERPRINT_VERSION = 8
+
+# Long-context pricing applies per request/prompt, not per stored hour/session.
+# Collectors pass single-event usage into ``estimate_cost`` before aggregating
+# buckets; aggregate-only callers get a best-effort fallback.
+_LONG_CONTEXT_TIERS: list[dict[str, object]] = [
+    {
+        "prefixes": ("gpt-5.4",),
+        "excluded_prefixes": ("gpt-5.4-mini", "gpt-5.4-nano"),
+        "threshold": 272_000,
+        "prices": (5.0, 22.5, 0.50, 0.0),
+    },
+    {
+        "prefixes": ("gemini-3.1-pro",),
+        "threshold": 200_000,
+        "prices": (4.0, 18.0, 0.40, 0.0),
+    },
+    {
+        "prefixes": ("gemini-2.5-pro",),
+        "threshold": 200_000,
+        "prices": (2.5, 15.0, 0.25, 0.0),
+    },
+    {
+        "prefixes": ("claude-sonnet-4",),
+        "excluded_prefixes": ("claude-sonnet-4-5", "claude-sonnet-4-6"),
+        "threshold": 200_000,
+        "prices": (6.0, 22.5, 0.60, 7.5),
+    },
+]
+
+_SERVICE_TIER_MULTIPLIERS: list[dict[str, object]] = [
+    {
+        "service_tier": "fast",
+        "prefixes": ("claude-opus-4-6",),
+        "multiplier": 6.0,
+    },
+    {
+        "service_tier": "fast",
+        "prefixes": ("gpt-5.5",),
+        "multiplier": 2.5,
+    },
+    {
+        "service_tier": "fast",
+        "prefixes": ("gpt-5.4",),
+        "excluded_prefixes": ("gpt-5.4-pro", "gpt-5.4-mini", "gpt-5.4-nano"),
+        "multiplier": 2.0,
+    },
+]
 
 # Track warned models to avoid spamming logs
 _warned_models: set[str] = set()
+
+
+def _matches_model_prefix(model: str, prefix: str) -> bool:
+    """Return True for an exact model id or a dated/preview variant."""
+    return model == prefix or model.startswith(f"{prefix}-")
+
+
+def _matches_any_model_prefix(model: str, prefixes: tuple[str, ...]) -> bool:
+    return any(_matches_model_prefix(model, prefix) for prefix in prefixes)
 
 # ── User pricing file I/O (with mtime-based memo cache) ────────────
 
@@ -194,8 +256,8 @@ def normalize_model(name: str) -> str:
     return _MODEL_ALIASES.get(name, name)
 
 
-def get_pricing(model: str) -> tuple[float, float, float, float]:
-    """Look up pricing: user overrides → builtin prefix match → family fallback → default.
+def get_pricing(model: str) -> tuple[float, float, float, float] | None:
+    """Look up pricing: user overrides → builtin prefix match → unknown.
 
     Prefix matching is done longest-prefix-first to ensure ``gpt-5.4-mini``
     matches its own entry before falling back to ``gpt-5.4``.
@@ -210,32 +272,74 @@ def get_pricing(model: str) -> tuple[float, float, float, float]:
     if model in user:
         return user[model]
 
+    if _matches_any_model_prefix(model, _UNKNOWN_MODEL_PREFIXES):
+        return None
+
     # 2. Builtin (prefix match — longest prefix first)
     for prefix, pricing in sorted(_BUILTIN_PRICING.items(), key=lambda x: len(x[0]), reverse=True):
-        if model.startswith(prefix):
+        if _matches_model_prefix(model, prefix):
             return pricing
 
-    # 3. Family fallback
-    for family_prefix, pricing in _FAMILY_FALLBACK:
-        if model.startswith(family_prefix):
-            if model not in _warned_models:
-                _warned_models.add(model)
-                log.warning(
-                    "Unknown model %r — using %s family pricing. "
-                    "Run 'agentic-metric pricing set' to configure.",
-                    model, family_prefix.rstrip("-"),
-                )
-            return pricing
-
-    # 4. Default
     if model and model not in _warned_models:
         _warned_models.add(model)
         log.warning(
-            "Unknown model %r — using default pricing ($%.1f/$%.1f per 1M tokens). "
-            "Run 'agentic-metric pricing set' to configure.",
-            model, _DEFAULT_PRICING[0], _DEFAULT_PRICING[1],
+            "Unknown model %r — cost will be shown as '?'. "
+            "Run 'agentic-metric pricing set' to configure pricing.",
+            model,
         )
-    return _DEFAULT_PRICING
+    return None
+
+
+def is_model_priced(model: str) -> bool:
+    """Return True when a model has explicit builtin or user pricing."""
+    return get_pricing(model) is not None
+
+
+def _long_context_prices(
+    model: str,
+    input_tokens: int,
+    cache_read_tokens: int,
+    cache_creation_tokens: int,
+) -> tuple[float, float, float, float] | None:
+    """Return request-size tier pricing when this usage crosses a model tier."""
+    if input_tokens < 0 or cache_read_tokens < 0 or cache_creation_tokens < 0:
+        return None
+
+    model = normalize_model(model)
+    if model in _load_user_pricing():
+        return None
+    if _matches_any_model_prefix(model, _UNKNOWN_MODEL_PREFIXES):
+        return None
+    total_input_tokens = input_tokens + cache_read_tokens + cache_creation_tokens
+    for tier in _LONG_CONTEXT_TIERS:
+        prefixes = tuple(str(p) for p in tier["prefixes"])
+        excluded = tuple(str(p) for p in tier.get("excluded_prefixes", ()))
+        if not _matches_any_model_prefix(model, prefixes) or (
+            excluded and _matches_any_model_prefix(model, excluded)
+        ):
+            continue
+        if total_input_tokens > int(tier["threshold"]):
+            return tuple(float(v) for v in tier["prices"])  # type: ignore[return-value]
+    return None
+
+
+def _service_tier_multiplier(model: str, service_tier: str) -> float:
+    """Return a provider-specific multiplier for observable service tiers."""
+    service_tier = (service_tier or "").strip().lower()
+    if not service_tier:
+        return 1.0
+
+    model = normalize_model(model)
+    for tier in _SERVICE_TIER_MULTIPLIERS:
+        if service_tier != tier["service_tier"]:
+            continue
+        prefixes = tuple(str(p) for p in tier["prefixes"])
+        excluded = tuple(str(p) for p in tier.get("excluded_prefixes", ()))
+        if _matches_any_model_prefix(model, prefixes) and not (
+            excluded and _matches_any_model_prefix(model, excluded)
+        ):
+            return float(tier["multiplier"])
+    return 1.0
 
 
 def get_all_pricing() -> dict[str, tuple[float, float, float, float]]:
@@ -251,9 +355,10 @@ def get_pricing_fingerprint() -> str:
         "version": _PRICING_FINGERPRINT_VERSION,
         "aliases": sorted(_MODEL_ALIASES.items()),
         "builtin": sorted((model, list(prices)) for model, prices in _BUILTIN_PRICING.items()),
-        "default": list(_DEFAULT_PRICING),
-        "family_fallback": sorted((model, list(prices)) for model, prices in _FAMILY_FALLBACK),
+        "long_context_tiers": _LONG_CONTEXT_TIERS,
         "non_billable": sorted(_NON_BILLABLE_MODELS),
+        "unknown_model_prefixes": sorted(_UNKNOWN_MODEL_PREFIXES),
+        "service_tier_multipliers": _SERVICE_TIER_MULTIPLIERS,
         "user": sorted((model, list(prices)) for model, prices in _load_user_pricing().items()),
     }
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -265,38 +370,66 @@ def estimate_cost(
     output_tokens: int = 0,
     cache_read_tokens: int = 0,
     cache_creation_tokens: int = 0,
-) -> float:
+    cache_creation_1h_tokens: int = 0,
+    service_tier: str = "",
+    apply_long_context: bool = True,
+) -> float | None:
     """Estimate API-equivalent cost in USD.
 
     ``input_tokens`` must NOT include cached tokens — collectors are
     responsible for stripping cached portions before storing, per each
     provider's API semantics (Anthropic: already separate; OpenAI:
-    ``input_tokens`` is total, subtract ``cached_input_tokens``).
+    ``input_tokens`` is total, subtract ``cached_input_tokens``). Anthropic's
+    optional 1-hour cache writes are a subset of ``cache_creation_tokens`` and
+    are charged at the 1-hour prompt-cache multiplier when provided. Long-context
+    tiers are only correct for single-request usage; callers that only have
+    hourly/session aggregates should pass ``apply_long_context=False``.
     """
     if (
         input_tokens <= 0
         and output_tokens <= 0
         and cache_read_tokens <= 0
         and cache_creation_tokens <= 0
+        and cache_creation_1h_tokens <= 0
     ):
         return 0.0
 
-    p_in, p_out, p_cr, p_cw = get_pricing(model)
+    cache_creation_1h_tokens = max(0, min(cache_creation_1h_tokens, cache_creation_tokens))
+    cache_creation_5m_tokens = cache_creation_tokens - cache_creation_1h_tokens
+    pricing = None
+    if apply_long_context:
+        pricing = _long_context_prices(
+            model,
+            input_tokens=input_tokens,
+            cache_read_tokens=cache_read_tokens,
+            cache_creation_tokens=cache_creation_tokens,
+        )
+    pricing = pricing or get_pricing(model)
+    if pricing is None:
+        return None
+    p_in, p_out, p_cr, p_cw = pricing
     cost = (
         input_tokens * p_in
         + output_tokens * p_out
         + cache_read_tokens * p_cr
-        + cache_creation_tokens * p_cw
+        + cache_creation_5m_tokens * p_cw
+        + cache_creation_1h_tokens * (p_in * 2.0)
     ) / 1_000_000
-    return cost
+    return cost * _service_tier_multiplier(model, service_tier)
 
 
-def estimate_session_cost(session) -> float:
-    """Estimate cost for a LiveSession object."""
+def estimate_session_cost(session) -> float | None:
+    """Estimate cost for a LiveSession object.
+
+    LiveSession counters are session aggregates, so request-size tiers cannot
+    be inferred here.
+    """
     return estimate_cost(
         model=session.model,
         input_tokens=session.input_tokens,
         output_tokens=session.output_tokens,
         cache_read_tokens=session.cache_read_tokens,
         cache_creation_tokens=session.cache_creation_tokens,
+        service_tier=getattr(session, "service_tier", ""),
+        apply_long_context=False,
     )

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import platform
+import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -10,7 +12,10 @@ from ..config import CODEX_SESSIONS_DIR
 from ..models import LiveSession
 from ..pricing import estimate_cost
 from . import BaseCollector
-from ._process import get_running_cwds
+from ._process import get_running_cwds, normalize_cwd_key
+
+
+_RECENT_ACTIVITY_SECONDS = 300
 
 
 # ── Incremental JSONL accumulator ────────────────────────────────────────
@@ -53,6 +58,7 @@ class _SessionAccum:
         "last_prompt",
         "git_branch",
         "model",
+        "service_tier",
         "partial_line",
         "file_id",
         "file_mtime_ns",
@@ -95,6 +101,7 @@ class _SessionAccum:
         self.last_prompt = ""
         self.git_branch = ""
         self.model = ""
+        self.service_tier = ""
         self.partial_line = b""
         self.file_id: tuple[int, int] | None = None
         self.file_mtime_ns = -1
@@ -104,7 +111,7 @@ class _SessionAccum:
         self.fork_baseline_output = 0
         self.fork_baseline_cache_read = 0
         self.fork_baseline_cache_create = 0
-        self.usage_buckets: dict[tuple[str, int, str], dict] = {}
+        self.usage_buckets: dict[tuple[str, int, str, str], dict] = {}
 
     def read_new_lines(self) -> None:
         """Read only bytes appended since last call.
@@ -177,6 +184,7 @@ class _SessionAccum:
         self.last_prompt = ""
         self.git_branch = ""
         self.model = ""
+        self.service_tier = ""
         self.partial_line = b""
         self.is_forked = False
         self.seen_turn_context = False
@@ -217,11 +225,14 @@ class _SessionAccum:
         output_tokens: int = 0,
         cache_read_tokens: int = 0,
         cache_creation_tokens: int = 0,
+        estimated_cost_usd: float | None = 0.0,
+        service_tier: str | None = None,
     ) -> None:
         usage_date, usage_hour = _local_bucket(ts)
         if not usage_date:
             return
-        key = (usage_date, usage_hour, self.model or "")
+        bucket_service_tier = self.service_tier if service_tier is None else service_tier
+        key = (usage_date, usage_hour, self.model or "", bucket_service_tier or "")
         bucket = self.usage_buckets.setdefault(
             key,
             {
@@ -229,21 +240,28 @@ class _SessionAccum:
                 "usage_hour": usage_hour,
                 "project_path": self.project_path,
                 "model": self.model or "",
+                "service_tier": bucket_service_tier or "",
                 "message_count": 0,
                 "user_turns": 0,
                 "input_tokens": 0,
                 "output_tokens": 0,
                 "cache_read_tokens": 0,
                 "cache_creation_tokens": 0,
+                "estimated_cost_usd": 0.0,
             },
         )
         bucket["project_path"] = self.project_path
+        bucket["service_tier"] = bucket_service_tier or ""
         bucket["message_count"] += message_count
         bucket["user_turns"] += user_turns
         bucket["input_tokens"] += input_tokens
         bucket["output_tokens"] += output_tokens
         bucket["cache_read_tokens"] += cache_read_tokens
         bucket["cache_creation_tokens"] += cache_creation_tokens
+        if estimated_cost_usd is None:
+            bucket["estimated_cost_usd"] = None
+        elif bucket["estimated_cost_usd"] is not None:
+            bucket["estimated_cost_usd"] += estimated_cost_usd
 
     def usage_bucket_rows(self) -> list[dict]:
         return list(self.usage_buckets.values())
@@ -290,6 +308,9 @@ class _SessionAccum:
             model = payload.get("model", "")
             if model:
                 self.model = model
+            service_tier = _extract_service_tier(payload)
+            if service_tier:
+                self.service_tier = service_tier
             self.seen_turn_context = True
 
         elif entry_type == "event_msg":
@@ -327,6 +348,9 @@ class _SessionAccum:
             info = payload.get("info")
             if not info:
                 return
+            service_tier = _extract_service_tier(payload) or _extract_service_tier(info)
+            if service_tier:
+                self.service_tier = service_tier
             usage = info.get("total_token_usage", {})
             if not usage:
                 return
@@ -364,12 +388,29 @@ class _SessionAccum:
             d_cache_read = self.cache_read - prev_cache_read
             d_cache_create = self.cache_create - prev_cache_create
             if d_input or d_output or d_cache_read or d_cache_create:
+                event_cost = _event_cost_from_token_usage(
+                    self.model,
+                    info.get("last_token_usage"),
+                    self.service_tier,
+                )
+                if event_cost is None:
+                    event_cost = estimate_cost(
+                        self.model,
+                        input_tokens=d_input,
+                        output_tokens=d_output,
+                        cache_read_tokens=d_cache_read,
+                        cache_creation_tokens=d_cache_create,
+                        service_tier=self.service_tier,
+                        apply_long_context=False,
+                    )
                 self._add_usage_bucket(
                     ts,
                     input_tokens=d_input,
                     output_tokens=d_output,
                     cache_read_tokens=d_cache_read,
                     cache_creation_tokens=d_cache_create,
+                    estimated_cost_usd=event_cost,
+                    service_tier=self.service_tier,
                 )
             if is_today:
                 self.today_input_tokens = max(self.input_tokens - self.today_input_base, 0)
@@ -410,6 +451,7 @@ class _SessionAccum:
             project_path=self.project_path,
             git_branch=self.git_branch,
             model=self.model,
+            service_tier=self.service_tier,
             message_count=self.message_count,
             user_turns=self.user_turns,
             input_tokens=self.input_tokens,
@@ -448,11 +490,20 @@ class _LiveMonitor:
         """Return currently running sessions."""
         pid_cwds: dict[int, str] = get_running_cwds("codex", exact=True)
         if not pid_cwds:
+            if platform.system() == "Windows":
+                return self._refresh_recent_files()
             return []
 
         cwd_to_pids: dict[str, list[int]] = {}
+        cwd_display: dict[str, str] = {}
         for pid, cwd in pid_cwds.items():
-            cwd_to_pids.setdefault(cwd, []).append(pid)
+            key = normalize_cwd_key(cwd)
+            if not key:
+                continue
+            cwd_to_pids.setdefault(key, []).append(pid)
+            cwd_display.setdefault(key, cwd)
+        if not cwd_to_pids:
+            return []
 
         today = date.today()
         candidate_files: dict[Path, float] = {}
@@ -482,7 +533,7 @@ class _LiveMonitor:
                 for jsonl_file in CODEX_SESSIONS_DIR.rglob("rollout-*.jsonl"):
                     if jsonl_file in candidate_files:
                         continue
-                    cwd = self._read_cwd(jsonl_file)
+                    cwd = normalize_cwd_key(self._read_cwd(jsonl_file))
                     if cwd not in missing_cwds:
                         continue
                     try:
@@ -511,7 +562,7 @@ class _LiveMonitor:
                 pid = pids[idx] if idx < len(pids) else 0
                 accum = self._accums.get(jsonl_file)
                 if accum is None:
-                    accum = _SessionAccum(jsonl_file, cwd, pid=pid)
+                    accum = _SessionAccum(jsonl_file, cwd_display.get(cwd, cwd), pid=pid)
                     self._accums[jsonl_file] = accum
                 else:
                     accum.pid = pid
@@ -528,6 +579,41 @@ class _LiveMonitor:
         results.sort(key=lambda s: s.last_active, reverse=True)
         return results
 
+    def _refresh_recent_files(self) -> list[LiveSession]:
+        """Windows fallback when process CWD lookup is unavailable."""
+        if not CODEX_SESSIONS_DIR.exists():
+            return []
+        cutoff = time.time() - _RECENT_ACTIVITY_SECONDS
+        candidates: list[tuple[float, Path]] = []
+        try:
+            for jsonl_file in CODEX_SESSIONS_DIR.rglob("rollout-*.jsonl"):
+                try:
+                    mtime = jsonl_file.stat().st_mtime
+                    if mtime >= cutoff:
+                        candidates.append((mtime, jsonl_file))
+                except OSError:
+                    continue
+        except OSError:
+            return []
+
+        results: list[LiveSession] = []
+        active_files: set[Path] = set()
+        for _mtime, jsonl_file in sorted(candidates, key=lambda item: item[0], reverse=True):
+            active_files.add(jsonl_file)
+            accum = self._accums.get(jsonl_file)
+            if accum is None:
+                accum = _SessionAccum(jsonl_file, project_path="")
+                self._accums[jsonl_file] = accum
+            accum.read_new_lines()
+            if accum.user_turns > 0:
+                results.append(accum.to_live_session())
+
+        stale = [k for k in self._accums if k not in active_files]
+        for k in stale:
+            del self._accums[k]
+        results.sort(key=lambda s: s.last_active, reverse=True)
+        return results
+
     @staticmethod
     def _files_by_active_cwd(
         candidate_files: dict[Path, float],
@@ -537,7 +623,7 @@ class _LiveMonitor:
         cwd_to_files: dict[str, list[Path]] = {}
         jsonl_files = sorted(candidate_files, key=lambda f: candidate_files[f], reverse=True)
         for jsonl_file in jsonl_files:
-            cwd = _LiveMonitor._read_cwd(jsonl_file)
+            cwd = normalize_cwd_key(_LiveMonitor._read_cwd(jsonl_file))
             if not cwd or cwd not in cwd_to_pids:
                 continue
             cwd_to_files.setdefault(cwd, []).append(jsonl_file)
@@ -590,7 +676,7 @@ class CodexCollector(BaseCollector):
         if not CODEX_SESSIONS_DIR.exists():
             return
 
-        sync_prefix = "codex_jsonl:v3:"
+        sync_prefix = "codex_jsonl:v5:"
 
         for jsonl_file in CODEX_SESSIONS_DIR.rglob("rollout-*.jsonl"):
             sync_key = f"{sync_prefix}{jsonl_file}"
@@ -660,18 +746,68 @@ def _sync_state_matches(state: str | None, file_size: int, mtime_ns: int) -> boo
         return False
 
 
-def _usage_rows_cost(rows: list[dict]) -> float:
+def _usage_rows_cost(rows: list[dict]) -> float | None:
     """Estimate cost using each bucket's own model."""
-    return sum(
-        estimate_cost(
-            row.get("model") or "",
-            input_tokens=int(row.get("input_tokens") or 0),
-            output_tokens=int(row.get("output_tokens") or 0),
-            cache_read_tokens=int(row.get("cache_read_tokens") or 0),
-            cache_creation_tokens=int(row.get("cache_creation_tokens") or 0),
-        )
-        for row in rows
+    total = 0.0
+    for row in rows:
+        if "estimated_cost_usd" in row:
+            cost = row["estimated_cost_usd"]
+        else:
+            cost = estimate_cost(
+                row.get("model") or "",
+                input_tokens=int(row.get("input_tokens") or 0),
+                output_tokens=int(row.get("output_tokens") or 0),
+                cache_read_tokens=int(row.get("cache_read_tokens") or 0),
+                cache_creation_tokens=int(row.get("cache_creation_tokens") or 0),
+                service_tier=str(row.get("service_tier") or ""),
+                apply_long_context=False,
+            )
+        if cost is None:
+            return None
+        total += float(cost)
+    return total
+
+
+def _event_cost_from_token_usage(model: str, usage: object, service_tier: str = "") -> float | None:
+    """Estimate one Codex/OpenAI token-count event when last-token usage exists."""
+    if not isinstance(usage, dict):
+        return None
+    if not any(k in usage for k in ("input_tokens", "output_tokens", "cached_input_tokens")):
+        return None
+    raw_input = int(usage.get("input_tokens") or 0)
+    cached = int(usage.get("cached_input_tokens") or 0)
+    output = int(usage.get("output_tokens") or 0)
+    cache_create = int(usage.get("cache_creation_input_tokens") or 0)
+    return estimate_cost(
+        model,
+        input_tokens=max(raw_input - cached, 0),
+        output_tokens=output,
+        cache_read_tokens=cached,
+        cache_creation_tokens=cache_create,
+        service_tier=service_tier,
     )
+
+
+def _extract_service_tier(payload: object) -> str:
+    """Return a Codex service tier such as ``fast`` if present in log payloads."""
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("service_tier", "serviceTier", "speed"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip().lower()
+    collab = payload.get("collaboration_mode")
+    if isinstance(collab, dict):
+        settings = collab.get("settings")
+        nested = _extract_service_tier(settings)
+        if nested:
+            return nested
+    settings = payload.get("settings")
+    if settings is not payload:
+        nested = _extract_service_tier(settings)
+        if nested:
+            return nested
+    return ""
 
 
 def _local_bucket(ts: str) -> tuple[str, int]:

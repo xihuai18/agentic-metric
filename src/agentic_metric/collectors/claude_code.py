@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import platform
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -11,7 +13,10 @@ from ..config import PROJECTS_DIR
 from ..models import LiveSession
 from ..pricing import estimate_cost
 from . import BaseCollector
-from ._process import get_running_cwds
+from ._process import get_running_cwds, normalize_cwd_key
+
+
+_RECENT_ACTIVITY_SECONDS = 300
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -65,6 +70,7 @@ class _SessionAccum:
         "last_prompt",
         "git_branch",
         "model",
+        "service_tier",
         "today_user_turns",
         "today_message_count",
         "today_input_tokens",
@@ -98,6 +104,7 @@ class _SessionAccum:
         self.last_prompt = ""
         self.git_branch = ""
         self.model = ""
+        self.service_tier = ""
         self.today_user_turns = 0
         self.today_message_count = 0
         self.today_input_tokens = 0
@@ -108,9 +115,9 @@ class _SessionAccum:
         self.partial_line = b""
         self.file_id: tuple[int, int] | None = None
         self.file_mtime_ns = -1
-        self.assistant_message_dates: dict[str, tuple[str, int, str]] = {}
-        self.assistant_usage_by_id: dict[str, tuple[int, int, int, int, str, int, str]] = {}
-        self.usage_buckets: dict[tuple[str, int, str], dict] = {}
+        self.assistant_message_dates: dict[str, tuple[str, int, str, str]] = {}
+        self.assistant_usage_by_id: dict[str, tuple[int, int, int, int, float | None, str, int, str, str]] = {}
+        self.usage_buckets: dict[tuple[str, int, str, str], dict] = {}
 
     def read_new_lines(self) -> None:
         """Read only bytes appended since last call."""
@@ -175,6 +182,7 @@ class _SessionAccum:
         self.last_prompt = ""
         self.git_branch = ""
         self.model = ""
+        self.service_tier = ""
         self.partial_line = b""
         self.assistant_message_dates.clear()
         self.assistant_usage_by_id.clear()
@@ -221,11 +229,14 @@ class _SessionAccum:
         output_tokens: int = 0,
         cache_read_tokens: int = 0,
         cache_creation_tokens: int = 0,
+        estimated_cost_usd: float | None = 0.0,
+        service_tier: str | None = None,
     ) -> None:
         if not usage_date:
             return
         bucket_model = model if model is not None else self.model
-        key = (usage_date, usage_hour, bucket_model or "")
+        bucket_service_tier = self.service_tier if service_tier is None else service_tier
+        key = (usage_date, usage_hour, bucket_model or "", bucket_service_tier or "")
         bucket = self.usage_buckets.setdefault(
             key,
             {
@@ -233,21 +244,28 @@ class _SessionAccum:
                 "usage_hour": usage_hour,
                 "project_path": self.project_path,
                 "model": bucket_model or "",
+                "service_tier": bucket_service_tier or "",
                 "message_count": 0,
                 "user_turns": 0,
                 "input_tokens": 0,
                 "output_tokens": 0,
                 "cache_read_tokens": 0,
                 "cache_creation_tokens": 0,
+                "estimated_cost_usd": 0.0,
             },
         )
         bucket["project_path"] = self.project_path
+        bucket["service_tier"] = bucket_service_tier or ""
         bucket["message_count"] += message_count
         bucket["user_turns"] += user_turns
         bucket["input_tokens"] += input_tokens
         bucket["output_tokens"] += output_tokens
         bucket["cache_read_tokens"] += cache_read_tokens
         bucket["cache_creation_tokens"] += cache_creation_tokens
+        if estimated_cost_usd is None:
+            bucket["estimated_cost_usd"] = None
+        elif bucket["estimated_cost_usd"] is not None:
+            bucket["estimated_cost_usd"] += estimated_cost_usd
 
     def usage_bucket_rows(self) -> list[dict]:
         rows = []
@@ -259,6 +277,7 @@ class _SessionAccum:
                 or bucket["output_tokens"]
                 or bucket["cache_read_tokens"]
                 or bucket["cache_creation_tokens"]
+                or bucket["estimated_cost_usd"]
             ):
                 rows.append(bucket)
         return rows
@@ -307,33 +326,53 @@ class _SessionAccum:
             msg = entry.get("message", {})
             msg_id = msg.get("id", "") if isinstance(msg, dict) else ""
             msg_model = msg.get("model", "") if isinstance(msg, dict) else ""
-            if msg_model and not self.model:
+            if msg_model and msg_model != "<synthetic>":
+                self.model = msg_model
+            elif msg_model and not self.model:
                 self.model = msg_model
             entry_date, entry_hour = _local_bucket(ts)
             if not entry_date:
                 entry_date, entry_hour = today_str, 0
             bucket_model = msg_model or self.model
+            usage = msg.get("usage", {}) if isinstance(msg, dict) else {}
+            service_tier = _extract_service_tier(usage) or _extract_service_tier(msg)
+            if service_tier:
+                self.service_tier = service_tier
             self._count_assistant_message(
                 msg_id,
                 entry_date,
                 entry_hour,
                 today_str,
                 bucket_model,
+                service_tier,
             )
 
-            usage = msg.get("usage", {}) if isinstance(msg, dict) else {}
             if usage:
-                inp = usage.get("input_tokens", 0)
-                out = usage.get("output_tokens", 0)
-                cr = usage.get("cache_read_input_tokens", 0)
-                cw = usage.get("cache_creation_input_tokens", 0)
+                inp = int(usage.get("input_tokens") or 0)
+                out = int(usage.get("output_tokens") or 0)
+                cr = int(usage.get("cache_read_input_tokens") or 0)
+                cw = int(usage.get("cache_creation_input_tokens") or 0)
+                cache_creation = usage.get("cache_creation", {})
+                cw_1h = 0
+                if isinstance(cache_creation, dict):
+                    cw_1h = int(cache_creation.get("ephemeral_1h_input_tokens") or 0)
+                usage_cost = estimate_cost(
+                    bucket_model,
+                    input_tokens=inp,
+                    output_tokens=out,
+                    cache_read_tokens=cr,
+                    cache_creation_tokens=cw,
+                    cache_creation_1h_tokens=cw_1h,
+                    service_tier=service_tier,
+                )
                 self._set_assistant_usage(
                     msg_id,
-                    (inp, out, cr, cw),
+                    (inp, out, cr, cw, usage_cost),
                     entry_date,
                     entry_hour,
                     today_str,
                     bucket_model,
+                    service_tier,
                 )
 
     def _count_assistant_message(
@@ -343,6 +382,7 @@ class _SessionAccum:
         entry_hour: int,
         today_str: str,
         model: str,
+        service_tier: str,
     ) -> None:
         """Count each Claude Code assistant message once by message id."""
         if not msg_id:
@@ -351,6 +391,7 @@ class _SessionAccum:
                 entry_date,
                 entry_hour,
                 model=model,
+                service_tier=service_tier,
                 message_count=1,
             )
             if entry_date == today_str:
@@ -359,48 +400,67 @@ class _SessionAccum:
 
         prev = self.assistant_message_dates.get(msg_id)
         if prev is None:
-            self.assistant_message_dates[msg_id] = (entry_date, entry_hour, model)
+            self.assistant_message_dates[msg_id] = (entry_date, entry_hour, model, service_tier)
             self.message_count += 1
             self._add_usage_bucket(
                 entry_date,
                 entry_hour,
                 model=model,
+                service_tier=service_tier,
                 message_count=1,
             )
             if entry_date == today_str:
                 self.today_message_count += 1
             return
 
-        prev_date, prev_hour, prev_model = prev
-        if (prev_date, prev_hour, prev_model) == (entry_date, entry_hour, model):
+        prev_date, prev_hour, prev_model, prev_service_tier = prev
+        if (prev_date, prev_hour, prev_model, prev_service_tier) == (
+            entry_date,
+            entry_hour,
+            model,
+            service_tier,
+        ):
             return
 
         # A rare cross-midnight update for the same streamed message should
         # move the day-local count without changing the session total.
-        self._add_usage_bucket(prev_date, prev_hour, model=prev_model, message_count=-1)
-        self._add_usage_bucket(entry_date, entry_hour, model=model, message_count=1)
+        self._add_usage_bucket(
+            prev_date,
+            prev_hour,
+            model=prev_model,
+            service_tier=prev_service_tier,
+            message_count=-1,
+        )
+        self._add_usage_bucket(
+            entry_date,
+            entry_hour,
+            model=model,
+            service_tier=service_tier,
+            message_count=1,
+        )
         if prev_date == today_str and entry_date != today_str:
             self.today_message_count = max(0, self.today_message_count - 1)
         elif prev_date != today_str and entry_date == today_str:
             self.today_message_count += 1
-        self.assistant_message_dates[msg_id] = (entry_date, entry_hour, model)
+        self.assistant_message_dates[msg_id] = (entry_date, entry_hour, model, service_tier)
 
     def _set_assistant_usage(
         self,
         msg_id: str,
-        usage: tuple[int, int, int, int],
+        usage: tuple[int, int, int, int, float | None],
         entry_date: str,
         entry_hour: int,
         today_str: str,
         model: str,
+        service_tier: str,
     ) -> None:
         """Use the last usage snapshot for a Claude Code assistant message."""
-        inp, out, cr, cw = usage
+        inp, out, cr, cw, cost = usage
 
         if msg_id:
             prev = self.assistant_usage_by_id.get(msg_id)
             if prev is not None:
-                p_in, p_out, p_cr, p_cw, p_date, p_hour, p_model = prev
+                p_in, p_out, p_cr, p_cw, p_cost, p_date, p_hour, p_model, p_service_tier = prev
                 self.input_tokens = max(0, self.input_tokens - p_in)
                 self.output_tokens = max(0, self.output_tokens - p_out)
                 self.cache_read = max(0, self.cache_read - p_cr)
@@ -409,10 +469,12 @@ class _SessionAccum:
                     p_date,
                     p_hour,
                     model=p_model,
+                    service_tier=p_service_tier,
                     input_tokens=-p_in,
                     output_tokens=-p_out,
                     cache_read_tokens=-p_cr,
                     cache_creation_tokens=-p_cw,
+                    estimated_cost_usd=-p_cost if p_cost is not None else None,
                 )
                 if p_date == today_str:
                     self.today_input_tokens = max(0, self.today_input_tokens - p_in)
@@ -425,9 +487,11 @@ class _SessionAccum:
                 out,
                 cr,
                 cw,
+                cost,
                 entry_date,
                 entry_hour,
                 model,
+                service_tier,
             )
 
         self.input_tokens += inp
@@ -438,10 +502,12 @@ class _SessionAccum:
             entry_date,
             entry_hour,
             model=model,
+            service_tier=service_tier,
             input_tokens=inp,
             output_tokens=out,
             cache_read_tokens=cr,
             cache_creation_tokens=cw,
+            estimated_cost_usd=cost,
         )
         if entry_date == today_str:
             self.today_input_tokens += inp
@@ -456,6 +522,7 @@ class _SessionAccum:
             project_path=self.project_path,
             git_branch=self.git_branch,
             model=self.model,
+            service_tier=self.service_tier,
             message_count=self.message_count,
             user_turns=self.user_turns,
             input_tokens=self.input_tokens,
@@ -501,9 +568,20 @@ class _LiveMonitor:
         """Return currently running sessions. Fast on repeated calls."""
         pid_cwds: dict[int, str] = get_running_cwds("claude", exact=True)
         if not pid_cwds:
+            if platform.system() == "Windows":
+                return self._refresh_recent_files()
             return []
 
-        cwd_set = set(pid_cwds.values())
+        cwd_display: dict[str, str] = {}
+        cwd_set: set[str] = set()
+        for cwd in pid_cwds.values():
+            key = normalize_cwd_key(cwd)
+            if not key:
+                continue
+            cwd_set.add(key)
+            cwd_display.setdefault(key, cwd)
+        if not cwd_set:
+            return []
 
         # Rebuild cwd map if we see unknown cwds
         if not self._cwd_map_built or not cwd_set.issubset(self._cwd_map.keys()):
@@ -512,7 +590,9 @@ class _LiveMonitor:
         # Build cwd -> list of pids (multiple sessions may share a cwd)
         cwd_to_pids: dict[str, list[int]] = {}
         for pid, cwd in pid_cwds.items():
-            cwd_to_pids.setdefault(cwd, []).append(pid)
+            key = normalize_cwd_key(cwd)
+            if key:
+                cwd_to_pids.setdefault(key, []).append(pid)
 
         results: list[LiveSession] = []
         active_files: set[Path] = set()
@@ -548,7 +628,7 @@ class _LiveMonitor:
                 # Get or create accumulator
                 accum = self._accums.get(jf)
                 if accum is None:
-                    accum = _SessionAccum(jf, cwd, pid=pid)
+                    accum = _SessionAccum(jf, cwd_display.get(cwd, cwd), pid=pid)
                     self._accums[jf] = accum
                 else:
                     # Update pid in case it changed across refreshes
@@ -563,6 +643,46 @@ class _LiveMonitor:
         for k in stale:
             del self._accums[k]
 
+        results.sort(key=lambda s: s.last_active, reverse=True)
+        return results
+
+    def _refresh_recent_files(self) -> list[LiveSession]:
+        """Windows fallback when process CWD lookup is unavailable."""
+        if not PROJECTS_DIR.exists():
+            return []
+        cutoff = time.time() - _RECENT_ACTIVITY_SECONDS
+        candidates: list[tuple[float, Path, str]] = []
+        try:
+            project_dirs = [p for p in PROJECTS_DIR.iterdir() if p.is_dir()]
+        except OSError:
+            return []
+        for project_dir in project_dirs:
+            try:
+                for jsonl_file in project_dir.glob("*.jsonl"):
+                    try:
+                        mtime = jsonl_file.stat().st_mtime
+                        if mtime >= cutoff:
+                            candidates.append((mtime, jsonl_file, self._read_cwd(jsonl_file) or str(project_dir)))
+                    except OSError:
+                        continue
+            except OSError:
+                continue
+
+        results: list[LiveSession] = []
+        active_files: set[Path] = set()
+        for _mtime, jsonl_file, cwd in sorted(candidates, key=lambda item: item[0], reverse=True):
+            active_files.add(jsonl_file)
+            accum = self._accums.get(jsonl_file)
+            if accum is None:
+                accum = _SessionAccum(jsonl_file, cwd)
+                self._accums[jsonl_file] = accum
+            accum.read_new_lines()
+            if accum.user_turns > 0:
+                results.append(accum.to_live_session())
+
+        stale = [k for k in self._accums if k not in active_files]
+        for k in stale:
+            del self._accums[k]
         results.sort(key=lambda s: s.last_active, reverse=True)
         return results
 
@@ -586,7 +706,7 @@ class _LiveMonitor:
                 continue
             real_cwd = self._read_cwd(jsonl_files[0])
             if real_cwd:
-                self._cwd_map[real_cwd] = project_dir
+                self._cwd_map[normalize_cwd_key(real_cwd)] = project_dir
         self._cwd_map_built = True
 
     @staticmethod
@@ -683,7 +803,7 @@ class ClaudeCodeCollector(BaseCollector):
         if not PROJECTS_DIR.exists():
             return
 
-        sync_prefix = "cc_jsonl:v3:"
+        sync_prefix = "cc_jsonl:v5:"
 
         for project_dir in PROJECTS_DIR.iterdir():
             if not project_dir.is_dir():
@@ -780,18 +900,37 @@ def _session_id_for_jsonl(project_dir: Path, jsonl_file: Path, default: str) -> 
     return default
 
 
-def _usage_rows_cost(rows: list[dict]) -> float:
+def _usage_rows_cost(rows: list[dict]) -> float | None:
     """Estimate cost using each bucket's own model."""
-    return sum(
-        estimate_cost(
-            row.get("model") or "",
-            input_tokens=int(row.get("input_tokens") or 0),
-            output_tokens=int(row.get("output_tokens") or 0),
-            cache_read_tokens=int(row.get("cache_read_tokens") or 0),
-            cache_creation_tokens=int(row.get("cache_creation_tokens") or 0),
-        )
-        for row in rows
-    )
+    total = 0.0
+    for row in rows:
+        if "estimated_cost_usd" in row:
+            cost = row["estimated_cost_usd"]
+        else:
+            cost = estimate_cost(
+                row.get("model") or "",
+                input_tokens=int(row.get("input_tokens") or 0),
+                output_tokens=int(row.get("output_tokens") or 0),
+                cache_read_tokens=int(row.get("cache_read_tokens") or 0),
+                cache_creation_tokens=int(row.get("cache_creation_tokens") or 0),
+                service_tier=str(row.get("service_tier") or ""),
+                apply_long_context=False,
+            )
+        if cost is None:
+            return None
+        total += float(cost)
+    return total
+
+
+def _extract_service_tier(payload: object) -> str:
+    """Extract provider speed/processing tier from a Claude usage payload."""
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("service_tier", "serviceTier", "speed"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip().lower()
+    return ""
 
 
 def _local_bucket(ts: str) -> tuple[str, int]:

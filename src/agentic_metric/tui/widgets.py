@@ -22,8 +22,10 @@ def fmt_tokens(n: int) -> str:
     return str(n)
 
 
-def fmt_cost(usd: float) -> str:
+def fmt_cost(usd: float | None, *, unknown: bool = False) -> str:
     """Format a USD cost value with thousands separator."""
+    if unknown or usd is None:
+        return "?"
     if usd >= 1.0:
         return f"${usd:,.2f}"
     return f"${usd:.3f}"
@@ -80,10 +82,12 @@ class SummaryCell(Static):
         super().__init__(**kwargs)
         self.label = label
         self.cost = 0.0
+        self.cost_unknown = False
         self.sessions = 0
         self.tokens = 0
         self.active = 0
         self.prev_cost: float | None = None
+        self.prev_cost_unknown = False
         self.sparkline: list[float] = []
         self.focused_view = False
 
@@ -99,18 +103,24 @@ class SummaryCell(Static):
         self, cost: float, sessions: int, tokens: int,
         active: int = 0, prev_cost: float | None = None,
         sparkline: list[float] | None = None,
+        cost_unknown: bool = False,
+        prev_cost_unknown: bool = False,
     ) -> None:
         self.cost = cost
+        self.cost_unknown = cost_unknown
         self.sessions = sessions
         self.tokens = tokens
         self.active = active
         self.prev_cost = prev_cost
+        self.prev_cost_unknown = prev_cost_unknown
         if sparkline is not None:
             self.sparkline = sparkline
         self.refresh()
 
     def _delta(self) -> tuple[str, str] | None:
         """Return (text, style) for the delta line, or None."""
+        if self.cost_unknown or self.prev_cost_unknown:
+            return None
         if self.prev_cost is None:
             return None
         if self.prev_cost <= 0 and self.cost <= 0:
@@ -137,7 +147,7 @@ class SummaryCell(Static):
         t = Text()
         t.append(f" {self.label} ", style=label_style)
         t.append("\n\n")
-        t.append(fmt_cost(self.cost), style=cost_style)
+        t.append(fmt_cost(self.cost, unknown=self.cost_unknown), style=cost_style)
         # Delta line (if we have a prev period)
         delta = self._delta()
         if delta:
@@ -204,7 +214,7 @@ class PeriodicHeatmap(Static):
             "bright_red",   # 5: high
             "bright_red",   # 6: peak
         ]
-        max_v = max(b["cost"] for b in self._buckets) or 1.0
+        max_v = max((b.get("cost") or 0) for b in self._buckets) or 1.0
         levels = len(blocks)
 
         n = len(buckets := self._buckets)
@@ -234,12 +244,17 @@ class PeriodicHeatmap(Static):
         row_blocks.append(" ")
         row_labels.append(" ")
 
-        peak_idx = max(range(n), key=lambda i: buckets[i]["cost"])
-        total_cost = sum(b["cost"] for b in buckets)
-        total_tokens = sum(b["tokens"] for b in buckets)
+        known_peak_idx = max(range(n), key=lambda i: buckets[i].get("cost") or 0)
+        unknown_peak_idx = next((i for i, b in enumerate(buckets) if _has_unknown_cost(b)), None)
+        peak_idx = known_peak_idx if (buckets[known_peak_idx].get("cost") or 0) > 0 else (
+            unknown_peak_idx if unknown_peak_idx is not None else known_peak_idx
+        )
+        total_cost = sum(b.get("cost") or 0 for b in buckets)
+        total_unknown = any(_has_unknown_cost(b) for b in buckets)
+        total_tokens = sum(b.get("tokens") or 0 for b in buckets)
 
         for i, b in enumerate(buckets):
-            ratio = b["cost"] / max_v
+            ratio = (b.get("cost") or 0) / max_v
             lvl = min(levels - 1, int(round(ratio * (levels - 1))))
             block = blocks[lvl]
             style = colors[lvl]
@@ -259,14 +274,15 @@ class PeriodicHeatmap(Static):
         peak_b = buckets[peak_idx]
         summary = Text()
         summary.append("  ")
-        if peak_b["cost"] > 0:
+        peak_unknown = _has_unknown_cost(peak_b)
+        if (peak_b.get("cost") or 0) > 0 or peak_unknown:
             summary.append("peak ", style="white")
             summary.append(peak_b["label"], style="bold")
-            summary.append(f"  ${peak_b['cost']:,.2f}", style="bright_yellow")
-            summary.append(f"  {_fmt_tokens_shared(peak_b['tokens'])}", style="bright_cyan")
+            summary.append(f"  {fmt_cost(peak_b.get('cost'), unknown=peak_unknown)}", style="bright_yellow")
+            summary.append(f"  {_fmt_tokens_shared(peak_b.get('tokens') or 0)}", style="bright_cyan")
             summary.append("    ")
         summary.append("total ", style="white")
-        summary.append(f"${total_cost:,.2f}", style="bold bright_yellow")
+        summary.append(fmt_cost(total_cost, unknown=total_unknown), style="bold bright_yellow")
         summary.append(f"  {_fmt_tokens_shared(total_tokens)} tokens", style="bright_cyan")
 
         t = Text()
@@ -336,25 +352,28 @@ class Breakdown(Static):
             return Text("  No activity in the selected range.", style="white")
 
         total = max(self._total_cost, 1e-9)
+        total_unknown = any(_has_unknown_cost(g) for g in self._groups)
         t = Text()
         for i, g in enumerate(self._groups):
             agent = g["agent"]
             cost = g["cost"]
+            unknown = _has_unknown_cost(g)
             ratio = cost / total
             pct = ratio * 100
 
             # Agent line — magenta, bold
             t.append(f"  {agent:<14}", style="bold bright_magenta")
-            t.append(f" {fmt_cost(cost):>10} ", style="bold bright_yellow")
+            t.append(f" {fmt_cost(cost, unknown=unknown):>10} ", style="bold bright_yellow")
             t.append_text(self._bar(ratio))
-            t.append(f" {pct:>4.1f}%\n", style="white")
+            t.append("   — \n" if unknown or total_unknown else f" {pct:>4.1f}%\n", style="white")
             t.append("    ")
             t.append(self._split(g), style="white")
             t.append("\n")
 
             # Model rows: keep the panel readable, then roll up the tail.
             raw_models = g.get("models", []) or []
-            nonzero = [m for m in raw_models if (m.get("cost") or 0) > 0]
+            nonzero = [m for m in raw_models if (m.get("cost") or 0) > 0 or _has_unknown_cost(m)]
+            nonzero.sort(key=lambda m: (0 if _has_unknown_cost(m) else 1, -(m.get("cost") or 0)))
             visible = nonzero[: self._visible_model_limit]
             hidden = nonzero[self._visible_model_limit :]
             for j, m in enumerate(visible):
@@ -363,10 +382,11 @@ class Breakdown(Static):
                 t.append(f"    {connector} ", style="white")
                 model_name = m.get("model") or "(unknown)"
                 t.append(f"{model_name:<28}", style="bright_cyan")
-                t.append(f" {fmt_cost(m['cost']):>10}", style="bright_yellow")
+                t.append(f" {fmt_cost(m.get('cost'), unknown=_has_unknown_cost(m)):>10}", style="bright_yellow")
                 t.append(f"  {self._split(m)}\n", style="white")
             if hidden:
                 hidden_cost = sum(m.get("cost") or 0 for m in hidden)
+                hidden_unknown = any(_has_unknown_cost(m) for m in hidden)
                 hidden_tokens = sum(m.get("tokens") or 0 for m in hidden)
                 hidden_row = {
                     "input": sum(m.get("input") or 0 for m in hidden),
@@ -375,9 +395,13 @@ class Breakdown(Static):
                 }
                 t.append("    └─ ", style="white")
                 t.append(f"+{len(hidden)} more models".ljust(28), style="white")
-                t.append(f" {fmt_cost(hidden_cost):>10}", style="bright_yellow")
+                t.append(f" {fmt_cost(hidden_cost, unknown=hidden_unknown):>10}", style="bright_yellow")
                 t.append(f"  {self._split(hidden_row)}")
                 t.append(f"  total {fmt_tokens(hidden_tokens)}\n", style="white")
             t.append("\n")
 
         return t
+
+
+def _has_unknown_cost(row: dict | None) -> bool:
+    return bool(row and (row.get("unknown_cost_count") or 0) > 0)
