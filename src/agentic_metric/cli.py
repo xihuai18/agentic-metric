@@ -36,18 +36,18 @@ console = Console()
 
 # ANSI named colors — inherit the terminal's own palette / theme.
 # No hard-coded hex, so output adapts to light/dark terminals equally well.
-C_TEXT     = "default"
+C_TEXT     = "bright_white"
 C_SUBTEXT  = "bright_white"
-C_MUTED    = "bright_black"
-C_RED      = "red"
-C_PEACH    = "yellow"
-C_YELLOW   = "yellow"
-C_GREEN    = "green"
-C_TEAL     = "cyan"
-C_SKY      = "cyan"
-C_BLUE     = "blue"
-C_MAUVE    = "magenta"
-C_SURFACE1 = "bright_black"
+C_MUTED    = "white"
+C_RED      = "bright_red"
+C_PEACH    = "bright_yellow"
+C_YELLOW   = "bright_yellow"
+C_GREEN    = "bright_green"
+C_TEAL     = "bright_cyan"
+C_SKY      = "bright_blue"
+C_BLUE     = "bright_blue"
+C_MAUVE    = "bright_magenta"
+C_SURFACE1 = "white"
 
 
 def _version_callback(value: bool) -> None:
@@ -66,7 +66,8 @@ def _default(
 ) -> None:
     """Launch TUI by default when no command is given."""
     if ctx.invoked_subcommand is None:
-        tui()
+        _run_tui()
+        raise typer.Exit()
 
 
 @pricing_app.callback(invoke_without_command=True)
@@ -78,6 +79,11 @@ def _pricing_default(ctx: typer.Context) -> None:
 
 @app.command()
 def tui() -> None:
+    """Launch the interactive TUI dashboard."""
+    _run_tui()
+
+
+def _run_tui() -> None:
     """Launch the interactive TUI dashboard."""
     from .tui.app import AgenticMetricApp
     AgenticMetricApp().run()
@@ -343,10 +349,10 @@ def _auto_summary_line(
             peak_label = peak["label"]
             if focus_kind == "today":
                 peak_label = f"{peak_label}:00"
-            parts.append(("yellow", f"peak {peak_label} ${peak['cost']:,.2f}"))
+            parts.append((C_YELLOW, f"peak {peak_label} ${peak['cost']:,.2f}"))
 
     if cache_pct >= 0 and cache_pct >= 50:
-        parts.append(("green", f"cache {cache_pct:.0f}%"))
+        parts.append((C_GREEN, f"cache {cache_pct:.0f}%"))
 
     if prev_totals is not None:
         prev = prev_totals.get("estimated_cost_usd") or 0.0
@@ -354,11 +360,11 @@ def _auto_summary_line(
         if prev > 0 and cur > 0:
             ratio = cur / prev
             if ratio >= 10:
-                parts.append(("red", "▲ ≫10× vs last"))
+                parts.append((C_RED, "▲ ≫10× vs last"))
             elif ratio > 1.01:
-                parts.append(("red", f"▲ +{(ratio - 1) * 100:.0f}% vs last"))
+                parts.append((C_RED, f"▲ +{(ratio - 1) * 100:.0f}% vs last"))
             elif ratio < 0.99:
-                parts.append(("green", f"▼ -{(1 - ratio) * 100:.0f}% vs last"))
+                parts.append((C_GREEN, f"▼ -{(1 - ratio) * 100:.0f}% vs last"))
 
     if not parts:
         return None
@@ -376,11 +382,11 @@ def _build_heatmap_panel(buckets: list[dict], focus_kind: str) -> Panel:
     blocks = [" ", "·", "░", "▒", "▓", "█", "█"]
     colors = [
         "default",
-        "bright_black",
-        "green",
+        C_BLUE,
+        C_GREEN,
         "bright_green",
-        "yellow",
-        "red",
+        C_YELLOW,
+        C_RED,
         "bright_red",
     ]
     levels = len(blocks)
@@ -421,7 +427,7 @@ def _build_heatmap_panel(buckets: list[dict], focus_kind: str) -> Panel:
             style = f"bold {style} reverse"
         row_blocks.append(blocks[lvl] * cell_w, style=style)
         if i % label_every == 0:
-            row_labels.append(b["label"][:cell_w].center(cell_w), style="bright_black")
+            row_labels.append(b["label"][:cell_w].center(cell_w), style=C_MUTED)
         else:
             row_labels.append(" " * cell_w, style="default")
 
@@ -800,7 +806,7 @@ def _build_periodic_table(periodic: list[dict], focus_kind: str | None) -> Table
         bar.append("░" * (bar_width - fill), style=C_SURFACE1)
         label_col = b["label"]
         if b.get("sublabel"):
-            label_col = f"{label_col}  [dim]{b['sublabel']}[/dim]"
+            label_col = f"{label_col}  [{C_MUTED}]{b['sublabel']}[/{C_MUTED}]"
         tbl.add_row(
             label_col,
             f"{b['session_count']:,}",

@@ -227,26 +227,26 @@ class AgenticMetricApp(App):
         has_driver = False
         if peak_rows:
             peak = peak_rows[0]
-            line.append(" driver ", style="bright_black")
-            line.append(_bucket_label(peak), style="bold blue")
-            line.append("  ", style="bright_black")
-            line.append(f"{peak['agent_type']} / {peak['model']}", style="cyan")
-            line.append("  ", style="bright_black")
-            line.append(fmt_cost(peak["estimated_cost_usd"] or 0.0), style="bold yellow")
-            line.append("  ", style="bright_black")
-            line.append(_split_label(peak), style="bright_black")
+            line.append(" driver ", style="white")
+            line.append(_bucket_label(peak), style="bold bright_blue")
+            line.append("  ", style="white")
+            line.append(f"{peak['agent_type']} / {peak['model']}", style="bright_cyan")
+            line.append("  ", style="white")
+            line.append(fmt_cost(peak["estimated_cost_usd"] or 0.0), style="bold bright_yellow")
+            line.append("  ", style="white")
+            line.append(_split_label(peak), style="white")
             has_driver = True
         if project_rows and (project_rows[0].get("estimated_cost_usd") or 0) > 0:
             if peak_rows:
-                line.append("    ", style="bright_black")
+                line.append("    ", style="white")
             project = project_rows[0]
-            line.append(" project ", style="bright_black")
-            line.append(_short_path(project["project_path"]), style="blue")
-            line.append("  ", style="bright_black")
-            line.append(fmt_cost(project["estimated_cost_usd"] or 0.0), style="yellow")
+            line.append(" project ", style="white")
+            line.append(_short_path(project["project_path"]), style="bright_blue")
+            line.append("  ", style="white")
+            line.append(fmt_cost(project["estimated_cost_usd"] or 0.0), style="bright_yellow")
             has_driver = True
         if not has_driver:
-            line.append(" no cost drivers in this period", style="bright_black")
+            line.append(" no cost drivers in this period", style="white")
 
         self.query_one("#driver-line", Static).update(line)
 
@@ -305,7 +305,7 @@ class AgenticMetricApp(App):
         xs = list(range(len(data)))
         max_y = max(ys) or 1
 
-        plt.bar(xs, ys, marker="sd", color="orange+")
+        plt.bar(xs, ys, marker="sd", color="yellow+")
         # show ~6 ticks to avoid crowding
         step = max(1, len(xs) // 6)
         plt.xticks(xs[::step], labels[::step])
@@ -320,14 +320,14 @@ class AgenticMetricApp(App):
         for x, y in zip(xs, ys):
             if y >= threshold:
                 plt.text(_fmt_bar_label(y), x=x, y=y + max_y * 0.05,
-                         alignment="center", color="yellow")
+                         alignment="center", color="cyan+")
 
         # Let the chart fill whatever the chart-panel gives it rather than
         # pinning a hard-coded height.
         plot_widget.refresh()
 
         title = self.query_one("#chart-title", Static)
-        title.update(Text.from_markup(f"[bold]Trend[/] — [dim]{span_label}[/]"))
+        title.update(Text.from_markup(f"[bold]Trend[/] — [bright_white]{span_label}[/]"))
 
     def _populate_breakdown(self) -> None:
         label, frm, to = resolve_range(self._focus, offset=self._offset)
@@ -370,7 +370,7 @@ class AgenticMetricApp(App):
 
         title_widget = self.query_one("#breakdown-title", Static)
         title_widget.update(Text.from_markup(
-            f"[bold]By agent × model[/] — [cyan]{label}[/] [dim]({frm} → {to})[/]"
+            f"[bold]By agent × model[/] — [bright_cyan]{label}[/] [white]({frm} → {to})[/]"
         ))
         self.query_one("#breakdown-body", Breakdown).update_data(groups, total_cost)
 

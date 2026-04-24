@@ -116,24 +116,24 @@ class SummaryCell(Static):
         if self.prev_cost <= 0 and self.cost <= 0:
             return None
         if self.prev_cost <= 0:
-            return ("▲ new", "yellow")
+            return ("▲ new", "bright_yellow")
         ratio = self.cost / self.prev_cost
         if abs(self.cost - self.prev_cost) < 0.01 or abs(ratio - 1.0) < 0.01:
-            return ("≈ flat", "bright_black")
+            return ("≈ flat", "white")
         if self.cost > self.prev_cost:
             if ratio >= 10:
-                return ("▲ ≫10×", "red")
+                return ("▲ ≫10×", "bright_red")
             pct = (ratio - 1) * 100
-            return (f"▲ +{pct:.0f}%", "red")
+            return (f"▲ +{pct:.0f}%", "bright_red")
         pct = (1 - ratio) * 100
-        return (f"▼ -{pct:.0f}%", "green")
+        return (f"▼ -{pct:.0f}%", "bright_green")
 
     def render(self) -> Text:
         # Use ANSI named colors so we inherit the terminal's palette.
         label_style = (
-            "bold black on yellow" if self.focused_view else "bold bright_black"
+            "bold black on bright_yellow" if self.focused_view else "bold bright_white"
         )
-        cost_style = "bold yellow reverse" if self.focused_view else "bold yellow"
+        cost_style = "bold bright_yellow reverse" if self.focused_view else "bold bright_yellow"
         t = Text()
         t.append(f" {self.label} ", style=label_style)
         t.append("\n\n")
@@ -146,14 +146,14 @@ class SummaryCell(Static):
         t.append("\n")
         # Sparkline (trend of the last N buckets for this focus)
         if self.sparkline:
-            t.append(fmt_sparkline(self.sparkline), style="cyan")
+            t.append(fmt_sparkline(self.sparkline), style="bright_cyan")
             t.append("\n")
-        t.append(f"{self.sessions:,} sessions", style="bright_black")
+        t.append(f"{self.sessions:,} sessions", style="white")
         t.append("  ")
-        t.append(f"{fmt_tokens(self.tokens)} tok", style="bright_black")
+        t.append(f"{fmt_tokens(self.tokens)} tok", style="white")
         if self.active:
             t.append("  ")
-            t.append(f"● {self.active} live", style="bold green")
+            t.append(f"● {self.active} live", style="bold bright_green")
         return t
 
 
@@ -188,7 +188,7 @@ class PeriodicHeatmap(Static):
 
     def render(self) -> Text:
         if not self._buckets:
-            return Text("  (no data)", style="bright_black")
+            return Text("  (no data)", style="white")
 
         # 7-level low → hot gradient. Keeps block-character steps so
         # the strip still reads without color support, but when colors
@@ -197,11 +197,11 @@ class PeriodicHeatmap(Static):
         blocks = [" ", "·", "░", "▒", "▓", "█", "█"]
         colors = [
             "default",      # 0: idle
-            "bright_black", # 1: trace
-            "green",        # 2: low
-            "bright_green", # 3: low-mid
-            "yellow",       # 4: mid
-            "red",          # 5: high
+            "bright_blue",  # 1: trace
+            "bright_green", # 2: low
+            "bright_cyan",  # 3: low-mid
+            "bright_yellow",# 4: mid
+            "bright_red",   # 5: high
             "bright_red",   # 6: peak
         ]
         max_v = max(b["cost"] for b in self._buckets) or 1.0
@@ -252,7 +252,7 @@ class PeriodicHeatmap(Static):
 
             if i % label_every == 0:
                 label = b["label"][:cell_w]
-                row_labels.append(label.center(cell_w), style="bright_black")
+                row_labels.append(label.center(cell_w), style="white")
             else:
                 row_labels.append(" " * cell_w, style="default")
 
@@ -260,14 +260,14 @@ class PeriodicHeatmap(Static):
         summary = Text()
         summary.append("  ")
         if peak_b["cost"] > 0:
-            summary.append("peak ", style="bright_black")
+            summary.append("peak ", style="white")
             summary.append(peak_b["label"], style="bold")
-            summary.append(f"  ${peak_b['cost']:,.2f}", style="yellow")
-            summary.append(f"  {_fmt_tokens_shared(peak_b['tokens'])}", style="cyan")
+            summary.append(f"  ${peak_b['cost']:,.2f}", style="bright_yellow")
+            summary.append(f"  {_fmt_tokens_shared(peak_b['tokens'])}", style="bright_cyan")
             summary.append("    ")
-        summary.append("total ", style="bright_black")
-        summary.append(f"${total_cost:,.2f}", style="bold yellow")
-        summary.append(f"  {_fmt_tokens_shared(total_tokens)} tokens", style="cyan")
+        summary.append("total ", style="white")
+        summary.append(f"${total_cost:,.2f}", style="bold bright_yellow")
+        summary.append(f"  {_fmt_tokens_shared(total_tokens)} tokens", style="bright_cyan")
 
         t = Text()
         t.append_text(row_blocks)
@@ -319,8 +319,8 @@ class Breakdown(Static):
         filled = int(round(ratio * width))
         filled = max(0, min(width, filled))
         bar = Text()
-        bar.append("█" * filled, style="bold cyan")
-        bar.append("░" * (width - filled), style="bright_black")
+        bar.append("█" * filled, style="bold bright_cyan")
+        bar.append("░" * (width - filled), style="white")
         return bar
 
     def _split(self, row: dict) -> str:
@@ -332,7 +332,7 @@ class Breakdown(Static):
 
     def render(self) -> Text:
         if not self._groups:
-            return Text("  No activity in the selected range.", style="bright_black")
+            return Text("  No activity in the selected range.", style="white")
 
         total = max(self._total_cost, 1e-9)
         t = Text()
@@ -343,12 +343,12 @@ class Breakdown(Static):
             pct = ratio * 100
 
             # Agent line — magenta, bold
-            t.append(f"  {agent:<14}", style="bold magenta")
-            t.append(f" {fmt_cost(cost):>10} ", style="bold yellow")
+            t.append(f"  {agent:<14}", style="bold bright_magenta")
+            t.append(f" {fmt_cost(cost):>10} ", style="bold bright_yellow")
             t.append_text(self._bar(ratio))
-            t.append(f" {pct:>4.1f}%\n", style="bright_black")
+            t.append(f" {pct:>4.1f}%\n", style="white")
             t.append("    ")
-            t.append(self._split(g), style="bright_black")
+            t.append(self._split(g), style="white")
             t.append("\n")
 
             # Model rows: keep the panel readable, then roll up the tail.
@@ -359,11 +359,11 @@ class Breakdown(Static):
             for j, m in enumerate(visible):
                 last = (j == len(visible) - 1 and not hidden)
                 connector = "└─" if last else "├─"
-                t.append(f"    {connector} ", style="bright_black")
+                t.append(f"    {connector} ", style="white")
                 model_name = m.get("model") or "(unknown)"
-                t.append(f"{model_name:<28}", style="cyan")
-                t.append(f" {fmt_cost(m['cost']):>10}", style="yellow")
-                t.append(f"  {self._split(m)}\n", style="bright_black")
+                t.append(f"{model_name:<28}", style="bright_cyan")
+                t.append(f" {fmt_cost(m['cost']):>10}", style="bright_yellow")
+                t.append(f"  {self._split(m)}\n", style="white")
             if hidden:
                 hidden_cost = sum(m.get("cost") or 0 for m in hidden)
                 hidden_tokens = sum(m.get("tokens") or 0 for m in hidden)
@@ -372,11 +372,11 @@ class Breakdown(Static):
                     "output": sum(m.get("output") or 0 for m in hidden),
                     "cache": sum(m.get("cache") or 0 for m in hidden),
                 }
-                t.append("    └─ ", style="bright_black")
-                t.append(f"+{len(hidden)} more models".ljust(28), style="bright_black")
-                t.append(f" {fmt_cost(hidden_cost):>10}", style="yellow")
+                t.append("    └─ ", style="white")
+                t.append(f"+{len(hidden)} more models".ljust(28), style="white")
+                t.append(f" {fmt_cost(hidden_cost):>10}", style="bright_yellow")
                 t.append(f"  {self._split(hidden_row)}")
-                t.append(f"  total {fmt_tokens(hidden_tokens)}\n", style="bright_black")
+                t.append(f"  total {fmt_tokens(hidden_tokens)}\n", style="white")
             t.append("\n")
 
         return t
