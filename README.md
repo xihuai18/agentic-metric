@@ -92,7 +92,7 @@ Overrides are stored in `$DATA/agentic_metric/pricing.json`.
 agentic-metric pricing list
 agentic-metric pricing set deepseek-r2 -i 0.5 -o 2.0
 agentic-metric pricing set claude-opus-4-7 -i 4.0 -o 20.0 -cr 0.4 -cw 5.0
-agentic-metric pricing long-context set gpt-5.5 --threshold 270000 -i 10 -o 45 -cr 1 -cw 0
+agentic-metric pricing long-context set gpt-5.5 --threshold 272000 -i 10 -o 45 -cr 1 -cw 0
 agentic-metric pricing long-context disable gpt-5.5
 agentic-metric pricing long-context enable gpt-5.5
 agentic-metric pricing cache set claude-sonnet-4 --write-1h 6

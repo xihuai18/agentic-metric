@@ -1258,7 +1258,7 @@ def pricing_long_context_set(
         console.print(f"[bold {C_TEXT}]Example:[/]")
         console.print(
             f"  [{C_MUTED}]agentic-metric pricing long-context set gpt-5.5 "
-            f"--threshold 270000 -i 10 -o 45 -cr 1 -cw 0[/]"
+            f"--threshold 272000 -i 10 -o 45 -cr 1 -cw 0[/]"
         )
         raise typer.Exit()
 
