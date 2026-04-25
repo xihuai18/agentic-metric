@@ -374,16 +374,20 @@ class Breakdown(Static):
             t.append("\n")
 
             # Model rows: keep the panel readable, then roll up the tail.
+            # Unknown models are always visible (before the fold), never hidden.
             raw_models = g.get("models", []) or []
             nonzero = [m for m in raw_models if (m.get("cost") or 0) > 0 or _has_unknown_cost(m)]
-            nonzero.sort(key=lambda m: (0 if _has_unknown_cost(m) else 1, -(m.get("cost") or 0)))
-            visible = nonzero[: self._visible_model_limit]
-            hidden = nonzero[self._visible_model_limit :]
+            known = sorted([m for m in nonzero if not _has_unknown_cost(m)], key=lambda m: -(m.get("cost") or 0))
+            unknown = sorted([m for m in nonzero if _has_unknown_cost(m)], key=lambda m: -(m.get("cost") or 0))
+            visible = known[: self._visible_model_limit] + unknown
+            hidden = known[self._visible_model_limit :]
             for j, m in enumerate(visible):
                 last = (j == len(visible) - 1 and not hidden)
                 connector = "└─" if last else "├─"
                 t.append(f"    {connector} ", style="white")
                 model_name = m.get("model") or "(unknown)"
+                if model_name == "Unknown" and m.get("raw_model"):
+                    model_name = f"Unknown: {m['raw_model']}"
                 t.append(f"{model_name:<28}", style="bright_cyan")
                 t.append(f" {fmt_cost(m.get('cost'), unknown=_has_unknown_cost(m)):>10}", style="bright_yellow")
                 t.append(f"  {self._split(m)}\n", style="white")

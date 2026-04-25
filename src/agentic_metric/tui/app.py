@@ -246,7 +246,10 @@ class AgenticMetricApp(App):
             line.append(" driver ", style="white")
             line.append(_bucket_label(peak), style="bold bright_blue")
             line.append("  ", style="white")
-            line.append(f"{peak['agent_type']} / {peak['model']}", style="bright_cyan")
+            peak_model = peak['model']
+            if peak_model == "Unknown" and peak.get("raw_model"):
+                peak_model = f"Unknown: {peak['raw_model']}"
+            line.append(f"{peak['agent_type']} / {peak_model}", style="bright_cyan")
             line.append("  ", style="white")
             line.append(
                 fmt_cost(peak.get("estimated_cost_usd"), unknown=peak_unknown),
@@ -387,6 +390,7 @@ class AgenticMetricApp(App):
             g["unknown_cost_count"] += r.get("unknown_cost_count") or 0
             g["models"].append({
                 "model": r["model"],
+                "raw_model": r.get("raw_model", ""),
                 "cost": r["estimated_cost_usd"] or 0.0,
                 "unknown_cost_count": r.get("unknown_cost_count") or 0,
                 "tokens": model_tokens,
@@ -396,8 +400,6 @@ class AgenticMetricApp(App):
             })
 
         groups = sorted(groups_by_agent.values(), key=lambda g: -g["cost"])
-        for g in groups:
-            g["models"].sort(key=lambda m: (0 if _has_unknown_cost(m) else 1, -(m.get("cost") or 0)))
 
         total_cost = sum(g["cost"] for g in groups)
 

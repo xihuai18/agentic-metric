@@ -356,14 +356,16 @@ def get_model_breakdown(db: Database, days: int = 30) -> list[dict]:
            FROM {usage}
            WHERE usage_date >= ? AND model != ''
            GROUP BY model
-           ORDER BY unknown_cost_count DESC, estimated_cost_usd DESC
+           ORDER BY estimated_cost_usd DESC, unknown_cost_count DESC
         """,
         (cutoff,),
     ).fetchall()
     out = []
     for r in rows:
         row = dict(r)
-        row["model"] = _model_label(row.pop("raw_model") or "")
+        raw = row.pop("raw_model") or ""
+        row["raw_model"] = raw
+        row["model"] = _model_label(raw)
         out.append(row)
     return out
 
@@ -402,7 +404,9 @@ def get_today_sessions(db: Database) -> list[dict]:
     out = []
     for r in rows:
         row = dict(r)
-        row["model"] = _model_label(row.get("model") or "")
+        raw = row.get("model") or ""
+        row["raw_model"] = raw
+        row["model"] = _model_label(raw)
         out.append(row)
     return out
 
@@ -522,7 +526,7 @@ def get_range_by_agent(db: Database, from_date: str, to_date: str) -> list[dict]
            FROM {usage}
            WHERE usage_date BETWEEN ? AND ?
            GROUP BY agent_type
-           ORDER BY unknown_cost_count DESC, estimated_cost_usd DESC
+           ORDER BY estimated_cost_usd DESC, unknown_cost_count DESC
         """,
         (from_date, to_date),
     ).fetchall()
@@ -548,14 +552,16 @@ def get_range_by_agent_model(db: Database, from_date: str, to_date: str) -> list
            FROM {usage}
            WHERE usage_date BETWEEN ? AND ?
            GROUP BY agent_type, model
-           ORDER BY agent_type, unknown_cost_count DESC, estimated_cost_usd DESC
+           ORDER BY agent_type, estimated_cost_usd DESC, unknown_cost_count DESC
         """,
         (from_date, to_date),
     ).fetchall()
     out = []
     for r in rows:
         row = dict(r)
-        row["model"] = _model_label(row.pop("raw_model") or "")
+        raw = row.pop("raw_model") or ""
+        row["raw_model"] = raw
+        row["model"] = _model_label(raw)
         out.append(row)
     return out
 
@@ -577,7 +583,7 @@ def get_range_by_project(db: Database, from_date: str, to_date: str, limit: int 
            FROM {usage}
            WHERE usage_date BETWEEN ? AND ?
            GROUP BY project_path
-           ORDER BY unknown_cost_count DESC, estimated_cost_usd DESC
+           ORDER BY estimated_cost_usd DESC, unknown_cost_count DESC
            LIMIT ?
         """,
         (from_date, to_date, limit),
@@ -605,7 +611,7 @@ def get_range_by_time_model(db: Database, from_date: str, to_date: str, limit: i
            WHERE usage_date BETWEEN ? AND ?
            GROUP BY usage_date, usage_hour, agent_type, model
            HAVING COALESCE(SUM(estimated_cost_usd), 0) > 0 OR {_unknown_cost_expr()} > 0
-           ORDER BY unknown_cost_count DESC, estimated_cost_usd DESC
+           ORDER BY estimated_cost_usd DESC, unknown_cost_count DESC
            LIMIT ?
         """,
         (from_date, to_date, limit),
@@ -613,8 +619,13 @@ def get_range_by_time_model(db: Database, from_date: str, to_date: str, limit: i
     out = []
     for r in rows:
         row = dict(r)
-        row["model"] = _model_label(row.pop("raw_model") or "")
+        raw = row.pop("raw_model") or ""
+        row["raw_model"] = raw
+        row["model"] = _model_label(raw)
         out.append(row)
+    # Re-sort: known rows by cost desc first, unknown (cost=0) rows at the end.
+    # This preserves unknown rows that SQL LIMIT kept while avoiding top position.
+    out.sort(key=lambda r: (1 if (r.get("unknown_cost_count") or 0) > 0 and (r.get("estimated_cost_usd") or 0) == 0 else 0, -(r.get("estimated_cost_usd") or 0)))
     return out
 
 
@@ -653,7 +664,7 @@ def get_range_top_sessions(db: Database, from_date: str, to_date: str, limit: in
            WHERE u.usage_date BETWEEN ? AND ?
            GROUP BY u.session_id, u.agent_type
            HAVING COALESCE(SUM(u.estimated_cost_usd), 0) > 0 OR {_unknown_cost_expr("u.estimated_cost_usd")} > 0
-           ORDER BY unknown_cost_count DESC, estimated_cost_usd DESC
+           ORDER BY estimated_cost_usd DESC, unknown_cost_count DESC
            LIMIT ?
         """,
         (from_date, to_date, limit),
@@ -661,8 +672,11 @@ def get_range_top_sessions(db: Database, from_date: str, to_date: str, limit: in
     out = []
     for r in rows:
         row = dict(r)
-        row["model"] = _model_label(row.get("model") or "")
+        raw_primary = row.get("model") or ""
+        row["raw_model"] = raw_primary
+        row["model"] = _model_label(raw_primary)
         raw_models = [m.strip() for m in (row.get("models") or "").split(",") if m.strip()]
+        row["raw_models"] = ",".join(raw_models)
         models = []
         for model in raw_models:
             label = _model_label(model)
@@ -672,6 +686,8 @@ def get_range_top_sessions(db: Database, from_date: str, to_date: str, limit: in
             models.append("Unknown")
         row["models"] = ",".join(models)
         out.append(row)
+    # Re-sort: known sessions by cost desc, unknown (cost=0) at the end.
+    out.sort(key=lambda r: (1 if (r.get("unknown_cost_count") or 0) > 0 and (r.get("estimated_cost_usd") or 0) == 0 else 0, -(r.get("estimated_cost_usd") or 0)))
     return out
 
 

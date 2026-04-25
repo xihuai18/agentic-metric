@@ -13,6 +13,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from .pricing import is_model_priced
 from .formatting import (
     cache_hit_rate as _cache_hit_rate,
     cache_tokens as _cache_tokens,
@@ -580,7 +581,10 @@ def _driver_summary_line(
         line.append("Peak bucket  ", style=C_MUTED)
         line.append(_time_bucket_label(peak), style=f"bold {C_BLUE}")
         line.append(" · ", style=C_MUTED)
-        line.append(f"{peak['agent_type']} / {peak['model']}", style=C_SKY)
+        peak_model = peak['model']
+        if peak_model == "Unknown" and peak.get("raw_model"):
+            peak_model = f"Unknown: {peak['raw_model']}"
+        line.append(f"{peak['agent_type']} / {peak_model}", style=C_SKY)
         line.append(f" · {_fmt_cost(peak['estimated_cost_usd'], unknown=peak_unknown)}", style=f"bold {C_YELLOW}")
         line.append(_share_suffix(peak["estimated_cost_usd"], total_cost, unknown=peak_unknown, total_unknown=total_unknown), style=C_MUTED)
         wrote = True
@@ -659,9 +663,12 @@ def _build_time_model_table(rows: list[dict], total_cost: float, *, total_unknow
     for row in rows[:8]:
         cost = row["estimated_cost_usd"] or 0.0
         unknown = _has_unknown_cost(row)
+        model_label = row['model']
+        if model_label == "Unknown" and row.get("raw_model"):
+            model_label = f"Unknown: {row['raw_model']}"
         cells = [
             _time_bucket_label(row) if wide else _time_bucket_label_short(row),
-            _clip(f"{row['agent_type']}/{row['model']}", 28 if wide else 18),
+            _clip(f"{row['agent_type']}/{model_label}", 28 if wide else 18),
         ]
         if wide:
             cells.append(f"{row['session_count']:,}")
@@ -704,7 +711,13 @@ def _build_top_sessions_table(rows: list[dict], total_cost: float, *, total_unkn
     for row in rows[:8]:
         cost = row["estimated_cost_usd"] or 0.0
         unknown = _has_unknown_cost(row)
-        models = _clip((row.get("models") or row.get("model") or "(unknown)").replace(",", ", "), 28)
+        models_str = row.get("models") or row.get("model") or "(unknown)"
+        if "Unknown" in models_str and row.get("raw_models"):
+            raw_list = [m.strip() for m in row["raw_models"].split(",") if m.strip()]
+            unknown_raw = [m for m in raw_list if not is_model_priced(m)]
+            if unknown_raw:
+                models_str = models_str.replace("Unknown", f"Unknown: {','.join(unknown_raw)}", 1)
+        models = _clip(models_str.replace(",", ", "), 28)
         prompt = (row.get("first_prompt") or "").strip()
         prompt_or_project = prompt if prompt else _short_path(row.get("project_path") or "")
         cells = [
@@ -785,9 +798,12 @@ def _build_by_agent_model_table(rows: list[dict]) -> Table | None:
     for r in nonzero:
         shown_agent = r["agent_type"] if r["agent_type"] != current_agent else ""
         current_agent = r["agent_type"]
+        model_display = r["model"]
+        if model_display == "Unknown" and r.get("raw_model"):
+            model_display = f"Unknown: {r['raw_model']}"
         tbl.add_row(
             shown_agent,
-            r["model"],
+            model_display,
             f"{r['session_count']:,}",
             _fmt_tokens(r.get("input_tokens") or 0),
             _fmt_tokens(r.get("output_tokens") or 0),

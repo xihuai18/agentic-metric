@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.3.1 (2026-04-25)
+
+### Improvements
+
+- **Unknown model identity**: unknown models now display as
+  `Unknown: <raw-model-id>` (e.g. `Unknown: gpt-5.4-pro`) in both TUI
+  and CLI, so users can see which actual model IDs lack pricing.
+- **Unknown model sort order**: unknown models no longer appear at the top
+  of breakdowns; they are sorted after known models but before the
+  collapsed "+N more models" fold, ensuring they remain visible without
+  dominating the view.
+
 ## v0.3.0 (2026-04-25)
 
 ### Improvements
