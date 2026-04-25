@@ -29,7 +29,17 @@ pricing_app = typer.Typer(
     invoke_without_command=True,
     context_settings={"help_option_names": ["-h", "--help"]},
 )
+long_context_app = typer.Typer(
+    help="Manage request-size long-context pricing.",
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
+cache_pricing_app = typer.Typer(
+    help="Manage cache-duration pricing.",
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
 app.add_typer(pricing_app, name="pricing")
+pricing_app.add_typer(long_context_app, name="long-context")
+pricing_app.add_typer(cache_pricing_app, name="cache")
 
 
 console = Console()
@@ -162,9 +172,12 @@ def report(
             label, frm, to = aggregator.resolve_range("today")
 
     db = Database()
-    if not no_sync:
+    if db.pricing_changed and no_sync:
+        console.print(f"[{C_YELLOW}]Pricing changed; syncing history to refresh event-level costs.[/]")
+    if db.pricing_changed or not no_sync:
         registry = create_default_registry()
         registry.sync_all(db)
+        db.commit()
 
     totals = aggregator.get_range_totals(db, frm, to)
     by_agent = aggregator.get_range_by_agent(db, frm, to)
@@ -1050,10 +1063,31 @@ def _delta_line(
 # ── pricing subcommands ────────────────────────────────────────────
 
 
+def _refresh_history_after_pricing_change() -> None:
+    """Re-read local history so event-level pricing reflects the new rules."""
+    from .collectors import create_default_registry
+    from .store.database import Database
+
+    db = Database()
+    try:
+        if db.pricing_changed:
+            registry = create_default_registry()
+            registry.sync_all(db)
+            db.commit()
+            console.print(f"[bold {C_GREEN}]✓[/] Repriced history from local event data.")
+    finally:
+        db.close()
+
+
 @pricing_app.command("list")
 def pricing_list() -> None:
-    """List all model pricing (builtin + user overrides)."""
-    from .pricing import _BUILTIN_PRICING, _load_user_pricing
+    """List model pricing plus long-context and cache-duration rules."""
+    from .pricing import (
+        _BUILTIN_PRICING,
+        _load_user_pricing,
+        get_long_context_rules,
+        get_user_cache_pricing,
+    )
 
     user = _load_user_pricing()
 
@@ -1098,6 +1132,62 @@ def pricing_list() -> None:
 
     console.print(table)
 
+    lc_rows = get_long_context_rules(include_disabled=True)
+    if lc_rows:
+        lc_table = Table(
+            title="Long Context Pricing (USD per 1M tokens)",
+            title_style=f"bold {C_TEXT}",
+            box=box.SIMPLE_HEAVY,
+            border_style=C_SURFACE1,
+            header_style=f"bold {C_SUBTEXT}",
+            pad_edge=False,
+        )
+        lc_table.add_column("Model Prefix", style=C_MAUVE)
+        lc_table.add_column("Threshold", justify="right", style=C_TEAL)
+        lc_table.add_column("Input", justify="right", style=C_TEAL)
+        lc_table.add_column("Output", justify="right", style=C_TEAL)
+        lc_table.add_column("Cache Read", justify="right", style=C_SKY)
+        lc_table.add_column("Cache Write", justify="right", style=C_SKY)
+        lc_table.add_column("Source", style=C_MUTED)
+        for rule in lc_rows:
+            prefixes = ", ".join(str(p) for p in rule["prefixes"])
+            prices = tuple(float(v) for v in rule["prices"])
+            source = str(rule.get("source") or "builtin")
+            source_style = C_PEACH if source == "user" else (C_RED if source == "disabled" else C_MUTED)
+            lc_table.add_row(
+                prefixes,
+                f"{int(rule['threshold']):,}",
+                f"${prices[0]:.3f}",
+                f"${prices[1]:.3f}",
+                f"${prices[2]:.3f}",
+                f"${prices[3]:.3f}",
+                Text(source, style=source_style),
+            )
+        console.print()
+        console.print(lc_table)
+
+    cache_rows = get_user_cache_pricing()
+    if cache_rows:
+        cache_table = Table(
+            title="Cache Duration Overrides (USD per 1M tokens)",
+            title_style=f"bold {C_TEXT}",
+            box=box.SIMPLE_HEAVY,
+            border_style=C_SURFACE1,
+            header_style=f"bold {C_SUBTEXT}",
+            pad_edge=False,
+        )
+        cache_table.add_column("Model Prefix", style=C_MAUVE)
+        cache_table.add_column("1h Write", justify="right", style=C_SKY)
+        cache_table.add_column("Source", style=C_MUTED)
+        for model, rule in sorted(cache_rows.items()):
+            cache_table.add_row(
+                model,
+                f"${float(rule['write_1h']):.3f}" if "write_1h" in rule else "",
+                Text("user", style=C_PEACH),
+            )
+        console.print()
+        console.print(cache_table)
+
 
 @pricing_app.command("set", context_settings={"help_option_names": ["-h", "--help"]})
 def pricing_set(
@@ -1125,6 +1215,7 @@ def pricing_set(
         f"input=[{C_TEAL}]${input_price:.3f}[/]  output=[{C_TEAL}]${output_price:.3f}[/]  "
         f"cache_read=[{C_SKY}]${cache_read:.3f}[/]  cache_write=[{C_SKY}]${cache_write:.3f}[/]"
     )
+    _refresh_history_after_pricing_change()
 
 
 @pricing_app.command("reset")
@@ -1137,12 +1228,134 @@ def pricing_reset(
 
     if all_models:
         reset_all_user_pricing()
-        console.print(f"[bold {C_GREEN}]✓[/] All user pricing overrides removed.")
+        console.print(f"[bold {C_GREEN}]✓[/] All user pricing config removed.")
+        _refresh_history_after_pricing_change()
     elif model:
         if remove_user_pricing(model):
             console.print(f"[bold {C_GREEN}]✓[/] Reset {model} to builtin default.")
+            _refresh_history_after_pricing_change()
         else:
             console.print(f"[{C_YELLOW}]{model} has no user override.[/]")
     else:
         console.print(f"[{C_RED}]Specify a model name or use --all.[/]")
         raise typer.Exit(1)
+
+
+@long_context_app.command("set", context_settings={"help_option_names": ["-h", "--help"]})
+def pricing_long_context_set(
+    ctx: typer.Context,
+    model: str = typer.Argument(None, help="Model prefix, e.g. gpt-5.5."),
+    threshold: int = typer.Option(None, "--threshold", "-t", help="Request input-token threshold."),
+    input_price: float = typer.Option(None, "--input", "-i", help="Input price per 1M tokens."),
+    output_price: float = typer.Option(None, "--output", "-o", help="Output price per 1M tokens."),
+    cache_read: float = typer.Option(0.0, "--cache-read", "-cr", help="Cache read price per 1M tokens."),
+    cache_write: float = typer.Option(0.0, "--cache-write", "-cw", help="Cache write price per 1M tokens."),
+) -> None:
+    """Add or update long-context pricing for a model prefix."""
+    if model is None or threshold is None or input_price is None or output_price is None:
+        console.print(ctx.get_help())
+        console.print()
+        console.print(f"[bold {C_TEXT}]Example:[/]")
+        console.print(
+            f"  [{C_MUTED}]agentic-metric pricing long-context set gpt-5.5 "
+            f"--threshold 270000 -i 10 -o 45 -cr 1 -cw 0[/]"
+        )
+        raise typer.Exit()
+
+    from .pricing import set_user_long_context_pricing
+
+    set_user_long_context_pricing(
+        model,
+        threshold,
+        input_price,
+        output_price,
+        cache_read,
+        cache_write,
+    )
+    console.print(
+        f"[bold {C_GREEN}]✓[/] Set long-context pricing for [bold {C_MAUVE}]{model}[/]: "
+        f"threshold=[{C_TEAL}]{threshold:,}[/]  input=[{C_TEAL}]${input_price:.3f}[/]  "
+        f"output=[{C_TEAL}]${output_price:.3f}[/]  cache_read=[{C_SKY}]${cache_read:.3f}[/]  "
+        f"cache_write=[{C_SKY}]${cache_write:.3f}[/]"
+    )
+    _refresh_history_after_pricing_change()
+
+
+@long_context_app.command("reset")
+def pricing_long_context_reset(
+    model: str = typer.Argument(..., help="Model prefix to reset."),
+) -> None:
+    """Remove a user long-context override and fall back to builtin behavior."""
+    from .pricing import remove_user_long_context_pricing
+
+    if remove_user_long_context_pricing(model):
+        console.print(f"[bold {C_GREEN}]✓[/] Removed long-context override for {model}.")
+        _refresh_history_after_pricing_change()
+    else:
+        console.print(f"[{C_YELLOW}]{model} has no long-context override.[/]")
+
+
+@long_context_app.command("disable")
+def pricing_long_context_disable(
+    model: str = typer.Argument(..., help="Builtin model prefix to disable."),
+) -> None:
+    """Disable builtin long-context pricing for a model prefix."""
+    from .pricing import disable_builtin_long_context
+
+    disable_builtin_long_context(model)
+    console.print(f"[bold {C_GREEN}]✓[/] Disabled builtin long-context pricing for {model}.")
+    _refresh_history_after_pricing_change()
+
+
+@long_context_app.command("enable")
+def pricing_long_context_enable(
+    model: str = typer.Argument(..., help="Builtin model prefix to enable."),
+) -> None:
+    """Re-enable builtin long-context pricing for a model prefix."""
+    from .pricing import enable_builtin_long_context
+
+    if enable_builtin_long_context(model):
+        console.print(f"[bold {C_GREEN}]✓[/] Enabled builtin long-context pricing for {model}.")
+        _refresh_history_after_pricing_change()
+    else:
+        console.print(f"[{C_YELLOW}]{model} was not disabled.[/]")
+
+
+@cache_pricing_app.command("set", context_settings={"help_option_names": ["-h", "--help"]})
+def pricing_cache_set(
+    ctx: typer.Context,
+    model: str = typer.Argument(None, help="Model prefix, e.g. claude-sonnet-4."),
+    write_1h: float = typer.Option(None, "--write-1h", help="1-hour cache write price per 1M tokens."),
+) -> None:
+    """Add or update cache-duration pricing for a model prefix."""
+    if model is None or write_1h is None:
+        console.print(ctx.get_help())
+        console.print()
+        console.print(f"[bold {C_TEXT}]Example:[/]")
+        console.print(
+            f"  [{C_MUTED}]agentic-metric pricing cache set claude-sonnet-4 --write-1h 6[/]"
+        )
+        raise typer.Exit()
+
+    from .pricing import set_user_cache_pricing
+
+    set_user_cache_pricing(model, write_1h=write_1h)
+    console.print(
+        f"[bold {C_GREEN}]✓[/] Set cache pricing for [bold {C_MAUVE}]{model}[/]: "
+        f"write_1h=[{C_SKY}]${write_1h:.3f}[/]"
+    )
+    _refresh_history_after_pricing_change()
+
+
+@cache_pricing_app.command("reset")
+def pricing_cache_reset(
+    model: str = typer.Argument(..., help="Model prefix to reset."),
+) -> None:
+    """Remove user cache-duration pricing for a model prefix."""
+    from .pricing import remove_user_cache_pricing
+
+    if remove_user_cache_pricing(model):
+        console.print(f"[bold {C_GREEN}]✓[/] Removed cache pricing override for {model}.")
+        _refresh_history_after_pricing_change()
+    else:
+        console.print(f"[{C_YELLOW}]{model} has no cache pricing override.[/]")

@@ -108,7 +108,9 @@ def test_upsert_session_is_scoped_by_agent_type():
 def test_database_reprices_sessions_when_pricing_changes(tmp_path):
     pricing_file = tmp_path / "pricing.json"
     db_path = str(tmp_path / "data.db")
-    pricing_file.write_text(json.dumps({"custom-model": [1.0, 2.0, 0.0, 0.0]}))
+    pricing_file.write_text(json.dumps({
+        "models": {"custom-model": [1.0, 2.0, 0.0, 0.0]},
+    }))
 
     with patch("agentic_metric.pricing.PRICING_FILE", pricing_file):
         db = Database(db_path=db_path)
@@ -116,12 +118,19 @@ def test_database_reprices_sessions_when_pricing_changes(tmp_path):
         db.commit()
         db.close()
 
-        pricing_file.write_text(json.dumps({"custom-model": [3.0, 2.0, 0.0, 0.0]}))
+        pricing_file.write_text(json.dumps({
+            "models": {"custom-model": [3.0, 2.0, 0.0, 0.0]},
+        }))
         db = Database(db_path=db_path)
+        assert db.pricing_changed is True
         row = db.conn.execute(
             "SELECT estimated_cost_usd FROM sessions WHERE session_id = 's1' AND agent_type = 'claude_code'"
         ).fetchone()
         assert row["estimated_cost_usd"] == 3.0
+        db.close()
+
+        db = Database(db_path=db_path)
+        assert db.pricing_changed is False
         db.close()
 
 
@@ -129,8 +138,10 @@ def test_database_reprices_session_usage_when_pricing_changes(tmp_path):
     pricing_file = tmp_path / "pricing.json"
     db_path = str(tmp_path / "data.db")
     pricing_file.write_text(json.dumps({
-        "cheap-model": [1.0, 0.0, 0.0, 0.0],
-        "expensive-model": [10.0, 0.0, 0.0, 0.0],
+        "models": {
+            "cheap-model": [1.0, 0.0, 0.0, 0.0],
+            "expensive-model": [10.0, 0.0, 0.0, 0.0],
+        },
     }))
 
     with patch("agentic_metric.pricing.PRICING_FILE", pricing_file):
@@ -163,8 +174,10 @@ def test_database_reprices_session_usage_when_pricing_changes(tmp_path):
         db.close()
 
         pricing_file.write_text(json.dumps({
-            "cheap-model": [2.0, 0.0, 0.0, 0.0],
-            "expensive-model": [20.0, 0.0, 0.0, 0.0],
+            "models": {
+                "cheap-model": [2.0, 0.0, 0.0, 0.0],
+                "expensive-model": [20.0, 0.0, 0.0, 0.0],
+            },
         }))
         db = Database(db_path=db_path)
         row = db.conn.execute(

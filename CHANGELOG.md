@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.2.5 (2026-04-25)
+
+### Bug fixes
+
+- **Complete price configuration**: pricing overrides now use a structured
+  config with separate model, long-context, and cache-duration rules.
+- **Configurable long-context pricing**: added CLI commands to set, reset,
+  disable, and re-enable request-size long-context prices without changing the
+  normal model price.
+- **Configurable cache duration pricing**: added CLI support for overriding
+  observable 1-hour cache-write prices.
+- **Fresh costs after pricing changes**: pricing changes now trigger history
+  resync so event-level costs such as long-context requests are recalculated
+  from the original local JSONL data before reports are shown.
+
 ## v0.2.4 (2026-04-25)
 
 ### Bug fixes

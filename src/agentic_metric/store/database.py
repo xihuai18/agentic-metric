@@ -68,6 +68,7 @@ CREATE INDEX IF NOT EXISTS idx_session_usage_project_date ON session_usage (proj
 class Database:
     def __init__(self, db_path: str | None = None) -> None:
         self._path = db_path or str(DB_PATH)
+        self.pricing_changed = False
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(self._path)
         self._conn.row_factory = sqlite3.Row
@@ -159,6 +160,7 @@ class Database:
         if self.get_sync_state(state_key) == fingerprint:
             return
 
+        self.pricing_changed = True
         self._conn.execute("DELETE FROM sync_state WHERE key LIKE 'codex_jsonl:%'")
         self._conn.execute("DELETE FROM sync_state WHERE key LIKE 'cc_jsonl:%'")
 

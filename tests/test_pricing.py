@@ -7,13 +7,19 @@ from agentic_metric.pricing import (
     PRICING,
     _BUILTIN_PRICING,
     _load_user_pricing,
+    disable_builtin_long_context,
+    enable_builtin_long_context,
     estimate_cost,
     estimate_session_cost,
     get_all_pricing,
+    get_cache_write_1h_price,
     get_pricing,
     get_pricing_fingerprint,
     remove_user_pricing,
+    remove_user_long_context_pricing,
     reset_all_user_pricing,
+    set_user_cache_pricing,
+    set_user_long_context_pricing,
     set_user_pricing,
 )
 from agentic_metric.models import LiveSession
@@ -222,6 +228,23 @@ def test_claude_cache_creation_1h_and_sonnet_long_context(tmp_path):
     _reset_cache()
 
 
+def test_user_cache_write_1h_override(tmp_path):
+    pricing_file = tmp_path / "pricing.json"
+
+    _reset_cache()
+    with patch("agentic_metric.pricing.PRICING_FILE", pricing_file):
+        assert get_cache_write_1h_price("claude-sonnet-4-6", 3.0) == 6.0
+        set_user_cache_pricing("claude-sonnet-4", write_1h=7.0)
+        assert get_cache_write_1h_price("claude-sonnet-4-6", 3.0) == 7.0
+        cost = estimate_cost(
+            "claude-sonnet-4-6",
+            cache_creation_tokens=1_000_000,
+            cache_creation_1h_tokens=1_000_000,
+        )
+        assert abs(cost - 7.0) < 0.001
+    _reset_cache()
+
+
 def test_estimate_cost_zero_usage_unknown_model_is_silent(caplog):
     import agentic_metric.pricing as p
 
@@ -252,7 +275,9 @@ def test_user_pricing_override(tmp_path):
     """User pricing should take precedence over builtin."""
     pricing_file = tmp_path / "pricing.json"
     pricing_file.write_text(json.dumps({
-        "claude-opus-4-6": [99.0, 99.0, 99.0, 99.0],
+        "models": {
+            "claude-opus-4-6": [99.0, 99.0, 99.0, 99.0],
+        },
     }))
 
     _reset_cache()
@@ -315,7 +340,9 @@ def test_pricing_fingerprint_includes_lookup_rules(tmp_path):
 def test_user_pricing_override_is_exact_match(tmp_path):
     pricing_file = tmp_path / "pricing.json"
     pricing_file.write_text(json.dumps({
-        "gpt-5": [99.0, 99.0, 99.0, 99.0],
+        "models": {
+            "gpt-5": [99.0, 99.0, 99.0, 99.0],
+        },
     }))
 
     _reset_cache()
@@ -325,10 +352,12 @@ def test_user_pricing_override_is_exact_match(tmp_path):
     _reset_cache()
 
 
-def test_user_pricing_override_takes_precedence_over_long_context(tmp_path):
+def test_user_base_price_does_not_disable_long_context(tmp_path):
     pricing_file = tmp_path / "pricing.json"
     pricing_file.write_text(json.dumps({
-        "gpt-5.4": [1.0, 2.0, 0.1, 0.0],
+        "models": {
+            "gpt-5.4": [1.0, 2.0, 0.1, 0.0],
+        },
     }))
 
     _reset_cache()
@@ -339,8 +368,55 @@ def test_user_pricing_override_takes_precedence_over_long_context(tmp_path):
             output_tokens=1_000,
             cache_read_tokens=10_000,
         )
-        expected = (300_000 * 1.0 + 1_000 * 2.0 + 10_000 * 0.1) / 1_000_000
+        expected = (300_000 * 5.0 + 1_000 * 22.5 + 10_000 * 0.5) / 1_000_000
         assert abs(cost - expected) < 0.001
+    _reset_cache()
+
+
+def test_user_long_context_override_takes_precedence(tmp_path):
+    pricing_file = tmp_path / "pricing.json"
+
+    _reset_cache()
+    with patch("agentic_metric.pricing.PRICING_FILE", pricing_file):
+        set_user_pricing("gpt-5.4", 1.0, 2.0, 0.1, 0.0)
+        set_user_long_context_pricing("gpt-5.4", 250_000, 9.0, 19.0, 0.9, 0.0)
+        cost = estimate_cost(
+            "gpt-5.4",
+            input_tokens=300_000,
+            output_tokens=1_000,
+            cache_read_tokens=10_000,
+        )
+        expected = (300_000 * 9.0 + 1_000 * 19.0 + 10_000 * 0.9) / 1_000_000
+        assert abs(cost - expected) < 0.001
+
+        assert remove_user_long_context_pricing("gpt-5.4") is True
+        assert remove_user_long_context_pricing("gpt-5.4") is False
+    _reset_cache()
+
+
+def test_builtin_long_context_can_be_disabled_and_enabled(tmp_path):
+    pricing_file = tmp_path / "pricing.json"
+
+    _reset_cache()
+    with patch("agentic_metric.pricing.PRICING_FILE", pricing_file):
+        disable_builtin_long_context("gpt-5.4")
+        cost = estimate_cost(
+            "gpt-5.4",
+            input_tokens=300_000,
+            output_tokens=1_000,
+        )
+        expected_standard = (300_000 * 2.5 + 1_000 * 15.0) / 1_000_000
+        assert abs(cost - expected_standard) < 0.001
+
+        assert enable_builtin_long_context("gpt-5.4") is True
+        assert enable_builtin_long_context("gpt-5.4") is False
+        cost = estimate_cost(
+            "gpt-5.4",
+            input_tokens=300_000,
+            output_tokens=1_000,
+        )
+        expected_long = (300_000 * 5.0 + 1_000 * 22.5) / 1_000_000
+        assert abs(cost - expected_long) < 0.001
     _reset_cache()
 
 
@@ -348,7 +424,9 @@ def test_user_custom_model(tmp_path):
     """User can add entirely new models."""
     pricing_file = tmp_path / "pricing.json"
     pricing_file.write_text(json.dumps({
-        "my-custom-model": [1.0, 2.0, 0.1, 0.2],
+        "models": {
+            "my-custom-model": [1.0, 2.0, 0.1, 0.2],
+        },
     }))
 
     _reset_cache()
@@ -361,7 +439,9 @@ def test_user_custom_model(tmp_path):
 def test_user_custom_model_can_price_unknown_prefix(tmp_path):
     pricing_file = tmp_path / "pricing.json"
     pricing_file.write_text(json.dumps({
-        "gpt-5.4-pro": [60.0, 270.0, 6.0, 0.0],
+        "models": {
+            "gpt-5.4-pro": [60.0, 270.0, 6.0, 0.0],
+        },
     }))
 
     _reset_cache()
@@ -394,7 +474,7 @@ def test_set_and_remove_user_pricing(tmp_path):
 
 def test_reset_all_user_pricing(tmp_path):
     pricing_file = tmp_path / "pricing.json"
-    pricing_file.write_text(json.dumps({"m": [1, 2, 3, 4]}))
+    pricing_file.write_text(json.dumps({"models": {"m": [1, 2, 3, 4]}}))
 
     _reset_cache()
     with patch("agentic_metric.pricing.PRICING_FILE", pricing_file):
@@ -406,7 +486,9 @@ def test_reset_all_user_pricing(tmp_path):
 def test_get_all_pricing_merges(tmp_path):
     pricing_file = tmp_path / "pricing.json"
     pricing_file.write_text(json.dumps({
-        "new-model": [1.0, 2.0, 0.1, 0.2],
+        "models": {
+            "new-model": [1.0, 2.0, 0.1, 0.2],
+        },
     }))
 
     _reset_cache()
