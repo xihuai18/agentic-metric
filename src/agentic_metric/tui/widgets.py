@@ -24,11 +24,14 @@ def fmt_tokens(n: int) -> str:
 
 def fmt_cost(usd: float | None, *, unknown: bool = False) -> str:
     """Format a USD cost value with thousands separator."""
+    usd_value = 0.0 if usd is None else usd
+    if unknown and usd_value > 0:
+        return f"{fmt_cost(usd_value)} + ?"
     if unknown or usd is None:
         return "?"
-    if usd >= 1.0:
-        return f"${usd:,.2f}"
-    return f"${usd:.3f}"
+    if usd_value >= 1.0:
+        return f"${usd_value:,.2f}"
+    return f"${usd_value:.3f}"
 
 
 _SPARK_BLOCKS = "▁▂▃▄▅▆▇█"

@@ -21,7 +21,8 @@ from agentic_metric.store.aggregator import (
     merge_live_into_overview,
     merge_live_into_trends,
 )
-from agentic_metric.tui.widgets import Breakdown
+from agentic_metric.cli import _fmt_cost as cli_fmt_cost
+from agentic_metric.tui.widgets import Breakdown, fmt_cost as tui_fmt_cost
 
 
 def _make_db() -> Database:
@@ -682,6 +683,17 @@ def test_tui_breakdown_keeps_unknown_visible_before_model_limit():
     rendered = widget.render().plain
     assert "Unknown" in rendered
     assert "?" in rendered
+
+
+def test_cost_format_shows_known_amount_plus_unknown_marker():
+    assert cli_fmt_cost(12.34, unknown=True) == "$12.34 + ?"
+    assert tui_fmt_cost(12.34, unknown=True) == "$12.34 + ?"
+    assert cli_fmt_cost(0.1234, unknown=True) == "$0.123 + ?"
+    assert tui_fmt_cost(0.1234, unknown=True) == "$0.123 + ?"
+    assert cli_fmt_cost(0.0, unknown=True) == "?"
+    assert tui_fmt_cost(0.0, unknown=True) == "?"
+    assert cli_fmt_cost(None, unknown=True) == "?"
+    assert tui_fmt_cost(None, unknown=True) == "?"
 
 
 def test_merge_live_overview_matches_by_session_and_agent():

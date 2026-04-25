@@ -904,11 +904,14 @@ def _has_cost_signal(row: dict, *, cost_key: str = "estimated_cost_usd") -> bool
 
 
 def _fmt_cost(cost: float | None, *, unknown: bool = False) -> str:
+    cost_value = 0.0 if cost is None else cost
+    if unknown and cost_value > 0:
+        return f"{_fmt_cost(cost_value)} + ?"
     if unknown or cost is None:
         return "?"
-    if cost >= 1.0:
-        return f"${cost:,.2f}"
-    return f"${cost:.3f}"
+    if cost_value >= 1.0:
+        return f"${cost_value:,.2f}"
+    return f"${cost_value:.3f}"
 
 
 def _share_pct(
