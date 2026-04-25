@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.3.2 (2026-04-25)
+
+### Improvements
+
+- **Height-aware model fold**: the TUI breakdown panel now uses the
+  available widget height to decide how many models to show per agent
+  group, instead of a hard-coded limit of 4.
+- **Ctrl+C no longer quits**: Ctrl+C is intercepted with a "Press q to
+  quit" hint, so terminal-native copy (Cmd+C / Ctrl+Shift+C / Ctrl+C
+  with selection) works across macOS, Linux, and Windows.
+- **Cleaner fold line**: the `+N more models` row no longer prints a
+  redundant `total` token count.
+
 ## v0.3.1 (2026-04-25)
 
 ### Improvements

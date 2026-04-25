@@ -129,6 +129,8 @@ class AgenticMetricApp(App):
         Binding("w", "focus('week')", "Week", show=False),
         Binding("m", "focus('month')", "Month", show=False),
         Binding("r", "refresh_all", "Refresh"),
+        # Let Ctrl+C pass through to the terminal for native copy.
+        Binding("ctrl+c", "noop", show=False),
         Binding("q", "quit", "Quit"),
     ]
 
@@ -501,6 +503,10 @@ class AgenticMetricApp(App):
     def action_refresh_all(self) -> None:
         self.notify("Syncing…")
         self.run_worker(self._sync_worker, thread=True, exclusive=True, group="sync")
+
+    def action_noop(self) -> None:
+        """Intercept Ctrl+C so it doesn't quit; hint the real quit key."""
+        self.notify("Press [bold]q[/] to quit", severity="information")
 
 
 def _has_unknown_cost(row: dict | None) -> bool:

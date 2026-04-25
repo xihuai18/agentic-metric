@@ -324,11 +324,12 @@ class Breakdown(Static):
         ]
     """
 
+    _MIN_MODEL_LIMIT = 3
+
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self._groups: list[dict] = []
         self._total_cost: float = 0.0
-        self._visible_model_limit = 4
 
     def update_data(self, groups: list[dict], total_cost: float) -> None:
         self._groups = groups
@@ -356,6 +357,14 @@ class Breakdown(Static):
 
         total = max(self._total_cost, 1e-9)
         total_unknown = any(_has_unknown_cost(g) for g in self._groups)
+        # Each agent group uses ~3 lines (header + split + blank); each model 1 line.
+        # Compute how many model lines we can afford from the available height.
+        n_groups = len(self._groups)
+        avail = self.size.height
+        overhead = n_groups * 3  # agent header + token split + trailing blank
+        model_budget = max(avail - overhead, n_groups * self._MIN_MODEL_LIMIT)
+        # Distribute budget evenly across groups, but at least _MIN_MODEL_LIMIT each.
+        model_limit = max(self._MIN_MODEL_LIMIT, model_budget // max(n_groups, 1))
         t = Text()
         for i, g in enumerate(self._groups):
             agent = g["agent"]
@@ -379,8 +388,8 @@ class Breakdown(Static):
             nonzero = [m for m in raw_models if (m.get("cost") or 0) > 0 or _has_unknown_cost(m)]
             known = sorted([m for m in nonzero if not _has_unknown_cost(m)], key=lambda m: -(m.get("cost") or 0))
             unknown = sorted([m for m in nonzero if _has_unknown_cost(m)], key=lambda m: -(m.get("cost") or 0))
-            visible = known[: self._visible_model_limit] + unknown
-            hidden = known[self._visible_model_limit :]
+            visible = known[: model_limit] + unknown
+            hidden = known[model_limit :]
             for j, m in enumerate(visible):
                 last = (j == len(visible) - 1 and not hidden)
                 connector = "└─" if last else "├─"
@@ -394,7 +403,6 @@ class Breakdown(Static):
             if hidden:
                 hidden_cost = sum(m.get("cost") or 0 for m in hidden)
                 hidden_unknown = any(_has_unknown_cost(m) for m in hidden)
-                hidden_tokens = sum(m.get("tokens") or 0 for m in hidden)
                 hidden_row = {
                     "input": sum(m.get("input") or 0 for m in hidden),
                     "output": sum(m.get("output") or 0 for m in hidden),
@@ -403,8 +411,7 @@ class Breakdown(Static):
                 t.append("    └─ ", style="white")
                 t.append(f"+{len(hidden)} more models".ljust(28), style="white")
                 t.append(f" {fmt_cost(hidden_cost, unknown=hidden_unknown):>10}", style="bright_yellow")
-                t.append(f"  {self._split(hidden_row)}")
-                t.append(f"  total {fmt_tokens(hidden_tokens)}\n", style="white")
+                t.append(f"  {self._split(hidden_row)}\n", style="white")
             t.append("\n")
 
         return t
