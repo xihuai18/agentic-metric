@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.2.3 (2026-04-25)
+
+### Bug fixes
+
+- **Claude Code history on Windows locales**: read Claude JSONL `cwd` fields
+  and `sessions-index.json` as UTF-8 so Windows non-UTF-8 system locales do
+  not silently prevent `~/.claude` history from syncing.
+
 ## v0.2.2 (2026-04-25)
 
 Pricing and platform compatibility fixes for the v0.2.x fork.
