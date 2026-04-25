@@ -145,53 +145,7 @@ def test_openai_long_context_is_model_specific(tmp_path):
     _reset_cache()
 
 
-def test_openai_codex_fast_mode_is_model_specific(tmp_path):
-    with _patch_empty_user_pricing(tmp_path):
-        standard_55 = estimate_cost("gpt-5.5", input_tokens=1_000_000, output_tokens=1_000_000)
-        fast_55 = estimate_cost(
-            "gpt-5.5",
-            input_tokens=1_000_000,
-            output_tokens=1_000_000,
-            service_tier="fast",
-        )
-        assert abs(standard_55 - 35.0) < 0.001
-        assert abs(fast_55 - 87.5) < 0.001
-
-        standard_54 = estimate_cost("gpt-5.4", input_tokens=100_000, output_tokens=100_000)
-        fast_54 = estimate_cost(
-            "gpt-5.4",
-            input_tokens=100_000,
-            output_tokens=100_000,
-            service_tier="fast",
-        )
-        assert abs(standard_54 - 1.75) < 0.001
-        assert abs(fast_54 - 3.5) < 0.001
-
-        mini_fast = estimate_cost(
-            "gpt-5.4-mini",
-            input_tokens=1_000_000,
-            output_tokens=1_000_000,
-            service_tier="fast",
-        )
-        assert abs(mini_fast - 5.25) < 0.001
-
-        claude_standard = estimate_cost(
-            "claude-opus-4-6",
-            input_tokens=1_000_000,
-            output_tokens=1_000_000,
-        )
-        claude_fast = estimate_cost(
-            "claude-opus-4-6",
-            input_tokens=1_000_000,
-            output_tokens=1_000_000,
-            service_tier="fast",
-        )
-        assert abs(claude_standard - 30.0) < 0.001
-        assert abs(claude_fast - 180.0) < 0.001
-    _reset_cache()
-
-
-def test_gpt_55_long_context_has_no_separate_surcharge(tmp_path):
+def test_gpt_55_long_context_uses_long_context_rate(tmp_path):
     with _patch_empty_user_pricing(tmp_path):
         cost = estimate_cost(
             "gpt-5.5",
@@ -199,7 +153,7 @@ def test_gpt_55_long_context_has_no_separate_surcharge(tmp_path):
             output_tokens=1_000,
             cache_read_tokens=10_000,
         )
-        expected = (500_000 * 5.0 + 1_000 * 30.0 + 10_000 * 0.50) / 1_000_000
+        expected = (500_000 * 10.0 + 1_000 * 45.0 + 10_000 * 1.0) / 1_000_000
         assert abs(cost - expected) < 0.001
     _reset_cache()
 
@@ -349,9 +303,7 @@ def test_pricing_fingerprint_includes_lookup_rules(tmp_path):
         base = get_pricing_fingerprint()
         with patch("agentic_metric.pricing._MODEL_ALIASES", {"alias-model": "claude-sonnet-4-6"}):
             assert get_pricing_fingerprint() != base
-        with patch("agentic_metric.pricing._LONG_CONTEXT_TIERS", []):
-            assert get_pricing_fingerprint() != base
-        with patch("agentic_metric.pricing._SERVICE_TIER_MULTIPLIERS", []):
+        with patch("agentic_metric.pricing._LONG_CONTEXT_RULES", []):
             assert get_pricing_fingerprint() != base
         with patch("agentic_metric.pricing._UNKNOWN_MODEL_PREFIXES", ("gpt-5-pro", "custom-pro")):
             assert get_pricing_fingerprint() != base

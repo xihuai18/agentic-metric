@@ -58,7 +58,6 @@ class _SessionAccum:
         "last_prompt",
         "git_branch",
         "model",
-        "service_tier",
         "partial_line",
         "file_id",
         "file_mtime_ns",
@@ -101,7 +100,6 @@ class _SessionAccum:
         self.last_prompt = ""
         self.git_branch = ""
         self.model = ""
-        self.service_tier = ""
         self.partial_line = b""
         self.file_id: tuple[int, int] | None = None
         self.file_mtime_ns = -1
@@ -111,7 +109,7 @@ class _SessionAccum:
         self.fork_baseline_output = 0
         self.fork_baseline_cache_read = 0
         self.fork_baseline_cache_create = 0
-        self.usage_buckets: dict[tuple[str, int, str, str], dict] = {}
+        self.usage_buckets: dict[tuple[str, int, str], dict] = {}
 
     def read_new_lines(self) -> None:
         """Read only bytes appended since last call.
@@ -184,7 +182,6 @@ class _SessionAccum:
         self.last_prompt = ""
         self.git_branch = ""
         self.model = ""
-        self.service_tier = ""
         self.partial_line = b""
         self.is_forked = False
         self.seen_turn_context = False
@@ -226,13 +223,11 @@ class _SessionAccum:
         cache_read_tokens: int = 0,
         cache_creation_tokens: int = 0,
         estimated_cost_usd: float | None = 0.0,
-        service_tier: str | None = None,
     ) -> None:
         usage_date, usage_hour = _local_bucket(ts)
         if not usage_date:
             return
-        bucket_service_tier = self.service_tier if service_tier is None else service_tier
-        key = (usage_date, usage_hour, self.model or "", bucket_service_tier or "")
+        key = (usage_date, usage_hour, self.model or "")
         bucket = self.usage_buckets.setdefault(
             key,
             {
@@ -240,7 +235,6 @@ class _SessionAccum:
                 "usage_hour": usage_hour,
                 "project_path": self.project_path,
                 "model": self.model or "",
-                "service_tier": bucket_service_tier or "",
                 "message_count": 0,
                 "user_turns": 0,
                 "input_tokens": 0,
@@ -251,7 +245,6 @@ class _SessionAccum:
             },
         )
         bucket["project_path"] = self.project_path
-        bucket["service_tier"] = bucket_service_tier or ""
         bucket["message_count"] += message_count
         bucket["user_turns"] += user_turns
         bucket["input_tokens"] += input_tokens
@@ -308,9 +301,6 @@ class _SessionAccum:
             model = payload.get("model", "")
             if model:
                 self.model = model
-            service_tier = _extract_service_tier(payload)
-            if service_tier:
-                self.service_tier = service_tier
             self.seen_turn_context = True
 
         elif entry_type == "event_msg":
@@ -348,9 +338,6 @@ class _SessionAccum:
             info = payload.get("info")
             if not info:
                 return
-            service_tier = _extract_service_tier(payload) or _extract_service_tier(info)
-            if service_tier:
-                self.service_tier = service_tier
             usage = info.get("total_token_usage", {})
             if not usage:
                 return
@@ -391,7 +378,6 @@ class _SessionAccum:
                 event_cost = _event_cost_from_token_usage(
                     self.model,
                     info.get("last_token_usage"),
-                    self.service_tier,
                 )
                 if event_cost is None:
                     event_cost = estimate_cost(
@@ -400,7 +386,6 @@ class _SessionAccum:
                         output_tokens=d_output,
                         cache_read_tokens=d_cache_read,
                         cache_creation_tokens=d_cache_create,
-                        service_tier=self.service_tier,
                         apply_long_context=False,
                     )
                 self._add_usage_bucket(
@@ -410,7 +395,6 @@ class _SessionAccum:
                     cache_read_tokens=d_cache_read,
                     cache_creation_tokens=d_cache_create,
                     estimated_cost_usd=event_cost,
-                    service_tier=self.service_tier,
                 )
             if is_today:
                 self.today_input_tokens = max(self.input_tokens - self.today_input_base, 0)
@@ -451,7 +435,6 @@ class _SessionAccum:
             project_path=self.project_path,
             git_branch=self.git_branch,
             model=self.model,
-            service_tier=self.service_tier,
             message_count=self.message_count,
             user_turns=self.user_turns,
             input_tokens=self.input_tokens,
@@ -759,7 +742,6 @@ def _usage_rows_cost(rows: list[dict]) -> float | None:
                 output_tokens=int(row.get("output_tokens") or 0),
                 cache_read_tokens=int(row.get("cache_read_tokens") or 0),
                 cache_creation_tokens=int(row.get("cache_creation_tokens") or 0),
-                service_tier=str(row.get("service_tier") or ""),
                 apply_long_context=False,
             )
         if cost is None:
@@ -768,7 +750,7 @@ def _usage_rows_cost(rows: list[dict]) -> float | None:
     return total
 
 
-def _event_cost_from_token_usage(model: str, usage: object, service_tier: str = "") -> float | None:
+def _event_cost_from_token_usage(model: str, usage: object) -> float | None:
     """Estimate one Codex/OpenAI token-count event when last-token usage exists."""
     if not isinstance(usage, dict):
         return None
@@ -784,30 +766,7 @@ def _event_cost_from_token_usage(model: str, usage: object, service_tier: str = 
         output_tokens=output,
         cache_read_tokens=cached,
         cache_creation_tokens=cache_create,
-        service_tier=service_tier,
     )
-
-
-def _extract_service_tier(payload: object) -> str:
-    """Return a Codex service tier such as ``fast`` if present in log payloads."""
-    if not isinstance(payload, dict):
-        return ""
-    for key in ("service_tier", "serviceTier", "speed"):
-        value = payload.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip().lower()
-    collab = payload.get("collaboration_mode")
-    if isinstance(collab, dict):
-        settings = collab.get("settings")
-        nested = _extract_service_tier(settings)
-        if nested:
-            return nested
-    settings = payload.get("settings")
-    if settings is not payload:
-        nested = _extract_service_tier(settings)
-        if nested:
-            return nested
-    return ""
 
 
 def _local_bucket(ts: str) -> tuple[str, int]:

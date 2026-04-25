@@ -1,7 +1,6 @@
 """Tests for store module."""
 
 import json
-import sqlite3
 import tempfile
 from datetime import datetime
 from unittest.mock import patch
@@ -175,52 +174,6 @@ def test_database_reprices_session_usage_when_pricing_changes(tmp_path):
         db.close()
 
 
-def test_database_migrates_session_usage_service_tier_primary_key(tmp_path):
-    db_path = tmp_path / "old.db"
-    conn = sqlite3.connect(db_path)
-    conn.execute(
-        """CREATE TABLE session_usage (
-            session_id TEXT NOT NULL,
-            agent_type TEXT NOT NULL,
-            usage_date TEXT NOT NULL,
-            usage_hour INTEGER NOT NULL,
-            project_path TEXT DEFAULT '',
-            model TEXT DEFAULT '',
-            message_count INTEGER DEFAULT 0,
-            user_turns INTEGER DEFAULT 0,
-            input_tokens INTEGER DEFAULT 0,
-            output_tokens INTEGER DEFAULT 0,
-            cache_read_tokens INTEGER DEFAULT 0,
-            cache_creation_tokens INTEGER DEFAULT 0,
-            estimated_cost_usd REAL DEFAULT 0,
-            PRIMARY KEY (session_id, agent_type, usage_date, usage_hour, model)
-        )"""
-    )
-    conn.execute(
-        """INSERT INTO session_usage
-           (session_id, agent_type, usage_date, usage_hour, model, input_tokens, estimated_cost_usd)
-           VALUES ('s1', 'codex', '2026-04-24', 10, 'gpt-5.5', 1, 0.000005)"""
-    )
-    conn.commit()
-    conn.close()
-
-    db = Database(db_path=str(db_path))
-    pk_cols = [
-        row[1]
-        for row in sorted(
-            db.conn.execute("PRAGMA table_info(session_usage)").fetchall(),
-            key=lambda r: r[5],
-        )
-        if row[5] > 0
-    ]
-    assert pk_cols == ["session_id", "agent_type", "usage_date", "usage_hour", "model", "service_tier"]
-    row = db.conn.execute(
-        "SELECT service_tier FROM session_usage WHERE session_id = 's1' AND agent_type = 'codex'"
-    ).fetchone()
-    assert row["service_tier"] == ""
-    db.close()
-
-
 def test_replace_session_usage_preserves_collector_estimated_cost():
     db = _make_db()
     db.replace_session_usage(
@@ -245,7 +198,7 @@ def test_replace_session_usage_preserves_collector_estimated_cost():
     db.close()
 
 
-def test_replace_session_usage_keeps_service_tiers_distinct():
+def test_range_reports_group_by_model_only():
     db = _make_db()
     db.replace_session_usage(
         "s1",
@@ -260,9 +213,8 @@ def test_replace_session_usage_keeps_service_tiers_distinct():
             },
             {
                 "usage_date": "2026-04-24",
-                "usage_hour": 10,
+                "usage_hour": 11,
                 "model": "gpt-5.5",
-                "service_tier": "fast",
                 "input_tokens": 1_000_000,
                 "output_tokens": 1_000_000,
             },
@@ -271,20 +223,60 @@ def test_replace_session_usage_keeps_service_tiers_distinct():
     db.commit()
 
     rows = db.conn.execute(
-        """SELECT model, service_tier, estimated_cost_usd
+        """SELECT model, estimated_cost_usd
            FROM session_usage
            WHERE session_id = 's1' AND agent_type = 'codex'
-           ORDER BY service_tier"""
+           ORDER BY usage_hour"""
     ).fetchall()
-    assert len(rows) == 2
-    assert rows[0]["service_tier"] == ""
-    assert rows[0]["estimated_cost_usd"] == 35.0
-    assert rows[1]["service_tier"] == "fast"
-    assert rows[1]["estimated_cost_usd"] == 87.5
+    assert [row["estimated_cost_usd"] for row in rows] == [35.0, 35.0]
 
     model_rows = get_range_by_agent_model(db, "2026-04-24", "2026-04-24")
-    labels = {row["model"] for row in model_rows}
-    assert labels == {"gpt-5.5", "gpt-5.5 [fast]"}
+    assert len(model_rows) == 1
+    assert model_rows[0]["model"] == "gpt-5.5"
+    assert model_rows[0]["estimated_cost_usd"] == 70.0
+
+    time_rows = get_range_by_time_model(db, "2026-04-24", "2026-04-24", limit=10)
+    assert {row["usage_hour"] for row in time_rows} == {10, 11}
+    assert all(row["model"] == "gpt-5.5" for row in time_rows)
+
+    session_rows = get_range_top_sessions(db, "2026-04-24", "2026-04-24", limit=1)
+    session_models = {
+        model.strip() for model in session_rows[0]["models"].split(",") if model.strip()
+    }
+    assert session_models == {"gpt-5.5"}
+    db.close()
+
+
+def test_replace_session_usage_prices_known_model():
+    db = _make_db()
+    db.replace_session_usage(
+        "s1",
+        "codex",
+        [
+            {
+                "usage_date": "2026-04-24",
+                "usage_hour": 10,
+                "model": "gpt-5.4",
+                "input_tokens": 1_000,
+            },
+        ],
+    )
+    db.commit()
+
+    row = db.conn.execute(
+        """SELECT estimated_cost_usd
+           FROM session_usage
+           WHERE session_id = 's1' AND agent_type = 'codex'"""
+    ).fetchone()
+    assert row["estimated_cost_usd"] == 0.0025
+
+    model_rows = get_range_by_agent_model(db, "2026-04-24", "2026-04-24")
+    assert model_rows[0]["model"] == "gpt-5.4"
+    assert model_rows[0]["unknown_cost_count"] == 0
+
+    top_sessions = get_range_top_sessions(db, "2026-04-24", "2026-04-24", limit=1)
+    assert top_sessions[0]["models"] == "gpt-5.4"
+    assert top_sessions[0]["unknown_cost_count"] == 0
     db.close()
 
 

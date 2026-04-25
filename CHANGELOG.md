@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.2.4 (2026-04-25)
+
+### Bug fixes
+
+- **Unsupported speed/priority billing removed**: local Codex, Claude Code, and
+  Gemini-compatible histories do not expose reliable non-standard provider mode
+  markers, so reports now group by model only and do not price those modes
+  separately.
+- **Pricing cleanup**: removed the stored `service_tier` dimension and the old
+  fast-mode multipliers; unknown models still display as `Unknown` with cost
+  `?` until explicit pricing is configured.
+- **GPT-5.5 long-context pricing**: added request-size pricing for GPT-5.5
+  when event-level usage crosses the long-context threshold.
+
 ## v0.2.3 (2026-04-25)
 
 ### Bug fixes
@@ -18,8 +32,8 @@ Pricing and platform compatibility fixes for the v0.2.x fork.
   Unknown models now surface as `Unknown` with cost `?` until explicit
   pricing is configured.
 - **Codex/OpenAI token accounting**: cached input is no longer charged twice;
-  per-request pricing handles Codex `fast` tier and OpenAI/Gemini long-context
-  tiers only when event-level usage is available.
+  provider speed/priority modes are not priced separately, and OpenAI/Gemini
+  long-context rates are only applied when event-level usage is available.
 - **Claude cache accounting**: cache-read and cache-write tokens remain
   separate from input tokens, and observable 1-hour cache writes use the
   Anthropic 1-hour cache multiplier.
@@ -28,7 +42,7 @@ Pricing and platform compatibility fixes for the v0.2.x fork.
   uses GPT-5.3-Codex.
 - **Stored-cost repricing**: historical rows with collector-computed
   event-level costs are preserved across pricing fingerprint migrations, while
-  aggregate-only rows are repriced without triggering request-size tiers.
+  aggregate-only rows are repriced without triggering request-size rates.
 - **Windows support**: process detection now uses `psutil`/`tasklist`
   fallbacks, CWD matching normalizes Windows paths, date formatting avoids
   POSIX-only flags, and the app data directory uses `%LOCALAPPDATA%`.

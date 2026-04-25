@@ -15,7 +15,6 @@ class LiveSession:
     project_path: str
     git_branch: str = ""
     model: str = ""
-    service_tier: str = ""
     message_count: int = 0
     user_turns: int = 0
     input_tokens: int = 0

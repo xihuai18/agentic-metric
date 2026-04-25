@@ -16,12 +16,10 @@ log = logging.getLogger(__name__)
 #   https://developers.openai.com/api/docs/models/gpt-5.4/
 #   https://platform.claude.com/docs/en/docs/about-claude/pricing
 #   https://ai.google.dev/gemini-api/docs/pricing
-# Cache-write uses the 5-minute rate for Anthropic unless a collector can
-# observe a different cache duration. OpenAI Codex Fast mode is applied when a
-# collector can observe ``service_tier=fast``. Other processing tiers such as
-# Priority/Flex are standard-priced unless the collector can observe the tier.
-# Request-size tiers are applied in ``estimate_cost`` when per-request usage is
-# available.
+# Cache-write uses the 5-minute rate for Anthropic unless a collector observes
+# a different cache duration. Provider speed/priority modes are intentionally
+# ignored because the local histories this tool reads do not expose reliable
+# non-standard markers.
 _BUILTIN_PRICING: dict[str, tuple[float, float, float, float]] = {
     # ── Anthropic Claude ──
     "claude-opus-4-7":       (5.0,  25.0, 0.50,  6.25),
@@ -95,12 +93,17 @@ _UNKNOWN_MODEL_PREFIXES = (
     "gpt-5-pro",
 )
 
-_PRICING_FINGERPRINT_VERSION = 8
+_PRICING_FINGERPRINT_VERSION = 9
 
 # Long-context pricing applies per request/prompt, not per stored hour/session.
 # Collectors pass single-event usage into ``estimate_cost`` before aggregating
 # buckets; aggregate-only callers get a best-effort fallback.
-_LONG_CONTEXT_TIERS: list[dict[str, object]] = [
+_LONG_CONTEXT_RULES: list[dict[str, object]] = [
+    {
+        "prefixes": ("gpt-5.5",),
+        "threshold": 270_000,
+        "prices": (10.0, 45.0, 1.0, 0.0),
+    },
     {
         "prefixes": ("gpt-5.4",),
         "excluded_prefixes": ("gpt-5.4-mini", "gpt-5.4-nano"),
@@ -122,25 +125,6 @@ _LONG_CONTEXT_TIERS: list[dict[str, object]] = [
         "excluded_prefixes": ("claude-sonnet-4-5", "claude-sonnet-4-6"),
         "threshold": 200_000,
         "prices": (6.0, 22.5, 0.60, 7.5),
-    },
-]
-
-_SERVICE_TIER_MULTIPLIERS: list[dict[str, object]] = [
-    {
-        "service_tier": "fast",
-        "prefixes": ("claude-opus-4-6",),
-        "multiplier": 6.0,
-    },
-    {
-        "service_tier": "fast",
-        "prefixes": ("gpt-5.5",),
-        "multiplier": 2.5,
-    },
-    {
-        "service_tier": "fast",
-        "prefixes": ("gpt-5.4",),
-        "excluded_prefixes": ("gpt-5.4-pro", "gpt-5.4-mini", "gpt-5.4-nano"),
-        "multiplier": 2.0,
     },
 ]
 
@@ -301,7 +285,7 @@ def _long_context_prices(
     cache_read_tokens: int,
     cache_creation_tokens: int,
 ) -> tuple[float, float, float, float] | None:
-    """Return request-size tier pricing when this usage crosses a model tier."""
+    """Return request-size pricing when this usage crosses a model threshold."""
     if input_tokens < 0 or cache_read_tokens < 0 or cache_creation_tokens < 0:
         return None
 
@@ -311,35 +295,16 @@ def _long_context_prices(
     if _matches_any_model_prefix(model, _UNKNOWN_MODEL_PREFIXES):
         return None
     total_input_tokens = input_tokens + cache_read_tokens + cache_creation_tokens
-    for tier in _LONG_CONTEXT_TIERS:
-        prefixes = tuple(str(p) for p in tier["prefixes"])
-        excluded = tuple(str(p) for p in tier.get("excluded_prefixes", ()))
+    for rule in _LONG_CONTEXT_RULES:
+        prefixes = tuple(str(p) for p in rule["prefixes"])
+        excluded = tuple(str(p) for p in rule.get("excluded_prefixes", ()))
         if not _matches_any_model_prefix(model, prefixes) or (
             excluded and _matches_any_model_prefix(model, excluded)
         ):
             continue
-        if total_input_tokens > int(tier["threshold"]):
-            return tuple(float(v) for v in tier["prices"])  # type: ignore[return-value]
+        if total_input_tokens > int(rule["threshold"]):
+            return tuple(float(v) for v in rule["prices"])  # type: ignore[return-value]
     return None
-
-
-def _service_tier_multiplier(model: str, service_tier: str) -> float:
-    """Return a provider-specific multiplier for observable service tiers."""
-    service_tier = (service_tier or "").strip().lower()
-    if not service_tier:
-        return 1.0
-
-    model = normalize_model(model)
-    for tier in _SERVICE_TIER_MULTIPLIERS:
-        if service_tier != tier["service_tier"]:
-            continue
-        prefixes = tuple(str(p) for p in tier["prefixes"])
-        excluded = tuple(str(p) for p in tier.get("excluded_prefixes", ()))
-        if _matches_any_model_prefix(model, prefixes) and not (
-            excluded and _matches_any_model_prefix(model, excluded)
-        ):
-            return float(tier["multiplier"])
-    return 1.0
 
 
 def get_all_pricing() -> dict[str, tuple[float, float, float, float]]:
@@ -355,10 +320,9 @@ def get_pricing_fingerprint() -> str:
         "version": _PRICING_FINGERPRINT_VERSION,
         "aliases": sorted(_MODEL_ALIASES.items()),
         "builtin": sorted((model, list(prices)) for model, prices in _BUILTIN_PRICING.items()),
-        "long_context_tiers": _LONG_CONTEXT_TIERS,
+        "long_context_rules": _LONG_CONTEXT_RULES,
         "non_billable": sorted(_NON_BILLABLE_MODELS),
         "unknown_model_prefixes": sorted(_UNKNOWN_MODEL_PREFIXES),
-        "service_tier_multipliers": _SERVICE_TIER_MULTIPLIERS,
         "user": sorted((model, list(prices)) for model, prices in _load_user_pricing().items()),
     }
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -371,7 +335,6 @@ def estimate_cost(
     cache_read_tokens: int = 0,
     cache_creation_tokens: int = 0,
     cache_creation_1h_tokens: int = 0,
-    service_tier: str = "",
     apply_long_context: bool = True,
 ) -> float | None:
     """Estimate API-equivalent cost in USD.
@@ -382,7 +345,7 @@ def estimate_cost(
     ``input_tokens`` is total, subtract ``cached_input_tokens``). Anthropic's
     optional 1-hour cache writes are a subset of ``cache_creation_tokens`` and
     are charged at the 1-hour prompt-cache multiplier when provided. Long-context
-    tiers are only correct for single-request usage; callers that only have
+    rates are only correct for single-request usage; callers that only have
     hourly/session aggregates should pass ``apply_long_context=False``.
     """
     if (
@@ -415,13 +378,13 @@ def estimate_cost(
         + cache_creation_5m_tokens * p_cw
         + cache_creation_1h_tokens * (p_in * 2.0)
     ) / 1_000_000
-    return cost * _service_tier_multiplier(model, service_tier)
+    return cost
 
 
 def estimate_session_cost(session) -> float | None:
     """Estimate cost for a LiveSession object.
 
-    LiveSession counters are session aggregates, so request-size tiers cannot
+    LiveSession counters are session aggregates, so request-size rates cannot
     be inferred here.
     """
     return estimate_cost(
@@ -430,6 +393,5 @@ def estimate_session_cost(session) -> float | None:
         output_tokens=session.output_tokens,
         cache_read_tokens=session.cache_read_tokens,
         cache_creation_tokens=session.cache_creation_tokens,
-        service_tier=getattr(session, "service_tier", ""),
         apply_long_context=False,
     )

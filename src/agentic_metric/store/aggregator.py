@@ -16,7 +16,6 @@ _USAGE_SOURCE = """(
            usage_hour,
            project_path,
            model,
-           service_tier,
            message_count,
            user_turns,
            input_tokens,
@@ -32,7 +31,6 @@ _USAGE_SOURCE = """(
            CAST(strftime('%H', s.started_at, 'localtime') AS INTEGER) AS usage_hour,
            s.project_path,
            s.model,
-           '' AS service_tier,
            s.message_count,
            s.user_turns,
            s.input_tokens,
@@ -75,23 +73,14 @@ def _preferred_session_model_expr(session_alias: str = "s", usage_alias: str = "
     )"""
 
 
-def _model_tier_label_expr(model_expr: str = "model", tier_expr: str = "service_tier") -> str:
-    return f"""CASE
-        WHEN {model_expr} = '' THEN '(unknown)'
-        WHEN COALESCE({tier_expr}, '') = '' THEN {model_expr}
-        ELSE {model_expr} || ' [' || {tier_expr} || ']'
-    END"""
-
-
-def _model_label(model: str, service_tier: str = "") -> str:
+def _model_label(model: str) -> str:
     """Return a display label, hiding unpriced model ids as Unknown."""
     model = model or ""
-    service_tier = service_tier or ""
     if not model:
         return "(unknown)"
     if not is_model_priced(model):
         return "Unknown"
-    return model if not service_tier else f"{model} [{service_tier}]"
+    return model
 
 
 def _unknown_cost_expr(column: str = "estimated_cost_usd") -> str:
@@ -175,7 +164,6 @@ def merge_live_into_overview(
             t_out,
             t_cr,
             t_cw,
-            service_tier=ls.service_tier,
             apply_long_context=False,
         )
         t_unknown = 1 if t_cost is None else 0
@@ -282,7 +270,6 @@ def merge_live_into_trends(
             t_out,
             t_cr,
             t_cw,
-            service_tier=ls.service_tier,
             apply_long_context=False,
         )
         t_unknown = 1 if t_cost is None else 0
@@ -360,7 +347,6 @@ def get_model_breakdown(db: Database, days: int = 30) -> list[dict]:
     usage = _usage_source(db)
     rows = db.conn.execute(
         f"""SELECT model AS raw_model,
-                  service_tier,
                   SUM(input_tokens) AS input_tokens,
                   SUM(output_tokens) AS output_tokens,
                   SUM(cache_read_tokens) AS cache_read_tokens,
@@ -369,7 +355,7 @@ def get_model_breakdown(db: Database, days: int = 30) -> list[dict]:
                   {_unknown_cost_expr()} AS unknown_cost_count
            FROM {usage}
            WHERE usage_date >= ? AND model != ''
-           GROUP BY model, service_tier
+           GROUP BY model
            ORDER BY unknown_cost_count DESC, estimated_cost_usd DESC
         """,
         (cutoff,),
@@ -377,7 +363,7 @@ def get_model_breakdown(db: Database, days: int = 30) -> list[dict]:
     out = []
     for r in rows:
         row = dict(r)
-        row["model"] = _model_label(row.pop("raw_model") or "", row.get("service_tier") or "")
+        row["model"] = _model_label(row.pop("raw_model") or "")
         out.append(row)
     return out
 
@@ -552,7 +538,6 @@ def get_range_by_agent_model(db: Database, from_date: str, to_date: str) -> list
     rows = db.conn.execute(
         f"""SELECT agent_type,
                   model AS raw_model,
-                  service_tier,
                   COUNT(DISTINCT session_id) AS session_count,
                   COALESCE(SUM(input_tokens), 0) AS input_tokens,
                   COALESCE(SUM(output_tokens), 0) AS output_tokens,
@@ -562,7 +547,7 @@ def get_range_by_agent_model(db: Database, from_date: str, to_date: str) -> list
                   {_unknown_cost_expr()} AS unknown_cost_count
            FROM {usage}
            WHERE usage_date BETWEEN ? AND ?
-           GROUP BY agent_type, model, service_tier
+           GROUP BY agent_type, model
            ORDER BY agent_type, unknown_cost_count DESC, estimated_cost_usd DESC
         """,
         (from_date, to_date),
@@ -570,7 +555,7 @@ def get_range_by_agent_model(db: Database, from_date: str, to_date: str) -> list
     out = []
     for r in rows:
         row = dict(r)
-        row["model"] = _model_label(row.pop("raw_model") or "", row.get("service_tier") or "")
+        row["model"] = _model_label(row.pop("raw_model") or "")
         out.append(row)
     return out
 
@@ -608,7 +593,6 @@ def get_range_by_time_model(db: Database, from_date: str, to_date: str, limit: i
                   usage_hour,
                   agent_type,
                   model AS raw_model,
-                  service_tier,
                   {_session_count_expr()} AS session_count,
                   COALESCE(SUM(user_turns), 0) AS user_turns,
                   COALESCE(SUM(input_tokens), 0) AS input_tokens,
@@ -619,7 +603,7 @@ def get_range_by_time_model(db: Database, from_date: str, to_date: str, limit: i
                   {_unknown_cost_expr()} AS unknown_cost_count
            FROM {usage}
            WHERE usage_date BETWEEN ? AND ?
-           GROUP BY usage_date, usage_hour, agent_type, model, service_tier
+           GROUP BY usage_date, usage_hour, agent_type, model
            HAVING COALESCE(SUM(estimated_cost_usd), 0) > 0 OR {_unknown_cost_expr()} > 0
            ORDER BY unknown_cost_count DESC, estimated_cost_usd DESC
            LIMIT ?
@@ -629,7 +613,7 @@ def get_range_by_time_model(db: Database, from_date: str, to_date: str, limit: i
     out = []
     for r in rows:
         row = dict(r)
-        row["model"] = _model_label(row.pop("raw_model") or "", row.get("service_tier") or "")
+        row["model"] = _model_label(row.pop("raw_model") or "")
         out.append(row)
     return out
 
@@ -648,12 +632,9 @@ def get_range_top_sessions(db: Database, from_date: str, to_date: str, limit: in
                   COALESCE(
                       GROUP_CONCAT(
                           DISTINCT CASE
-                              WHEN COALESCE(u.estimated_cost_usd, 0) > 0
+                              WHEN (COALESCE(u.estimated_cost_usd, 0) > 0 OR u.estimated_cost_usd IS NULL)
                                AND u.model NOT IN ('', '<synthetic>')
-                              THEN CASE
-                                  WHEN COALESCE(u.service_tier, '') = '' THEN u.model
-                                  ELSE u.model || ' [' || u.service_tier || ']'
-                              END
+                              THEN u.model
                           END
                       ),
                       ''
@@ -681,11 +662,15 @@ def get_range_top_sessions(db: Database, from_date: str, to_date: str, limit: in
     for r in rows:
         row = dict(r)
         row["model"] = _model_label(row.get("model") or "")
-        if row.get("unknown_cost_count"):
-            models = [m.strip() for m in (row.get("models") or "").split(",") if m.strip()]
-            if "Unknown" not in models:
-                models.append("Unknown")
-            row["models"] = ",".join(models)
+        raw_models = [m.strip() for m in (row.get("models") or "").split(",") if m.strip()]
+        models = []
+        for model in raw_models:
+            label = _model_label(model)
+            if label not in models:
+                models.append(label)
+        if row.get("unknown_cost_count") and not models:
+            models.append("Unknown")
+        row["models"] = ",".join(models)
         out.append(row)
     return out
 

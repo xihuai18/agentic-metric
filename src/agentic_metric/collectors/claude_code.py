@@ -70,7 +70,6 @@ class _SessionAccum:
         "last_prompt",
         "git_branch",
         "model",
-        "service_tier",
         "today_user_turns",
         "today_message_count",
         "today_input_tokens",
@@ -104,7 +103,6 @@ class _SessionAccum:
         self.last_prompt = ""
         self.git_branch = ""
         self.model = ""
-        self.service_tier = ""
         self.today_user_turns = 0
         self.today_message_count = 0
         self.today_input_tokens = 0
@@ -115,9 +113,9 @@ class _SessionAccum:
         self.partial_line = b""
         self.file_id: tuple[int, int] | None = None
         self.file_mtime_ns = -1
-        self.assistant_message_dates: dict[str, tuple[str, int, str, str]] = {}
-        self.assistant_usage_by_id: dict[str, tuple[int, int, int, int, float | None, str, int, str, str]] = {}
-        self.usage_buckets: dict[tuple[str, int, str, str], dict] = {}
+        self.assistant_message_dates: dict[str, tuple[str, int, str]] = {}
+        self.assistant_usage_by_id: dict[str, tuple[int, int, int, int, float | None, str, int, str]] = {}
+        self.usage_buckets: dict[tuple[str, int, str], dict] = {}
 
     def read_new_lines(self) -> None:
         """Read only bytes appended since last call."""
@@ -182,7 +180,6 @@ class _SessionAccum:
         self.last_prompt = ""
         self.git_branch = ""
         self.model = ""
-        self.service_tier = ""
         self.partial_line = b""
         self.assistant_message_dates.clear()
         self.assistant_usage_by_id.clear()
@@ -230,13 +227,11 @@ class _SessionAccum:
         cache_read_tokens: int = 0,
         cache_creation_tokens: int = 0,
         estimated_cost_usd: float | None = 0.0,
-        service_tier: str | None = None,
     ) -> None:
         if not usage_date:
             return
         bucket_model = model if model is not None else self.model
-        bucket_service_tier = self.service_tier if service_tier is None else service_tier
-        key = (usage_date, usage_hour, bucket_model or "", bucket_service_tier or "")
+        key = (usage_date, usage_hour, bucket_model or "")
         bucket = self.usage_buckets.setdefault(
             key,
             {
@@ -244,7 +239,6 @@ class _SessionAccum:
                 "usage_hour": usage_hour,
                 "project_path": self.project_path,
                 "model": bucket_model or "",
-                "service_tier": bucket_service_tier or "",
                 "message_count": 0,
                 "user_turns": 0,
                 "input_tokens": 0,
@@ -255,7 +249,6 @@ class _SessionAccum:
             },
         )
         bucket["project_path"] = self.project_path
-        bucket["service_tier"] = bucket_service_tier or ""
         bucket["message_count"] += message_count
         bucket["user_turns"] += user_turns
         bucket["input_tokens"] += input_tokens
@@ -335,16 +328,12 @@ class _SessionAccum:
                 entry_date, entry_hour = today_str, 0
             bucket_model = msg_model or self.model
             usage = msg.get("usage", {}) if isinstance(msg, dict) else {}
-            service_tier = _extract_service_tier(usage) or _extract_service_tier(msg)
-            if service_tier:
-                self.service_tier = service_tier
             self._count_assistant_message(
                 msg_id,
                 entry_date,
                 entry_hour,
                 today_str,
                 bucket_model,
-                service_tier,
             )
 
             if usage:
@@ -363,7 +352,6 @@ class _SessionAccum:
                     cache_read_tokens=cr,
                     cache_creation_tokens=cw,
                     cache_creation_1h_tokens=cw_1h,
-                    service_tier=service_tier,
                 )
                 self._set_assistant_usage(
                     msg_id,
@@ -372,7 +360,6 @@ class _SessionAccum:
                     entry_hour,
                     today_str,
                     bucket_model,
-                    service_tier,
                 )
 
     def _count_assistant_message(
@@ -382,7 +369,6 @@ class _SessionAccum:
         entry_hour: int,
         today_str: str,
         model: str,
-        service_tier: str,
     ) -> None:
         """Count each Claude Code assistant message once by message id."""
         if not msg_id:
@@ -391,7 +377,6 @@ class _SessionAccum:
                 entry_date,
                 entry_hour,
                 model=model,
-                service_tier=service_tier,
                 message_count=1,
             )
             if entry_date == today_str:
@@ -400,26 +385,20 @@ class _SessionAccum:
 
         prev = self.assistant_message_dates.get(msg_id)
         if prev is None:
-            self.assistant_message_dates[msg_id] = (entry_date, entry_hour, model, service_tier)
+            self.assistant_message_dates[msg_id] = (entry_date, entry_hour, model)
             self.message_count += 1
             self._add_usage_bucket(
                 entry_date,
                 entry_hour,
                 model=model,
-                service_tier=service_tier,
                 message_count=1,
             )
             if entry_date == today_str:
                 self.today_message_count += 1
             return
 
-        prev_date, prev_hour, prev_model, prev_service_tier = prev
-        if (prev_date, prev_hour, prev_model, prev_service_tier) == (
-            entry_date,
-            entry_hour,
-            model,
-            service_tier,
-        ):
+        prev_date, prev_hour, prev_model = prev
+        if (prev_date, prev_hour, prev_model) == (entry_date, entry_hour, model):
             return
 
         # A rare cross-midnight update for the same streamed message should
@@ -428,21 +407,19 @@ class _SessionAccum:
             prev_date,
             prev_hour,
             model=prev_model,
-            service_tier=prev_service_tier,
             message_count=-1,
         )
         self._add_usage_bucket(
             entry_date,
             entry_hour,
             model=model,
-            service_tier=service_tier,
             message_count=1,
         )
         if prev_date == today_str and entry_date != today_str:
             self.today_message_count = max(0, self.today_message_count - 1)
         elif prev_date != today_str and entry_date == today_str:
             self.today_message_count += 1
-        self.assistant_message_dates[msg_id] = (entry_date, entry_hour, model, service_tier)
+        self.assistant_message_dates[msg_id] = (entry_date, entry_hour, model)
 
     def _set_assistant_usage(
         self,
@@ -452,7 +429,6 @@ class _SessionAccum:
         entry_hour: int,
         today_str: str,
         model: str,
-        service_tier: str,
     ) -> None:
         """Use the last usage snapshot for a Claude Code assistant message."""
         inp, out, cr, cw, cost = usage
@@ -460,7 +436,7 @@ class _SessionAccum:
         if msg_id:
             prev = self.assistant_usage_by_id.get(msg_id)
             if prev is not None:
-                p_in, p_out, p_cr, p_cw, p_cost, p_date, p_hour, p_model, p_service_tier = prev
+                p_in, p_out, p_cr, p_cw, p_cost, p_date, p_hour, p_model = prev
                 self.input_tokens = max(0, self.input_tokens - p_in)
                 self.output_tokens = max(0, self.output_tokens - p_out)
                 self.cache_read = max(0, self.cache_read - p_cr)
@@ -469,7 +445,6 @@ class _SessionAccum:
                     p_date,
                     p_hour,
                     model=p_model,
-                    service_tier=p_service_tier,
                     input_tokens=-p_in,
                     output_tokens=-p_out,
                     cache_read_tokens=-p_cr,
@@ -491,7 +466,6 @@ class _SessionAccum:
                 entry_date,
                 entry_hour,
                 model,
-                service_tier,
             )
 
         self.input_tokens += inp
@@ -502,7 +476,6 @@ class _SessionAccum:
             entry_date,
             entry_hour,
             model=model,
-            service_tier=service_tier,
             input_tokens=inp,
             output_tokens=out,
             cache_read_tokens=cr,
@@ -522,7 +495,6 @@ class _SessionAccum:
             project_path=self.project_path,
             git_branch=self.git_branch,
             model=self.model,
-            service_tier=self.service_tier,
             message_count=self.message_count,
             user_turns=self.user_turns,
             input_tokens=self.input_tokens,
@@ -913,24 +885,12 @@ def _usage_rows_cost(rows: list[dict]) -> float | None:
                 output_tokens=int(row.get("output_tokens") or 0),
                 cache_read_tokens=int(row.get("cache_read_tokens") or 0),
                 cache_creation_tokens=int(row.get("cache_creation_tokens") or 0),
-                service_tier=str(row.get("service_tier") or ""),
                 apply_long_context=False,
             )
         if cost is None:
             return None
         total += float(cost)
     return total
-
-
-def _extract_service_tier(payload: object) -> str:
-    """Extract provider speed/processing tier from a Claude usage payload."""
-    if not isinstance(payload, dict):
-        return ""
-    for key in ("service_tier", "serviceTier", "speed"):
-        value = payload.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip().lower()
-    return ""
 
 
 def _local_bucket(ts: str) -> tuple[str, int]:

@@ -145,40 +145,6 @@ def test_codex_cumulative_fallback_does_not_apply_long_context_cost():
     assert abs(sum(r["estimated_cost_usd"] for r in accum.usage_bucket_rows()) - expected) < 1e-12
 
 
-def test_codex_fast_mode_tier_drives_event_cost():
-    accum = CodexSessionAccum(Path("/tmp/fake.jsonl"), project_path="/test")
-    accum._process_entry({
-        "timestamp": "2026-04-24T09:59:59Z",
-        "type": "turn_context",
-        "payload": {"model": "gpt-5.5", "service_tier": "fast"},
-    })
-    accum._process_event_msg({
-        "type": "token_count",
-        "info": {
-            "total_token_usage": {
-                "input_tokens": 1_000_000,
-                "cached_input_tokens": 0,
-                "output_tokens": 1_000_000,
-            },
-            "last_token_usage": {
-                "input_tokens": 1_000_000,
-                "cached_input_tokens": 0,
-                "output_tokens": 1_000_000,
-            },
-        },
-    }, ts="2026-04-24T10:00:00Z")
-
-    rows = accum.usage_bucket_rows()
-    expected = estimate_cost(
-        "gpt-5.5",
-        input_tokens=1_000_000,
-        output_tokens=1_000_000,
-        service_tier="fast",
-    )
-    assert rows[0]["service_tier"] == "fast"
-    assert abs(sum(r["estimated_cost_usd"] for r in rows) - expected) < 1e-12
-
-
 def test_codex_unknown_model_event_cost_stays_unknown(tmp_path):
     import agentic_metric.pricing as pricing
 
@@ -408,45 +374,6 @@ def test_claude_real_model_replaces_initial_synthetic(tmp_path):
 
     assert accum.model == "claude-opus-4-7"
     assert any(r["model"] == "claude-opus-4-7" for r in accum.usage_bucket_rows())
-
-
-def test_claude_fast_mode_tier_drives_usage_cost(tmp_path):
-    session_file = tmp_path / "session.jsonl"
-    lines = [
-        {
-            "timestamp": "2026-04-23T10:00:00Z",
-            "type": "user",
-            "message": {"content": "hello"},
-        },
-        {
-            "timestamp": "2026-04-23T10:00:01Z",
-            "type": "assistant",
-            "message": {
-                "id": "fast",
-                "model": "claude-opus-4-6",
-                "usage": {
-                    "input_tokens": 1_000_000,
-                    "output_tokens": 1_000_000,
-                    "service_tier": "fast",
-                },
-            },
-        },
-    ]
-    session_file.write_text("".join(json.dumps(line) + "\n" for line in lines))
-
-    accum = ClaudeSessionAccum(session_file, project_path="/tmp/project")
-    accum.read_new_lines()
-
-    rows = accum.usage_bucket_rows()
-    expected = estimate_cost(
-        "claude-opus-4-6",
-        input_tokens=1_000_000,
-        output_tokens=1_000_000,
-        service_tier="fast",
-    )
-    assert accum.to_live_session().service_tier == "fast"
-    assert any(r["service_tier"] == "fast" for r in rows)
-    assert abs(sum(r["estimated_cost_usd"] for r in rows) - expected) < 1e-12
 
 
 def test_claude_today_counters_reset_after_midnight(tmp_path):

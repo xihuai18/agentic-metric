@@ -95,6 +95,8 @@ agentic-metric pricing reset --all                                         # Res
 
 Unknown models are not priced by default. They are displayed as `Unknown` with
 cost `?` until you add explicit pricing with `agentic-metric pricing set`.
+Provider speed/priority modes are not shown or priced separately because the
+local history files do not expose reliable non-standard markers.
 
 ### TUI Keybindings
 
