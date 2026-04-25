@@ -20,13 +20,14 @@ from agentic_metric.store.aggregator import (
     merge_live_into_overview,
     merge_live_into_trends,
 )
-from agentic_metric.cli import _fmt_cost as cli_fmt_cost
+from agentic_metric.formatting import fmt_cost as cli_fmt_cost
 from agentic_metric.tui.widgets import Breakdown, fmt_cost as tui_fmt_cost
 
 
 def _make_db() -> Database:
-    """Create an in-memory database for testing."""
-    tmp = tempfile.mktemp(suffix=".db")
+    """Create a temporary file-based database for testing."""
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        tmp = f.name
     return Database(db_path=tmp)
 
 

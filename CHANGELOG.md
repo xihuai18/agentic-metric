@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.3.0 (2026-04-25)
+
+### Improvements
+
+- **Documentation rewrite**: both README.md and README-CN.md have been
+  restructured with full CLI option documentation, pricing sub-command
+  reference (long-context, cache-duration), builtin model pricing tables,
+  architecture overview, and data flow diagram.
+- **Formatting module extracted**: pure formatting helpers (`fmt_cost`,
+  `fmt_tokens`, `clip`, `short_path`, etc.) moved from `cli.py` to
+  `formatting.py`, reducing `cli.py` by ~170 lines and making helpers
+  independently testable and importable.
+- **CI workflows**: added `.github/workflows/test.yml` (Python 3.10–3.13
+  matrix on push/PR); `publish.yml` now runs tests before building.
+- **Dev dependencies**: added `ruff` and `pytest-cov` to `[dev]` extras.
+
+### Bug fixes
+
+- **`--version` package name**: `agentic-metric --version` now queries the
+  correct PyPI package name `agentic-metric-x` instead of `agentic-metric`,
+  fixing a `PackageNotFoundError` when only the `-x` variant is installed.
+- **`--range` date validation**: `report --range` now validates date format
+  with `strptime` and rejects reversed ranges (`FROM > TO`) with a clear
+  error instead of passing invalid dates to the database.
+- **Pricing thread safety**: `_load_user_config` and `_save_user_config` are
+  now protected by `threading.Lock`, preventing data races if called from
+  background threads.
+- **Self-referencing model alias removed**: the no-op entry
+  `"gpt-5.1-codex-max": "gpt-5.1-codex-max"` has been removed from
+  `_MODEL_ALIASES`.
+- **Dead code removed**: the unused `big` parameter in `_stat()` has been
+  removed.
+- **Test reliability**: `test_store.py` no longer uses `tempfile.mktemp`
+  (TOCTOU race); `test_pricing.py` uses an `autouse` fixture for cache
+  reset consistency.
+
 ## v0.2.5 (2026-04-25)
 
 ### Bug fixes

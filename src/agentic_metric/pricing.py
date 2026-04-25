@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 
 from .config import PRICING_FILE
 
@@ -78,7 +79,6 @@ _MODEL_ALIASES: dict[str, str] = {
     "claude-4.5-sonnet-thinking": "claude-sonnet-4-5",
     "claude-4.5-opus-high-thinking": "claude-opus-4-5",
     "codex-auto-review": "gpt-5.3-codex",
-    "gpt-5.1-codex-max": "gpt-5.1-codex-max",
 }
 
 # Internal placeholder/system responses that should never be billed as a model.
@@ -147,6 +147,7 @@ def _matches_any_model_prefix(model: str, prefixes: tuple[str, ...]) -> bool:
 
 _user_cache: dict[str, object] | None = None
 _user_cache_mtime: float = -1.0
+_user_cache_lock = threading.Lock()
 
 
 def _empty_user_config() -> dict[str, object]:
@@ -171,104 +172,107 @@ def _load_user_config() -> dict[str, object]:
     """Load structured user pricing config from JSON, cached by mtime."""
     global _user_cache, _user_cache_mtime
 
-    if not PRICING_FILE.exists():
-        if _user_cache is not None:
-            _user_cache = None
-            _user_cache_mtime = -1.0
-        return _empty_user_config()
+    with _user_cache_lock:
+        if not PRICING_FILE.exists():
+            if _user_cache is not None:
+                _user_cache = None
+                _user_cache_mtime = -1.0
+            return _empty_user_config()
 
-    try:
-        mtime = PRICING_FILE.stat().st_mtime
-    except OSError:
-        return _user_cache or _empty_user_config()
+        try:
+            mtime = PRICING_FILE.stat().st_mtime
+        except OSError:
+            return _user_cache or _empty_user_config()
 
-    if _user_cache is not None and mtime == _user_cache_mtime:
-        return _user_cache
+        if _user_cache is not None and mtime == _user_cache_mtime:
+            return _user_cache
 
-    try:
-        data = json.loads(PRICING_FILE.read_text())
-        if not isinstance(data, dict):
-            raise ValueError("pricing config must be an object")
+        try:
+            data = json.loads(PRICING_FILE.read_text())
+            if not isinstance(data, dict):
+                raise ValueError("pricing config must be an object")
 
-        result = _empty_user_config()
+            result = _empty_user_config()
 
-        models: dict[str, PriceTuple] = {}
-        for model, vals in (data.get("models") or {}).items():
-            models[normalize_model(str(model))] = _price_tuple(vals)
-        result["models"] = models
+            models: dict[str, PriceTuple] = {}
+            for model, vals in (data.get("models") or {}).items():
+                models[normalize_model(str(model))] = _price_tuple(vals)
+            result["models"] = models
 
-        long_context: dict[str, dict[str, object]] = {}
-        for model, rule in (data.get("long_context") or {}).items():
-            if not isinstance(rule, dict):
-                raise ValueError("long-context rule must be an object")
-            long_context[normalize_model(str(model))] = {
-                "threshold": int(rule["threshold"]),
-                "prices": _price_tuple(rule["prices"]),
-            }
-        result["long_context"] = long_context
+            long_context: dict[str, dict[str, object]] = {}
+            for model, rule in (data.get("long_context") or {}).items():
+                if not isinstance(rule, dict):
+                    raise ValueError("long-context rule must be an object")
+                long_context[normalize_model(str(model))] = {
+                    "threshold": int(rule["threshold"]),
+                    "prices": _price_tuple(rule["prices"]),
+                }
+            result["long_context"] = long_context
 
-        cache: dict[str, dict[str, float]] = {}
-        for model, rule in (data.get("cache") or {}).items():
-            if not isinstance(rule, dict):
-                raise ValueError("cache rule must be an object")
-            cache_rule: dict[str, float] = {}
-            if "write_1h" in rule:
-                cache_rule["write_1h"] = float(rule["write_1h"])
-            if cache_rule:
-                cache[normalize_model(str(model))] = cache_rule
-        result["cache"] = cache
+            cache: dict[str, dict[str, float]] = {}
+            for model, rule in (data.get("cache") or {}).items():
+                if not isinstance(rule, dict):
+                    raise ValueError("cache rule must be an object")
+                cache_rule: dict[str, float] = {}
+                if "write_1h" in rule:
+                    cache_rule["write_1h"] = float(rule["write_1h"])
+                if cache_rule:
+                    cache[normalize_model(str(model))] = cache_rule
+            result["cache"] = cache
 
-        disabled = data.get("disabled_builtin_long_context") or []
-        if not isinstance(disabled, list):
-            raise ValueError("disabled_builtin_long_context must be a list")
-        result["disabled_builtin_long_context"] = [
-            normalize_model(str(model)) for model in disabled
-        ]
+            disabled = data.get("disabled_builtin_long_context") or []
+            if not isinstance(disabled, list):
+                raise ValueError("disabled_builtin_long_context must be a list")
+            result["disabled_builtin_long_context"] = [
+                normalize_model(str(model)) for model in disabled
+            ]
 
-        _user_cache = result
-        _user_cache_mtime = mtime
-        return result
-    except (json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError):
-        log.warning("Failed to parse %s, ignoring user overrides", PRICING_FILE)
-        return _empty_user_config()
+            _user_cache = result
+            _user_cache_mtime = mtime
+            return result
+        except (json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError):
+            log.warning("Failed to parse %s, ignoring user overrides", PRICING_FILE)
+            return _empty_user_config()
 
 
 def _save_user_config(config: dict[str, object]) -> None:
     """Save structured user pricing config and invalidate cache."""
     global _user_cache, _user_cache_mtime
-    PRICING_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-    models = {
-        model: list(vals)
-        for model, vals in sorted(
-            (config.get("models") or {}).items()  # type: ignore[union-attr]
-        )
-    }
-    long_context = {
-        model: {
-            "threshold": int(rule["threshold"]),
-            "prices": list(rule["prices"]),
+    with _user_cache_lock:
+        PRICING_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+        models = {
+            model: list(vals)
+            for model, vals in sorted(
+                (config.get("models") or {}).items()  # type: ignore[union-attr]
+            )
         }
-        for model, rule in sorted(
-            (config.get("long_context") or {}).items()  # type: ignore[union-attr]
-        )
-    }
-    cache = {
-        model: dict(rule)
-        for model, rule in sorted(
-            (config.get("cache") or {}).items()  # type: ignore[union-attr]
-        )
-    }
-    disabled = sorted(str(model) for model in config.get("disabled_builtin_long_context") or [])
-    data: dict[str, object] = {
-        "models": models,
-        "long_context": long_context,
-        "cache": cache,
-        "disabled_builtin_long_context": disabled,
-    }
-    PRICING_FILE.write_text(json.dumps(data, indent=2) + "\n")
-    _user_cache = None
-    _user_cache_mtime = -1.0
+        long_context = {
+            model: {
+                "threshold": int(rule["threshold"]),
+                "prices": list(rule["prices"]),
+            }
+            for model, rule in sorted(
+                (config.get("long_context") or {}).items()  # type: ignore[union-attr]
+            )
+        }
+        cache = {
+            model: dict(rule)
+            for model, rule in sorted(
+                (config.get("cache") or {}).items()  # type: ignore[union-attr]
+            )
+        }
+        disabled = sorted(str(model) for model in config.get("disabled_builtin_long_context") or [])
+        data: dict[str, object] = {
+            "models": models,
+            "long_context": long_context,
+            "cache": cache,
+            "disabled_builtin_long_context": disabled,
+        }
+        PRICING_FILE.write_text(json.dumps(data, indent=2) + "\n")
+        _user_cache = None
+        _user_cache_mtime = -1.0
 
 
 def _load_user_pricing() -> dict[str, PriceTuple]:
@@ -308,10 +312,11 @@ def remove_user_pricing(model: str) -> bool:
 def reset_all_user_pricing() -> None:
     """Remove all user pricing config."""
     global _user_cache, _user_cache_mtime
-    if PRICING_FILE.exists():
-        PRICING_FILE.unlink()
-    _user_cache = None
-    _user_cache_mtime = -1.0
+    with _user_cache_lock:
+        if PRICING_FILE.exists():
+            PRICING_FILE.unlink()
+        _user_cache = None
+        _user_cache_mtime = -1.0
 
 
 def set_user_long_context_pricing(

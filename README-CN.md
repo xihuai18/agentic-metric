@@ -16,7 +16,7 @@
 ## 功能
 
 - **实时监控** — 检测运行中的 agent 进程,增量解析 JSONL 会话数据
-- **成本估算** — 基于各模型定价表计算 API 等效成本,支持 CLI 管理定价
+- **成本估算** — 基于各模型定价表计算 API 等效成本,支持 CLI 管理定价;支持长上下文和缓存时长定价
 - **统一的用量报告** — 单个 `report` 命令覆盖今日 / 本周 / 本月 / 自定义区间,含 agent × model 明细、项目排行、会话排行、小时/天/周热图
 - **TUI 仪表盘** — 终端图形界面,实时刷新,含汇总卡片、热图条、30 天成本柱图、agent × model 分解
 - **多 Agent 支持** — 插件架构;目前支持 Claude Code 和 Codex,可扩展
@@ -75,13 +75,28 @@ agentic-metric history -d 30         # 最近 N 天(默认 14 天)
 agentic-metric pricing               # 管理模型定价
 ```
 
+### Report 选项
+
+| 选项 | 说明 |
+|------|------|
+| `--today` | 今日用量 |
+| `--week` | 本周用量(周一至今) |
+| `--month` | 本月用量 |
+| `--range FROM:TO` | 自定义日期区间,如 `2026-04-01:2026-04-23` |
+| `--full` | 显示更多明细表(agent × model、时间粒度分解) |
+| `--limit N` / `-n N` | 明细表行数(1–25,默认 8) |
+| `--no-sync` | 跳过查询前的 collector 同步 |
+
 `report` 会输出:总成本 / sessions / 用户轮次 / tokens / 缓存命中率的汇总条,
 与上一同类周期的差额,一个热图条(`--today` 按小时、`--week` 按日、`--month`
-按周),30 天成本柱图,以及 agent × model、项目、会话、时间桶的明细表。
+按周),以及 agent × model、项目、会话、时间桶的明细表。
 
 ### 定价管理
 
-模型定价用于成本估算。常见模型已内置定价,你可以通过 CLI 添加新模型或覆盖现有价格 — 用户自定义定价存储在 `$DATA/agentic_metric/pricing.json`。
+模型定价用于成本估算。常见模型已内置定价,你可以通过 CLI 添加新模型、覆盖现有价格、
+配置长上下文费率和缓存时长费率。用户自定义定价存储在 `$DATA/agentic_metric/pricing.json`。
+
+#### 基础模型定价
 
 ```bash
 agentic-metric pricing list                                                # 查看所有模型定价
@@ -91,7 +106,29 @@ agentic-metric pricing reset deepseek-r2                                   # 恢
 agentic-metric pricing reset --all                                         # 恢复所有定价为默认
 ```
 
+#### 长上下文定价
+
+某些模型在单次请求超过 token 阈值时会使用更高的费率。工具在 collector 提供事件级用量时按事件应用这些费率。
+
+```bash
+agentic-metric pricing long-context set gpt-5.5 --threshold 272000 -i 10 -o 45 -cr 1 -cw 0
+agentic-metric pricing long-context reset gpt-5.5        # 删除用户覆盖
+agentic-metric pricing long-context disable gpt-5.5      # 禁用内置规则
+agentic-metric pricing long-context enable gpt-5.5       # 重新启用内置规则
+```
+
+#### 缓存时长定价
+
+Anthropic 对不同 TTL 的 cache write 收取不同费率。工具默认使用 5 分钟费率;如需 1 小时缓存时长,可手动覆盖。
+
+```bash
+agentic-metric pricing cache set claude-sonnet-4 --write-1h 6    # 设置 1 小时 cache write 价格
+agentic-metric pricing cache reset claude-sonnet-4                # 删除覆盖
+```
+
 未知模型不会自动套用默认价或模型族价格。界面会显示为 `Unknown`,费用显示为 `?`,直到你用 `agentic-metric pricing set` 添加明确价格。
+
+定价变更后,命令会自动重新同步历史数据,从原始 JSONL 数据重新计算事件级成本(如长上下文请求)。
 
 ### TUI 快捷键
 
@@ -103,6 +140,91 @@ agentic-metric pricing reset --all                                         # 恢
 | `t` / `w` / `m` | 直接聚焦 Today / Week / Month |
 | `r` | 刷新数据 |
 | `q` | 退出 |
+
+## 内置模型定价
+
+价格为 USD / 1M tokens。数据来源为官方定价页面(2026-04-25 核实)。
+
+<details>
+<summary>Anthropic Claude</summary>
+
+| 模型 | Input | Output | Cache Read | Cache Write |
+|------|------:|-------:|-----------:|------------:|
+| claude-opus-4-7 / 4-6 / 4-5 | $5.00 | $25.00 | $0.50 | $6.25 |
+| claude-opus-4-1 / 4 | $15.00 | $75.00 | $1.50 | $18.75 |
+| claude-sonnet-4-6 / 4-5 / 4 / 3-7 | $3.00 | $15.00 | $0.30 | $3.75 |
+| claude-haiku-4-5 | $1.00 | $5.00 | $0.10 | $1.25 |
+| claude-haiku-3-5 | $0.80 | $4.00 | $0.08 | $1.00 |
+
+</details>
+
+<details>
+<summary>OpenAI GPT</summary>
+
+| 模型 | Input | Output | Cache Read | Cache Write |
+|------|------:|-------:|-----------:|------------:|
+| gpt-5.5 | $5.00 | $30.00 | $0.50 | — |
+| gpt-5.4 | $2.50 | $15.00 | $0.25 | — |
+| gpt-5.4-mini | $0.75 | $4.50 | $0.075 | — |
+| gpt-5.4-nano | $0.20 | $1.25 | $0.02 | — |
+| gpt-5.3 / 5.2 / 5.1 / 5 | $1.25–$1.75 | $10.00–$14.00 | $0.125–$0.175 | — |
+
+</details>
+
+<details>
+<summary>Google Gemini</summary>
+
+| 模型 | Input | Output | Cache Read | Cache Write |
+|------|------:|-------:|-----------:|------------:|
+| gemini-3.1-pro / 3-pro | $2.00 | $12.00 | $0.20 | — |
+| gemini-3-flash | $0.50 | $3.00 | $0.05 | — |
+| gemini-2.5-pro | $1.25 | $10.00 | $0.125 | — |
+| gemini-2.5-flash | $0.30 | $2.50 | $0.03 | — |
+
+</details>
+
+<details>
+<summary>其他</summary>
+
+| 模型 | Input | Output | Cache Read | Cache Write |
+|------|------:|-------:|-----------:|------------:|
+| kimi-k2.6 | $0.95 | $4.00 | $0.16 | — |
+| glm-5.1 | $0.95 | $3.15 | $0.10 | — |
+
+</details>
+
+运行 `agentic-metric pricing list` 查看完整定价表(包含你的覆盖配置)。
+
+## 架构
+
+```
+src/agentic_metric/
+├── cli.py              # Typer CLI 命令和 Rich 报告渲染
+├── config.py           # 平台路径、环境变量、常量
+├── models.py           # 数据类(LiveSession, TodayOverview, DailyTrend)
+├── pricing.py          # 内置 + 用户定价,成本估算引擎
+├── collectors/
+│   ├── __init__.py     # Collector 注册中心和基类
+│   ├── claude_code.py  # Claude Code JSONL 解析器和进程检测
+│   ├── codex.py        # Codex JSONL 解析器和进程检测
+│   └── _process.py     # 跨平台进程检测(psutil / tasklist)
+├── store/
+│   ├── __init__.py
+│   ├── database.py     # SQLite 数据库(sessions, session_usage 分桶表)
+│   └── aggregator.py   # 查询层:区间汇总、热图、多维分解
+└── tui/
+    ├── __init__.py
+    ├── app.py          # Textual TUI 应用
+    └── widgets.py      # 自定义 TUI 组件
+```
+
+### 数据流
+
+1. **Collectors** 读取 agent 数据文件(`~/.claude/`、`~/.codex/`),产出 `LiveSession` 对象。
+2. **Database** 将 sessions 和按日拆分的 `session_usage` 桶存入 SQLite。
+3. **Aggregator** 执行 SQL 查询生成报告(区间汇总、热图、agent/model/project 分解)。
+4. **CLI** 使用 Rich 渲染表格和面板。**TUI** 使用 Textual 提供实时仪表盘。
+5. **Pricing** 引擎按事件计算成本(支持长上下文)或按会话汇总计算。
 
 ## 数据来源
 

@@ -17,6 +17,11 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install and test
+        run: |
+          pip install -e ".[dev]"
+          pytest
+
       - name: Build package
         run: |
           pip install build

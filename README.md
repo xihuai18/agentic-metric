@@ -16,7 +16,7 @@ A local-only monitoring tool for AI coding agents — like `top`, but for your c
 ## Features
 
 - **Live monitoring** — Detect running agent processes, incremental JSONL session parsing
-- **Cost estimation** — Per-model pricing table with CLI management, calculates API-equivalent costs
+- **Cost estimation** — Per-model pricing table with CLI management, calculates API-equivalent costs; supports long-context and cache-duration pricing
 - **Unified report** — One `report` command for today / week / month / custom date range, with agent × model breakdown, top projects, top sessions, and hourly/daily/weekly heatmaps
 - **TUI dashboard** — Terminal UI with live refresh, stacked summary cells, heatmap strip, 30-day cost chart, and agent × model breakdown
 - **Multi-agent** — Plugin architecture; supports Claude Code and Codex today, extensible
@@ -76,10 +76,22 @@ agentic-metric history -d 30         # Last N days (default 14)
 agentic-metric pricing               # Manage model pricing
 ```
 
+### Report Options
+
+| Option | Description |
+|--------|-------------|
+| `--today` | Today's usage |
+| `--week` | This week (Mon → today) |
+| `--month` | This month |
+| `--range FROM:TO` | Custom date range, e.g. `2026-04-01:2026-04-23` |
+| `--full` | Show extra drill-down tables (agent × model, periodic breakdown) |
+| `--limit N` / `-n N` | Rows in driver tables (1–25, default 8) |
+| `--no-sync` | Skip syncing collectors before querying |
+
 `report` shows a header with total cost / sessions / turns / tokens / cache-hit
 rate, a delta vs. the previous equivalent period, a heatmap strip (hours for
-`--today`, days for `--week`, weeks for `--month`), a 30-day cost chart, and
-breakdowns by agent × model, top projects, top sessions, and time buckets.
+`--today`, days for `--week`, weeks for `--month`), and breakdowns by agent ×
+model, top projects, top sessions, and time buckets.
 
 ### Pricing Management
 
@@ -88,16 +100,38 @@ common models. You can add new models, override builtins, configure
 long-context rates, and configure observable cache-duration rates via CLI.
 Overrides are stored in `$DATA/agentic_metric/pricing.json`.
 
+#### Basic model pricing
+
 ```bash
-agentic-metric pricing list
-agentic-metric pricing set deepseek-r2 -i 0.5 -o 2.0
-agentic-metric pricing set claude-opus-4-7 -i 4.0 -o 20.0 -cr 0.4 -cw 5.0
+agentic-metric pricing list                                                # List all model pricing
+agentic-metric pricing set deepseek-r2 -i 0.5 -o 2.0                       # Add a new model
+agentic-metric pricing set claude-opus-4-7 -i 4.0 -o 20.0 -cr 0.4 -cw 5.0  # Override builtin
+agentic-metric pricing reset deepseek-r2                                   # Reset one model to builtin
+agentic-metric pricing reset --all                                         # Reset all overrides
+```
+
+#### Long-context pricing
+
+Some models charge higher rates when a single request exceeds a token
+threshold. The tool applies these rates per-event when collectors provide
+event-level usage.
+
+```bash
 agentic-metric pricing long-context set gpt-5.5 --threshold 272000 -i 10 -o 45 -cr 1 -cw 0
-agentic-metric pricing long-context disable gpt-5.5
-agentic-metric pricing long-context enable gpt-5.5
-agentic-metric pricing cache set claude-sonnet-4 --write-1h 6
-agentic-metric pricing reset deepseek-r2
-agentic-metric pricing reset --all
+agentic-metric pricing long-context reset gpt-5.5        # Remove user override
+agentic-metric pricing long-context disable gpt-5.5      # Disable builtin rule
+agentic-metric pricing long-context enable gpt-5.5       # Re-enable builtin rule
+```
+
+#### Cache-duration pricing
+
+Anthropic charges different cache-write prices depending on cache TTL.
+By default the tool uses the 5-minute rate; override for 1-hour cache
+duration when applicable.
+
+```bash
+agentic-metric pricing cache set claude-sonnet-4 --write-1h 6    # Set 1h cache write price
+agentic-metric pricing cache reset claude-sonnet-4                # Remove override
 ```
 
 Unknown models are not priced by default. They are displayed as `Unknown` with
@@ -118,6 +152,92 @@ such as long-context requests are recalculated from the original JSONL data.
 | `t` / `w` / `m` | Focus Today / Week / Month directly |
 | `r` | Refresh data |
 | `q` | Quit |
+
+## Builtin Model Pricing
+
+Prices are USD per 1M tokens. Verified against official pricing docs
+(2026-04-25).
+
+<details>
+<summary>Anthropic Claude</summary>
+
+| Model | Input | Output | Cache Read | Cache Write |
+|-------|------:|-------:|-----------:|------------:|
+| claude-opus-4-7 / 4-6 / 4-5 | $5.00 | $25.00 | $0.50 | $6.25 |
+| claude-opus-4-1 / 4 | $15.00 | $75.00 | $1.50 | $18.75 |
+| claude-sonnet-4-6 / 4-5 / 4 / 3-7 | $3.00 | $15.00 | $0.30 | $3.75 |
+| claude-haiku-4-5 | $1.00 | $5.00 | $0.10 | $1.25 |
+| claude-haiku-3-5 | $0.80 | $4.00 | $0.08 | $1.00 |
+
+</details>
+
+<details>
+<summary>OpenAI GPT</summary>
+
+| Model | Input | Output | Cache Read | Cache Write |
+|-------|------:|-------:|-----------:|------------:|
+| gpt-5.5 | $5.00 | $30.00 | $0.50 | — |
+| gpt-5.4 | $2.50 | $15.00 | $0.25 | — |
+| gpt-5.4-mini | $0.75 | $4.50 | $0.075 | — |
+| gpt-5.4-nano | $0.20 | $1.25 | $0.02 | — |
+| gpt-5.3 / 5.2 / 5.1 / 5 | $1.25–$1.75 | $10.00–$14.00 | $0.125–$0.175 | — |
+
+</details>
+
+<details>
+<summary>Google Gemini</summary>
+
+| Model | Input | Output | Cache Read | Cache Write |
+|-------|------:|-------:|-----------:|------------:|
+| gemini-3.1-pro / 3-pro | $2.00 | $12.00 | $0.20 | — |
+| gemini-3-flash | $0.50 | $3.00 | $0.05 | — |
+| gemini-2.5-pro | $1.25 | $10.00 | $0.125 | — |
+| gemini-2.5-flash | $0.30 | $2.50 | $0.03 | — |
+
+</details>
+
+<details>
+<summary>Others</summary>
+
+| Model | Input | Output | Cache Read | Cache Write |
+|-------|------:|-------:|-----------:|------------:|
+| kimi-k2.6 | $0.95 | $4.00 | $0.16 | — |
+| glm-5.1 | $0.95 | $3.15 | $0.10 | — |
+
+</details>
+
+Run `agentic-metric pricing list` for the full table including your overrides.
+
+## Architecture
+
+```
+src/agentic_metric/
+├── cli.py              # Typer CLI commands and Rich report rendering
+├── config.py           # Platform paths, environment variables, constants
+├── models.py           # Data classes (LiveSession, TodayOverview, DailyTrend)
+├── pricing.py          # Builtin + user pricing, cost estimation engine
+├── collectors/
+│   ├── __init__.py     # Collector registry and base class
+│   ├── claude_code.py  # Claude Code JSONL parser and process detector
+│   ├── codex.py        # Codex JSONL parser and process detector
+│   └── _process.py     # Cross-platform process detection (psutil/tasklist)
+├── store/
+│   ├── __init__.py
+│   ├── database.py     # SQLite database (sessions, session_usage buckets)
+│   └── aggregator.py   # Query layer: range totals, heatmaps, breakdowns
+└── tui/
+    ├── __init__.py
+    ├── app.py          # Textual TUI application
+    └── widgets.py      # Custom TUI widgets
+```
+
+### Data flow
+
+1. **Collectors** read agent data files (`~/.claude/`, `~/.codex/`) and emit `LiveSession` objects.
+2. **Database** stores sessions and per-day `session_usage` buckets in SQLite.
+3. **Aggregator** runs SQL queries for reports (range totals, heatmaps, breakdowns by agent/model/project).
+4. **CLI** renders Rich tables and panels. **TUI** uses Textual for a live dashboard.
+5. **Pricing** engine calculates costs per-event (long-context aware) or per-session.
 
 ## Data Sources
 

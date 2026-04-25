@@ -26,7 +26,9 @@ class LiveSession:
     first_prompt: str = ""
     last_prompt: str = ""
     pid: int = 0
-    # Today-only counters (for cross-day sessions; equal to totals if started today)
+    # Today-only counters (for cross-day sessions; equal to totals if started today).
+    # Default -1 means "not computed" — collectors set these to 0+ once they
+    # have enough data to split today's portion from the session total.
     today_input_tokens: int = -1
     today_output_tokens: int = -1
     today_cache_read_tokens: int = -1

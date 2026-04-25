@@ -3,6 +3,8 @@
 import json
 from unittest.mock import patch
 
+import pytest
+
 from agentic_metric.pricing import (
     PRICING,
     _BUILTIN_PRICING,
@@ -30,6 +32,19 @@ def _reset_cache():
     import agentic_metric.pricing as p
     p._user_cache = None
     p._user_cache_mtime = -1.0
+
+
+@pytest.fixture(autouse=True)
+def _reset_pricing_state():
+    """Reset all global pricing state before and after each test."""
+    import agentic_metric.pricing as p
+    p._user_cache = None
+    p._user_cache_mtime = -1.0
+    p._warned_models.clear()
+    yield
+    p._user_cache = None
+    p._user_cache_mtime = -1.0
+    p._warned_models.clear()
 
 
 def _patch_empty_user_pricing(tmp_path):
