@@ -422,9 +422,9 @@ def _auto_summary_line(
 
 def _build_heatmap_panel(buckets: list[dict], focus_kind: str) -> Panel:
     """Render the activity heatmap as a CLI panel."""
-    blocks = [" ", "·", "░", "▒", "▓", "█", "█"]
+    blocks = ["·", "•", "░", "▒", "▓", "█", "█"]
     styles = [
-        "default",
+        "grey35",
         "dim green",
         "green",
         "green",
@@ -481,22 +481,25 @@ def _build_heatmap_panel(buckets: list[dict], focus_kind: str) -> Panel:
     total_cost = sum((bb.get("cost") or 0) for bb in buckets)
     total_unknown = any(_has_unknown_cost(bb) for bb in buckets)
     total_tokens = sum((bb.get("tokens") or 0) for bb in buckets)
-    summary = Text(" ")
+    summary_1 = Text(" ")
     if (peak.get("cost") or 0) > 0 or peak_unknown:
-        summary.append("peak ", style=C_MUTED)
-        summary.append(peak["label"], style="bold")
-        summary.append(f"  {_fmt_cost(peak.get('cost'), unknown=peak_unknown)}", style=C_YELLOW)
-        summary.append(f"  {_fmt_tokens(peak.get('tokens') or 0)}", style=C_TEAL)
-        summary.append("    ")
-    summary.append("total ", style=C_MUTED)
-    summary.append(_fmt_cost(total_cost, unknown=total_unknown), style=f"bold {C_YELLOW}")
-    summary.append(f"  {_fmt_tokens(total_tokens)} tokens", style=C_TEAL)
+        summary_1.append("peak ", style=C_MUTED)
+        summary_1.append(peak["label"], style="bold")
+        summary_1.append(f"  {_fmt_cost(peak.get('cost'), unknown=peak_unknown)}", style=C_YELLOW)
+        summary_1.append(f"  {_fmt_tokens(peak.get('tokens') or 0)}", style=C_TEAL)
+    else:
+        summary_1.append("peak —", style=C_MUTED)
+
+    summary_2 = Text(" ")
+    summary_2.append("total ", style=C_MUTED)
+    summary_2.append(_fmt_cost(total_cost, unknown=total_unknown), style=f"bold {C_YELLOW}")
+    summary_2.append(f"  {_fmt_tokens(total_tokens)} tokens", style=C_TEAL)
 
     titles = {"today": "Today by hour",
               "week":  "This week by day",
               "month": "This month by week"}
     return Panel(
-        Group(row_blocks, row_labels, Text(""), summary),
+        Group(row_blocks, row_labels, summary_1, summary_2),
         title=titles.get(focus_kind, "Heatmap"),
         title_align="left",
         box=box.ROUNDED,
@@ -1071,7 +1074,7 @@ def pricing_long_context_set(
     cache_read: float = typer.Option(0.0, "--cache-read", "-cr", help="Cache read price per 1M tokens."),
     cache_write: float = typer.Option(0.0, "--cache-write", "-cw", help="Cache write price per 1M tokens."),
 ) -> None:
-    """Add or update long-context pricing for a model prefix."""
+    """Add or update one long-context tier for a model prefix."""
     if model is None or threshold is None or input_price is None or output_price is None:
         console.print(ctx.get_help())
         console.print()
@@ -1079,6 +1082,10 @@ def pricing_long_context_set(
         console.print(
             f"  [{C_MUTED}]agentic-metric pricing long-context set gpt-5.5 "
             f"--threshold 272000 -i 10 -o 45 -cr 1 -cw 0[/]"
+        )
+        console.print(
+            f"  [{C_MUTED}]agentic-metric pricing long-context set gpt-5.5 "
+            f"--threshold 512000 -i 12 -o 52 -cr 1.2 -cw 0[/]"
         )
         raise typer.Exit()
 
@@ -1104,15 +1111,22 @@ def pricing_long_context_set(
 @long_context_app.command("reset")
 def pricing_long_context_reset(
     model: str = typer.Argument(..., help="Model prefix to reset."),
+    threshold: int = typer.Option(None, "--threshold", "-t", help="Remove one threshold tier only."),
 ) -> None:
-    """Remove a user long-context override and fall back to builtin behavior."""
+    """Remove one or all user long-context tiers and fall back to builtin behavior."""
     from .pricing import remove_user_long_context_pricing
 
-    if remove_user_long_context_pricing(model):
-        console.print(f"[bold {C_GREEN}]✓[/] Removed long-context override for {model}.")
+    if remove_user_long_context_pricing(model, threshold=threshold):
+        if threshold is None:
+            console.print(f"[bold {C_GREEN}]✓[/] Removed all long-context overrides for {model}.")
+        else:
+            console.print(f"[bold {C_GREEN}]✓[/] Removed long-context tier {threshold:,} for {model}.")
         _refresh_history_after_pricing_change()
     else:
-        console.print(f"[{C_YELLOW}]{model} has no long-context override.[/]")
+        if threshold is None:
+            console.print(f"[{C_YELLOW}]{model} has no long-context override.[/]")
+        else:
+            console.print(f"[{C_YELLOW}]{model} has no long-context tier at {threshold:,}.[/]")
 
 
 @long_context_app.command("disable")

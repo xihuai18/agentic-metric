@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from rich.console import Group
 from rich.text import Text
 from textual.widgets import Static
 
@@ -206,9 +207,9 @@ class PeriodicHeatmap(Static):
         # 7-level single-hue gradient. We keep one green family and vary
         # density / intensity so the strip reads cleanly in terminals
         # without turning into a rainbow.
-        blocks = [" ", "·", "░", "▒", "▓", "█", "█"]
+        blocks = ["·", "•", "░", "▒", "▓", "█", "█"]
         colors = [
-            "default",           # 0: idle
+            "grey35",            # 0: idle
             "dim green",         # 1: trace
             "green",             # 2: low
             "green",             # 3: low-mid
@@ -220,31 +221,30 @@ class PeriodicHeatmap(Static):
         levels = len(blocks)
 
         n = len(buckets := self._buckets)
-        # Per-bucket cell width — blocks fill the whole cell so the strip
-        # reads as one continuous heat gradient; labels get centred
-        # underneath.
         if n >= 20:
-            cell_w = 4
+            preferred_cell_w = 4
             label_every = 3
         elif n >= 10:
-            cell_w = 6
+            preferred_cell_w = 6
             label_every = 1
         elif n >= 6:
-            cell_w = 8
+            preferred_cell_w = 8
             label_every = 1
         else:
-            cell_w = 12
+            preferred_cell_w = 12
             label_every = 1
         try:
-            available = max(12, self.size.width - 2)
-            cell_w = min(cell_w, max(2, available // max(n, 1)))
+            available = max(1, self.size.width - 2)
         except Exception:
-            pass
+            available = max(1, preferred_cell_w * max(n, 1))
 
-        row_blocks = Text()
-        row_labels = Text()
-        row_blocks.append(" ")
-        row_labels.append(" ")
+        min_cell_w = 2 if available >= 2 else 1
+        if n and n * min_cell_w <= available:
+            cell_w = min(preferred_cell_w, max(min_cell_w, available // n))
+            buckets_per_row = n
+        else:
+            cell_w = min_cell_w
+            buckets_per_row = max(1, available // max(cell_w, 1))
 
         known_peak_idx = max(range(n), key=lambda i: buckets[i].get("cost") or 0)
         unknown_peak_idx = next((i for i, b in enumerate(buckets) if _has_unknown_cost(b)), None)
@@ -255,45 +255,52 @@ class PeriodicHeatmap(Static):
         total_unknown = any(_has_unknown_cost(b) for b in buckets)
         total_tokens = sum(b.get("tokens") or 0 for b in buckets)
 
-        for i, b in enumerate(buckets):
-            ratio = (b.get("cost") or 0) / max_v
-            lvl = min(levels - 1, int(round(ratio * (levels - 1))))
-            block = blocks[lvl]
-            style = colors[lvl]
-            if i == self._highlight:
-                style = f"{style} reverse"
+        rows: list[Text] = []
+        for start in range(0, n, buckets_per_row):
+            chunk = buckets[start : start + buckets_per_row]
+            row_blocks = Text(" ")
+            row_labels = Text(" ")
+            for offset, b in enumerate(chunk):
+                i = start + offset
+                ratio = (b.get("cost") or 0) / max_v
+                lvl = min(levels - 1, int(round(ratio * (levels - 1))))
+                block = blocks[lvl]
+                style = colors[lvl]
+                if i == self._highlight:
+                    style = f"{style} reverse"
 
-            # Fill the whole cell with the block char — no inter-bucket
-            # spacing, so adjacent buckets form a continuous strip.
-            row_blocks.append(block * cell_w, style=style)
+                row_blocks.append(block * cell_w, style=style)
 
-            if i % label_every == 0:
-                label = b["label"][:cell_w]
-                row_labels.append(label.center(cell_w), style="white")
-            else:
-                row_labels.append(" " * cell_w, style="default")
+                if i % label_every == 0:
+                    label = b["label"][:cell_w]
+                    row_labels.append(label.center(cell_w), style="white")
+                else:
+                    row_labels.append(" " * cell_w, style="default")
+            rows.extend([row_blocks, row_labels])
 
         peak_b = buckets[peak_idx]
-        summary = Text()
-        summary.append("  ")
+        summary_1 = Text("  ")
         peak_unknown = _has_unknown_cost(peak_b)
         if (peak_b.get("cost") or 0) > 0 or peak_unknown:
-            summary.append("peak ", style="white")
-            summary.append(peak_b["label"], style="bold")
-            summary.append(f"  {fmt_cost(peak_b.get('cost'), unknown=peak_unknown)}", style="bright_yellow")
-            summary.append(f"  {_fmt_tokens_shared(peak_b.get('tokens') or 0)}", style="bright_cyan")
-            summary.append("    ")
-        summary.append("total ", style="white")
-        summary.append(fmt_cost(total_cost, unknown=total_unknown), style="bold bright_yellow")
-        summary.append(f"  {_fmt_tokens_shared(total_tokens)} tokens", style="bright_cyan")
+            summary_1.append("peak ", style="white")
+            summary_1.append(peak_b["label"], style="bold")
+            summary_1.append(
+                f"  {fmt_cost(peak_b.get('cost'), unknown=peak_unknown)}",
+                style="bright_yellow",
+            )
+            summary_1.append(
+                f"  {_fmt_tokens_shared(peak_b.get('tokens') or 0)}",
+                style="bright_cyan",
+            )
+        else:
+            summary_1.append("peak —", style="white")
 
-        t = Text()
-        t.append_text(row_blocks)
-        t.append("\n")
-        t.append_text(row_labels)
-        t.append("\n")
-        t.append_text(summary)
-        return t
+        summary_2 = Text("  ")
+        summary_2.append("total ", style="white")
+        summary_2.append(fmt_cost(total_cost, unknown=total_unknown), style="bold bright_yellow")
+        summary_2.append(f"  {_fmt_tokens_shared(total_tokens)} tokens", style="bright_cyan")
+
+        return Group(*rows, summary_1, summary_2)
 
 
 # Keep the old name as an alias for backwards compatibility
@@ -302,6 +309,121 @@ HourHeatmap = PeriodicHeatmap
 
 def _fmt_tokens_shared(n: int) -> str:
     return fmt_tokens(n)
+
+
+def _bucket_label_shared(row: dict) -> str:
+    date_s = row.get("usage_date") or ""
+    hour = int(row.get("usage_hour") or 0)
+    try:
+        dt = datetime.strptime(date_s, "%Y-%m-%d")
+        day = f"{dt.strftime('%b')} {dt.day}"
+    except ValueError:
+        day = date_s
+    return f"{day} {hour:02d}:00" if day else f"{hour:02d}:00"
+
+
+def _short_path_shared(path: str, max_len: int) -> str:
+    if not path:
+        return "(unspecified)"
+    if len(path) <= max_len:
+        return path
+    return path[: max_len - 1] + "…"
+
+
+def _clip_shared(value: str, max_len: int) -> str:
+    if len(value) <= max_len:
+        return value
+    return value[: max(0, max_len - 1)] + "…"
+
+
+class CostDriverSummary(Static):
+    """Width-aware multi-line cost-driver summary for the TUI."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._peak: dict | None = None
+        self._project: dict | None = None
+
+    def update_data(self, peak: dict | None, project: dict | None) -> None:
+        self._peak = peak
+        self._project = project
+        self.refresh()
+
+    def render(self) -> Group | Text:
+        if self._peak is None and self._project is None:
+            return Text("  No cost drivers in this period", style="white")
+
+        try:
+            content_width = max(12, self.size.width - 2)
+        except Exception:
+            content_width = 48
+
+        lines: list[Text] = []
+
+        if self._peak is not None:
+            peak = self._peak
+            peak_unknown = _has_unknown_cost(peak)
+            peak_model = peak["model"]
+            if peak_model == "Unknown" and peak.get("raw_model"):
+                peak_model = f"Unknown: {peak['raw_model']}"
+            model_max = max(16, content_width - len("  Top agent × model "))
+
+            line_1 = Text("  ")
+            line_1.append("Top agent × model ", style="white")
+            line_1.append(
+                _clip_shared(f"{peak['agent_type']} / {peak_model}", model_max),
+                style="bright_cyan",
+            )
+            lines.append(line_1)
+
+            line_2 = Text("  ")
+            line_2.append(_bucket_label_shared(peak), style="bold bright_blue")
+            line_2.append("  ·  ", style="white")
+            line_2.append(
+                fmt_cost(peak.get("estimated_cost_usd"), unknown=peak_unknown),
+                style="bold bright_yellow",
+            )
+            lines.append(line_2)
+
+            line_3 = Text("  ")
+            line_3.append(_clip_shared(_split_label_shared(peak), max(12, content_width - 2)), style="white")
+            lines.append(line_3)
+
+        if self._project is not None and (
+            (self._project.get("estimated_cost_usd") or 0) > 0
+            or _has_unknown_cost(self._project)
+        ):
+            project = self._project
+            project_unknown = _has_unknown_cost(project)
+            path_max = max(12, content_width - len("  Top project  ") - 10)
+
+            line_4 = Text("  ")
+            line_4.append("Top project ", style="white")
+            line_4.append(
+                _short_path_shared(project["project_path"], path_max),
+                style="bright_blue",
+            )
+            line_4.append("  ·  ", style="white")
+            line_4.append(
+                fmt_cost(project.get("estimated_cost_usd"), unknown=project_unknown),
+                style="bright_yellow",
+            )
+            lines.append(line_4)
+
+        return Group(*lines)
+
+
+def _split_label_shared(row: dict) -> str:
+    cache = (row.get("cache_read_tokens") or row.get("cache") or 0) + (
+        row.get("cache_creation_tokens") or 0
+    )
+    parts = [
+        f"in {fmt_tokens(row.get('input_tokens') or row.get('input') or 0)}",
+        f"out {fmt_tokens(row.get('output_tokens') or row.get('output') or 0)}",
+    ]
+    if cache > 0:
+        parts.append(f"cache {fmt_tokens(cache)}")
+    return "  ".join(parts)
 
 
 class Breakdown(Static):

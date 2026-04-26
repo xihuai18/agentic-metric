@@ -29,7 +29,7 @@ from ..store.aggregator import (
     resolve_range,
 )
 from ..store.database import Database
-from .widgets import Breakdown, PeriodicHeatmap, SummaryCell, fmt_cost, fmt_tokens
+from .widgets import Breakdown, CostDriverSummary, PeriodicHeatmap, SummaryCell, fmt_cost, fmt_tokens
 
 
 def _total_tokens(d: dict) -> int:
@@ -164,9 +164,9 @@ class AgenticMetricApp(App):
         # styled via the `-auto-on` class in styles.tcss.
         Binding("R", "auto_refresh_on", "Auto", key_display="R"),
         Binding("R", "auto_refresh_off", "Auto", key_display="R"),
-        Binding("alt+c", "copy_view", "Copy", key_display="Alt+C"),
+        Binding("alt+c,ctrl+y", "copy_view", "Copy", key_display="Alt+C", priority=True, show=False),
         # Keep Ctrl+C from quitting; some terminals also use it while copying.
-        Binding("ctrl+c", "noop", show=False),
+        Binding("ctrl+c", "noop", show=False, priority=True),
         Binding("q", "quit", "Quit"),
     ]
 
@@ -191,7 +191,7 @@ class AgenticMetricApp(App):
         with Vertical(id="heatmap-panel"):
             yield Static("Today by hour", id="heatmap-title")
             yield PeriodicHeatmap(id="heatmap")
-            yield Static("", id="driver-line")
+            yield CostDriverSummary(id="driver-line")
         with Vertical(id="chart-panel"):
             yield Static("Trend", id="chart-title")
             yield PlotextPlot(id="chart")
@@ -240,19 +240,8 @@ class AgenticMetricApp(App):
         """Populate the heatmap strip for the currently focused view."""
         buckets = get_heatmap(self._db, self._focus, offset=self._offset)
 
-        # Determine which bucket to highlight as "now".
-        highlight: int | None = None
-        if self._offset == 0:
-            if self._focus == "today":
-                highlight = datetime.now().hour
-            elif self._focus == "week":
-                highlight = datetime.now().weekday()
-            elif self._focus == "month":
-                # Last bucket (current week)
-                highlight = len(buckets) - 1 if buckets else None
-
         self.query_one("#heatmap", PeriodicHeatmap).update_data(
-            buckets, highlight_index=highlight,
+            buckets, highlight_index=None,
         )
 
         titles = {
@@ -280,46 +269,15 @@ class AgenticMetricApp(App):
         peak_rows = get_range_by_time_model(self._db, frm, to, limit=1)
         project_rows = get_range_by_project(self._db, frm, to, limit=1)
 
-        line = Text()
-        has_driver = False
-        if peak_rows:
-            peak = peak_rows[0]
-            peak_unknown = _has_unknown_cost(peak)
-            line.append(" top agent × model ", style="white")
-            peak_model = peak['model']
-            if peak_model == "Unknown" and peak.get("raw_model"):
-                peak_model = f"Unknown: {peak['raw_model']}"
-            line.append(f"{peak['agent_type']} / {peak_model}", style="bright_cyan")
-            line.append("  ·  ", style="white")
-            line.append(_bucket_label(peak), style="bold bright_blue")
-            line.append("  ·  ", style="white")
-            line.append(
-                fmt_cost(peak.get("estimated_cost_usd"), unknown=peak_unknown),
-                style="bold bright_yellow",
-            )
-            line.append("  ·  ", style="white")
-            line.append(_split_label(peak), style="white")
-            has_driver = True
+        peak = peak_rows[0] if peak_rows else None
+        project = None
         if project_rows and (
             (project_rows[0].get("estimated_cost_usd") or 0) > 0
             or _has_unknown_cost(project_rows[0])
         ):
-            if peak_rows:
-                line.append("    ", style="white")
             project = project_rows[0]
-            project_unknown = _has_unknown_cost(project)
-            line.append("top project ", style="white")
-            line.append(_short_path(project["project_path"]), style="bright_blue")
-            line.append("  ·  ", style="white")
-            line.append(
-                fmt_cost(project.get("estimated_cost_usd"), unknown=project_unknown),
-                style="bright_yellow",
-            )
-            has_driver = True
-        if not has_driver:
-            line.append(" no cost drivers in this period", style="white")
 
-        self.query_one("#driver-line", Static).update(line)
+        self.query_one("#driver-line", CostDriverSummary).update_data(peak, project)
 
     def _populate_summary(self) -> None:
         active_count = self._count_active()
@@ -384,7 +342,7 @@ class AgenticMetricApp(App):
         # show ~6 ticks to avoid crowding
         step = max(1, len(xs) // 6)
         plt.xticks(xs[::step], labels[::step])
-        plt.ylabel("$")
+        plt.ylabel("USD")
 
         # Stretch the y-axis a bit so bar-top labels don't get clipped.
         plt.ylim(0, max_y * 1.18)
@@ -574,7 +532,7 @@ class AgenticMetricApp(App):
 
     def action_noop(self) -> None:
         """Keep Ctrl+C from quitting; point people at the TUI copy key."""
-        self.notify("Press [bold]Alt+C[/] to copy, [bold]q[/] to quit", severity="information")
+        self.notify("Press [bold]q[/] to quit", severity="information")
 
     def action_copy_view(self) -> None:
         """Copy selected text, or fall back to a compact snapshot of the current view."""

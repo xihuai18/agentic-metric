@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.3.6 (2026-04-26)
+
+### Improvements
+
+- **Heatmap readability**: the CLI and TUI heatmaps now use visible low-end
+  glyphs instead of transparent-looking blanks, and the peak / total summary
+  below the strip is split across separate lines for more reliable alignment.
+- **Adaptive TUI heatmap layout**: the TUI heatmap now wraps by live terminal
+  width instead of forcing everything into one overlong row, and the cost-driver
+  area under the heatmap uses a width-aware multi-line layout.
+- **Current-bucket highlight removed**: week / month no longer reverse-highlight
+  the current day or week, so the strip only communicates intensity.
+- **Trend axis labeling**: the TUI trend chart now labels the y-axis as `USD`
+  instead of a lone `$`.
+- **Long-context pricing tiers**: request-size pricing now supports multiple
+  thresholds per model prefix, and builtin `gpt-5.5` long-context pricing now
+  starts at `272,000` tokens.
+
 ## v0.3.5 (2026-04-26)
 
 ### Fixed

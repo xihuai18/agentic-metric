@@ -91,7 +91,7 @@ _UNKNOWN_MODEL_PREFIXES = (
     "gpt-5-pro",
 )
 
-_PRICING_FINGERPRINT_VERSION = 9
+_PRICING_FINGERPRINT_VERSION = 10
 
 # Long-context pricing applies per request/prompt, not per stored hour/session.
 # Collectors pass single-event usage into ``estimate_cost`` before aggregating
@@ -99,35 +99,63 @@ _PRICING_FINGERPRINT_VERSION = 9
 _LONG_CONTEXT_RULES: list[dict[str, object]] = [
     {
         "prefixes": ("gpt-5.5",),
-        "threshold": 270_000,
-        "prices": (10.0, 45.0, 1.0, 0.0),
+        "tiers": (
+            {"threshold": 272_000, "prices": (10.0, 45.0, 1.0, 0.0)},
+        ),
     },
     {
         "prefixes": ("gpt-5.4",),
         "excluded_prefixes": ("gpt-5.4-mini", "gpt-5.4-nano"),
-        "threshold": 272_000,
-        "prices": (5.0, 22.5, 0.50, 0.0),
+        "tiers": (
+            {"threshold": 272_000, "prices": (5.0, 22.5, 0.50, 0.0)},
+        ),
     },
     {
         "prefixes": ("gemini-3.1-pro",),
-        "threshold": 200_000,
-        "prices": (4.0, 18.0, 0.40, 0.0),
+        "tiers": (
+            {"threshold": 200_000, "prices": (4.0, 18.0, 0.40, 0.0)},
+        ),
     },
     {
         "prefixes": ("gemini-2.5-pro",),
-        "threshold": 200_000,
-        "prices": (2.5, 15.0, 0.25, 0.0),
+        "tiers": (
+            {"threshold": 200_000, "prices": (2.5, 15.0, 0.25, 0.0)},
+        ),
     },
     {
         "prefixes": ("claude-sonnet-4",),
         "excluded_prefixes": ("claude-sonnet-4-5", "claude-sonnet-4-6"),
-        "threshold": 200_000,
-        "prices": (6.0, 22.5, 0.60, 7.5),
+        "tiers": (
+            {"threshold": 200_000, "prices": (6.0, 22.5, 0.60, 7.5)},
+        ),
     },
 ]
 
 # Track warned models to avoid spamming logs
 _warned_models: set[str] = set()
+
+
+def _normalize_long_context_tiers(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("long-context tiers must be a list")
+    tiers: list[dict[str, object]] = []
+    for tier in value:
+        if not isinstance(tier, dict):
+            raise ValueError("long-context tier must be an object")
+        tiers.append({
+            "threshold": int(tier["threshold"]),
+            "prices": _price_tuple(tier["prices"]),
+        })
+    tiers.sort(key=lambda t: int(t["threshold"]))
+    return tiers
+
+
+def _matched_tier_prices(total_input_tokens: int, tiers: list[dict[str, object]]) -> tuple[float, float, float, float] | None:
+    matched: tuple[float, float, float, float] | None = None
+    for tier in tiers:
+        if total_input_tokens > int(tier["threshold"]):
+            matched = tuple(float(v) for v in tier["prices"])  # type: ignore[assignment]
+    return matched
 
 
 def _matches_model_prefix(model: str, prefix: str) -> bool:
@@ -199,10 +227,14 @@ def _load_user_config() -> dict[str, object]:
             for model, rule in (data.get("long_context") or {}).items():
                 if not isinstance(rule, dict):
                     raise ValueError("long-context rule must be an object")
-                long_context[normalize_model(str(model))] = {
-                    "threshold": int(rule["threshold"]),
-                    "prices": _price_tuple(rule["prices"]),
-                }
+                if "tiers" in rule:
+                    tiers = _normalize_long_context_tiers(rule["tiers"])
+                else:
+                    tiers = _normalize_long_context_tiers([{
+                        "threshold": rule["threshold"],
+                        "prices": rule["prices"],
+                    }])
+                long_context[normalize_model(str(model))] = {"tiers": tiers}
             result["long_context"] = long_context
 
             cache: dict[str, dict[str, float]] = {}
@@ -246,8 +278,13 @@ def _save_user_config(config: dict[str, object]) -> None:
         }
         long_context = {
             model: {
-                "threshold": int(rule["threshold"]),
-                "prices": list(rule["prices"]),
+                "tiers": [
+                    {
+                        "threshold": int(tier["threshold"]),
+                        "prices": list(tier["prices"]),
+                    }
+                    for tier in rule["tiers"]
+                ],
             }
             for model, rule in sorted(
                 (config.get("long_context") or {}).items()  # type: ignore[union-attr]
@@ -323,16 +360,21 @@ def set_user_long_context_pricing(
     cache_read_price: float = 0.0,
     cache_write_price: float = 0.0,
 ) -> None:
-    """Add or update request-size long-context pricing for a model prefix."""
+    """Add or update one request-size long-context tier for a model prefix."""
     if threshold < 0:
         raise ValueError("threshold must be non-negative")
     config = _load_user_config()
     rules: dict[str, dict[str, object]] = dict(config.get("long_context") or {})
     model = normalize_model(model)
-    rules[model] = {
+    existing = dict(rules.get(model) or {})
+    tiers = _normalize_long_context_tiers(existing.get("tiers") or [])
+    tiers = [tier for tier in tiers if int(tier["threshold"]) != int(threshold)]
+    tiers.append({
         "threshold": int(threshold),
         "prices": (input_price, output_price, cache_read_price, cache_write_price),
-    }
+    })
+    tiers.sort(key=lambda tier: int(tier["threshold"]))
+    rules[model] = {"tiers": tiers}
     disabled = set(str(v) for v in config.get("disabled_builtin_long_context") or [])
     disabled.discard(model)
     config["long_context"] = rules
@@ -340,14 +382,25 @@ def set_user_long_context_pricing(
     _save_user_config(config)
 
 
-def remove_user_long_context_pricing(model: str) -> bool:
-    """Remove a user long-context override without disabling builtin rules."""
+def remove_user_long_context_pricing(model: str, threshold: int | None = None) -> bool:
+    """Remove one or all user long-context tiers without disabling builtin rules."""
     config = _load_user_config()
     rules: dict[str, dict[str, object]] = dict(config.get("long_context") or {})
     model = normalize_model(model)
     if model not in rules:
         return False
-    del rules[model]
+    if threshold is None:
+        del rules[model]
+    else:
+        existing = dict(rules[model] or {})
+        tiers = _normalize_long_context_tiers(existing.get("tiers") or [])
+        next_tiers = [tier for tier in tiers if int(tier["threshold"]) != int(threshold)]
+        if len(next_tiers) == len(tiers):
+            return False
+        if next_tiers:
+            rules[model] = {"tiers": next_tiers}
+        else:
+            del rules[model]
     config["long_context"] = rules
     _save_user_config(config)
     return True
@@ -460,8 +513,7 @@ def _user_long_context_rules() -> list[dict[str, object]]:
     for model, rule in (_load_user_config().get("long_context") or {}).items():
         rules.append({
             "prefixes": (str(model),),
-            "threshold": int(rule["threshold"]),
-            "prices": tuple(float(v) for v in rule["prices"]),
+            "tiers": _normalize_long_context_tiers(rule.get("tiers") or []),
             "source": "user",
         })
     rules.sort(key=lambda r: len(str(r["prefixes"][0])), reverse=True)
@@ -475,17 +527,27 @@ def _builtin_long_context_enabled(rule: dict[str, object]) -> bool:
 
 
 def get_long_context_rules(*, include_disabled: bool = False) -> list[dict[str, object]]:
-    """Return effective long-context pricing rules for display and fingerprints."""
+    """Return effective long-context pricing tiers for display and fingerprints."""
     rules: list[dict[str, object]] = []
     for rule in _user_long_context_rules():
-        rules.append(dict(rule))
+        base = {k: v for k, v in rule.items() if k != "tiers"}
+        for tier in rule["tiers"]:
+            row = dict(base)
+            row["threshold"] = int(tier["threshold"])
+            row["prices"] = tuple(float(v) for v in tier["prices"])
+            rules.append(row)
     for rule in _LONG_CONTEXT_RULES:
         enabled = _builtin_long_context_enabled(rule)
         if not enabled and not include_disabled:
             continue
-        row = dict(rule)
-        row["source"] = "builtin" if enabled else "disabled"
-        rules.append(row)
+        base = {k: v for k, v in rule.items() if k != "tiers"}
+        for tier in _normalize_long_context_tiers(rule["tiers"]):
+            row = dict(base)
+            row["threshold"] = int(tier["threshold"])
+            row["prices"] = tuple(float(v) for v in tier["prices"])
+            row["source"] = "builtin" if enabled else "disabled"
+            rules.append(row)
+    rules.sort(key=lambda r: (len(str(r["prefixes"][0])) * -1, int(r["threshold"])))
     return rules
 
 
@@ -504,24 +566,32 @@ def _long_context_prices(
 
     for rule in _user_long_context_rules():
         prefixes = tuple(str(p) for p in rule["prefixes"])
-        if _matches_any_model_prefix(model, prefixes) and total_input_tokens > int(rule["threshold"]):
-            return tuple(float(v) for v in rule["prices"])  # type: ignore[return-value]
+        if not _matches_any_model_prefix(model, prefixes):
+            continue
+        matched = _matched_tier_prices(total_input_tokens, rule["tiers"])
+        if matched is not None:
+            return matched
 
     if _matches_any_model_prefix(model, _UNKNOWN_MODEL_PREFIXES):
         return None
 
+    current_prefixes: tuple[str, ...] | None = None
+    matched_builtin: tuple[float, float, float, float] | None = None
     for rule in get_long_context_rules():
-        if rule.get("source") == "user":
+        if rule.get("source") not in {"builtin", "disabled"}:
             continue
         prefixes = tuple(str(p) for p in rule["prefixes"])
+        if current_prefixes is not None and prefixes != current_prefixes and matched_builtin is not None:
+            return matched_builtin
         excluded = tuple(str(p) for p in rule.get("excluded_prefixes", ()))
         if not _matches_any_model_prefix(model, prefixes) or (
             excluded and _matches_any_model_prefix(model, excluded)
         ):
             continue
+        current_prefixes = prefixes
         if total_input_tokens > int(rule["threshold"]):
-            return tuple(float(v) for v in rule["prices"])  # type: ignore[return-value]
-    return None
+            matched_builtin = tuple(float(v) for v in rule["prices"])  # type: ignore[assignment]
+    return matched_builtin
 
 
 def get_all_pricing() -> dict[str, tuple[float, float, float, float]]:

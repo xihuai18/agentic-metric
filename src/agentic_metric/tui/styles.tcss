@@ -70,7 +70,8 @@ SummaryCell.-focused {
 /* ─── Hourly heatmap (today only) ─── */
 
 #heatmap-panel {
-    height: 7;
+    height: auto;
+    min-height: 8;
     margin: 0 1;
     padding: 0 1;
     border: round white;
@@ -83,11 +84,13 @@ SummaryCell.-focused {
 }
 
 #heatmap {
-    height: 3;
+    height: auto;
+    min-height: 4;
 }
 
 #driver-line {
-    height: 1;
+    height: auto;
+    min-height: 3;
     color: $text;
 }
 

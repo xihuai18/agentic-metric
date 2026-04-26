@@ -15,6 +15,7 @@ from agentic_metric.pricing import (
     estimate_session_cost,
     get_all_pricing,
     get_cache_write_1h_price,
+    get_long_context_rules,
     get_pricing,
     get_pricing_fingerprint,
     remove_user_pricing,
@@ -170,12 +171,32 @@ def test_gpt_55_long_context_uses_long_context_rate(tmp_path):
     with _patch_empty_user_pricing(tmp_path):
         cost = estimate_cost(
             "gpt-5.5",
-            input_tokens=500_000,
+            input_tokens=272_001,
             output_tokens=1_000,
             cache_read_tokens=10_000,
         )
-        expected = (500_000 * 10.0 + 1_000 * 45.0 + 10_000 * 1.0) / 1_000_000
+        expected = (272_001 * 10.0 + 1_000 * 45.0 + 10_000 * 1.0) / 1_000_000
         assert abs(cost - expected) < 0.001
+    _reset_cache()
+
+
+def test_builtin_long_context_uses_highest_matching_tier(tmp_path):
+    with _patch_empty_user_pricing(tmp_path):
+        with patch("agentic_metric.pricing._LONG_CONTEXT_RULES", [{
+            "prefixes": ("gpt-5.5",),
+            "tiers": (
+                {"threshold": 272_000, "prices": (10.0, 45.0, 1.0, 0.0)},
+                {"threshold": 512_000, "prices": (12.0, 52.0, 1.2, 0.0)},
+            ),
+        }]):
+            cost = estimate_cost(
+                "gpt-5.5",
+                input_tokens=600_000,
+                output_tokens=1_000,
+                cache_read_tokens=10_000,
+            )
+            expected = (600_000 * 12.0 + 1_000 * 52.0 + 10_000 * 1.2) / 1_000_000
+            assert abs(cost - expected) < 0.001
     _reset_cache()
 
 
@@ -406,6 +427,41 @@ def test_user_long_context_override_takes_precedence(tmp_path):
 
         assert remove_user_long_context_pricing("gpt-5.4") is True
         assert remove_user_long_context_pricing("gpt-5.4") is False
+    _reset_cache()
+
+
+def test_user_long_context_supports_multiple_tiers(tmp_path):
+    pricing_file = tmp_path / "pricing.json"
+
+    _reset_cache()
+    with patch("agentic_metric.pricing.PRICING_FILE", pricing_file):
+        set_user_long_context_pricing("gpt-5.5", 272_000, 10.0, 45.0, 1.0, 0.0)
+        set_user_long_context_pricing("gpt-5.5", 512_000, 12.0, 52.0, 1.2, 0.0)
+
+        rules = [r for r in get_long_context_rules() if tuple(r["prefixes"]) == ("gpt-5.5",) and r["source"] == "user"]
+        assert [r["threshold"] for r in rules] == [272_000, 512_000]
+
+        low_cost = estimate_cost(
+            "gpt-5.5",
+            input_tokens=300_000,
+            output_tokens=1_000,
+            cache_read_tokens=10_000,
+        )
+        expected_low = (300_000 * 10.0 + 1_000 * 45.0 + 10_000 * 1.0) / 1_000_000
+        assert abs(low_cost - expected_low) < 0.001
+
+        high_cost = estimate_cost(
+            "gpt-5.5",
+            input_tokens=600_000,
+            output_tokens=1_000,
+            cache_read_tokens=10_000,
+        )
+        expected_high = (600_000 * 12.0 + 1_000 * 52.0 + 10_000 * 1.2) / 1_000_000
+        assert abs(high_cost - expected_high) < 0.001
+
+        assert remove_user_long_context_pricing("gpt-5.5", threshold=512_000) is True
+        rules = [r for r in get_long_context_rules() if tuple(r["prefixes"]) == ("gpt-5.5",) and r["source"] == "user"]
+        assert [r["threshold"] for r in rules] == [272_000]
     _reset_cache()
 
 
