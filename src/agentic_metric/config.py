@@ -49,4 +49,4 @@ PRICING_FILE = DATA_DIR / "pricing.json"
 # Refresh intervals (seconds)
 LIVE_REFRESH_INTERVAL = 1  # running sessions
 DATA_SYNC_INTERVAL = 300  # history sync to sqlite
-AUTO_REFRESH_INTERVAL = 30  # TUI auto-refresh mode (toggled with Shift+R)
+AUTO_REFRESH_INTERVAL = 30  # TUI auto-refresh mode (toggled with R)

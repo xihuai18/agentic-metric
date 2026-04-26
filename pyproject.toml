@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agentic-metric-x"
-version = "0.3.3"
+version = "0.3.4"
 description = "Local-only monitoring tool for AI coding agents — track token usage and costs across Claude Code and Codex"
 readme = "README.md"
 license = "MIT"

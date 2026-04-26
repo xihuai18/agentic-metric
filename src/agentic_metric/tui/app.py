@@ -12,6 +12,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.timer import Timer
 from textual.widgets import Footer, Header, Static
+from textual.widgets._footer import FooterKey
 from textual_plotext import PlotextPlot
 
 from ..collectors import CollectorRegistry, create_default_registry
@@ -100,6 +101,22 @@ def _shorten_home(path: str) -> str:
     return path
 
 
+class _AutoAwareFooter(Footer):
+    """Footer that tags the currently-visible auto-refresh binding.
+
+    ``check_action`` hides the "off" variant while auto-refresh is inactive
+    (and vice versa), so whichever FooterKey survives here is the one
+    matching the current state. The ``-auto-on`` class on the "off" key
+    lets the stylesheet highlight it while running.
+    """
+
+    def compose(self) -> ComposeResult:
+        for child in super().compose():
+            if isinstance(child, FooterKey) and child.action == "auto_refresh_off":
+                child.add_class("-auto-on")
+            yield child
+
+
 def _split_label(row: dict) -> str:
     cache = (row.get("cache_read_tokens") or row.get("cache") or 0) + (
         row.get("cache_creation_tokens") or 0
@@ -130,7 +147,12 @@ class AgenticMetricApp(App):
         Binding("w", "focus('week')", "Week", show=False),
         Binding("m", "focus('month')", "Month", show=False),
         Binding("r", "refresh_all", "Refresh"),
-        Binding("shift+r", "toggle_auto_refresh", "Auto"),
+        # Two bindings on the same key; `check_action` picks whichever
+        # matches the current state so the footer always shows one label.
+        # The "off" variant (visible while auto-refresh is running) is
+        # styled via the `-auto-on` class in styles.tcss.
+        Binding("R", "auto_refresh_on", "Auto", key_display="R"),
+        Binding("R", "auto_refresh_off", "Auto", key_display="R"),
         # Let Ctrl+C pass through to the terminal for native copy.
         Binding("ctrl+c", "noop", show=False),
         Binding("q", "quit", "Quit"),
@@ -164,7 +186,7 @@ class AgenticMetricApp(App):
         with Vertical(id="breakdown-panel"):
             yield Static("By agent × model", id="breakdown-title")
             yield Breakdown(id="breakdown-body")
-        yield Footer()
+        yield _AutoAwareFooter()
 
     def on_mount(self) -> None:
         self._today_sessions = get_today_sessions(self._db)
@@ -510,18 +532,33 @@ class AgenticMetricApp(App):
         self.notify("Syncing…")
         self.run_worker(self._sync_worker, thread=True, exclusive=True, group="sync")
 
-    def action_toggle_auto_refresh(self) -> None:
-        """Toggle the fast auto-sync timer (runs in addition to the 5-min one)."""
+    def action_auto_refresh_on(self) -> None:
+        """Enable the fast auto-sync timer (runs in addition to the 5-min one)."""
         if self._auto_refresh_timer is not None:
-            self._auto_refresh_timer.stop()
-            self._auto_refresh_timer = None
-            self.notify("Auto-refresh off")
             return
         self._auto_refresh_timer = self.set_interval(
             AUTO_REFRESH_INTERVAL, self._tick_sync
         )
         self._tick_sync()
         self.notify(f"Auto-refresh on — every {AUTO_REFRESH_INTERVAL}s")
+        self.refresh_bindings()
+
+    def action_auto_refresh_off(self) -> None:
+        """Stop the fast auto-sync timer."""
+        if self._auto_refresh_timer is None:
+            return
+        self._auto_refresh_timer.stop()
+        self._auto_refresh_timer = None
+        self.notify("Auto-refresh off")
+        self.refresh_bindings()
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        """Hide whichever auto-refresh binding doesn't match current state."""
+        if action == "auto_refresh_on":
+            return self._auto_refresh_timer is None
+        if action == "auto_refresh_off":
+            return self._auto_refresh_timer is not None
+        return True
 
     def action_noop(self) -> None:
         """Intercept Ctrl+C so it doesn't quit; hint the real quit key."""

@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.3.4 (2026-04-26)
+
+### Improvements
+
+- **Auto-refresh key & active indicator**: the TUI auto-refresh toggle
+  is now bound to plain `R` (no Shift prefix in the footer label) and
+  visibly highlights while running — the key cell turns green and the
+  "Auto" label becomes bold yellow, so you can tell at a glance whether
+  the 30-second sync is active.
+
 ## v0.3.3 (2026-04-26)
 
 ### Improvements

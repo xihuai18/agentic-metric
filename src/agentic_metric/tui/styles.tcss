@@ -26,6 +26,16 @@ Footer > .footer--key {
     text-style: bold;
 }
 
+/* Highlight the R binding in the footer while auto-refresh is running. */
+FooterKey.-auto-on .footer-key--key {
+    background: $success;
+}
+
+FooterKey.-auto-on .footer-key--description {
+    color: $warning;
+    text-style: bold;
+}
+
 /* ─── Top summary row: 3 cells side by side ─── */
 
 #summary-row {
