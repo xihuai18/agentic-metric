@@ -138,7 +138,8 @@ agentic-metric pricing cache reset claude-sonnet-4                # 删除覆盖
 | `↑` / `↓` | 时间范围往前 / 往后 |
 | `.` | 回到"现在"(清空 offset) |
 | `t` / `w` / `m` | 直接聚焦 Today / Week / Month |
-| `r` | 刷新数据 |
+| `r` | 手动刷新一次 |
+| `R` | 切换自动刷新(每 30 秒) |
 | `q` | 退出 |
 
 ## 内置模型定价

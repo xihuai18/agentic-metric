@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.3.3 (2026-04-26)
+
+### Improvements
+
+- **TUI auto-refresh toggle**: press `Shift+R` to toggle a 30-second
+  auto-sync in addition to the existing 5-minute cadence. Lowercase `r`
+  continues to trigger a one-shot manual sync.
+
+### Removed
+
+- **Kimi and GLM pricing**: the Moonshot Kimi and Zhipu GLM builtin
+  pricing rows were removed along with the "Others" section in both
+  READMEs, since these providers are not reachable through the supported
+  Claude Code / Codex collectors.
+
 ## v0.3.2 (2026-04-25)
 
 ### Improvements

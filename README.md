@@ -150,7 +150,8 @@ such as long-context requests are recalculated from the original JSONL data.
 | `↑` / `↓` | Move time range earlier / later |
 | `.` | Jump back to "now" (reset offset) |
 | `t` / `w` / `m` | Focus Today / Week / Month directly |
-| `r` | Refresh data |
+| `r` | Refresh data once |
+| `R` | Toggle auto-refresh (every 30s) |
 | `q` | Quit |
 
 ## Builtin Model Pricing

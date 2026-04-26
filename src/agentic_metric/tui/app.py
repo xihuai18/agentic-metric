@@ -10,11 +10,12 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.timer import Timer
 from textual.widgets import Footer, Header, Static
 from textual_plotext import PlotextPlot
 
 from ..collectors import CollectorRegistry, create_default_registry
-from ..config import DATA_SYNC_INTERVAL, LIVE_REFRESH_INTERVAL
+from ..config import AUTO_REFRESH_INTERVAL, DATA_SYNC_INTERVAL, LIVE_REFRESH_INTERVAL
 from ..models import LiveSession
 from ..store.aggregator import (
     get_heatmap,
@@ -129,6 +130,7 @@ class AgenticMetricApp(App):
         Binding("w", "focus('week')", "Week", show=False),
         Binding("m", "focus('month')", "Month", show=False),
         Binding("r", "refresh_all", "Refresh"),
+        Binding("shift+r", "toggle_auto_refresh", "Auto"),
         # Let Ctrl+C pass through to the terminal for native copy.
         Binding("ctrl+c", "noop", show=False),
         Binding("q", "quit", "Quit"),
@@ -142,6 +144,7 @@ class AgenticMetricApp(App):
         self._today_sessions: list[dict] = []
         self._focus: str = "today"
         self._offset: int = 0  # 0 = current period; N = N units in the past
+        self._auto_refresh_timer: Timer | None = None
 
     # ── Layout ────────────────────────────────────────────────────────
 
@@ -180,6 +183,9 @@ class AgenticMetricApp(App):
         self.call_from_thread(self._on_sync_done)
 
     def on_unmount(self) -> None:
+        if self._auto_refresh_timer is not None:
+            self._auto_refresh_timer.stop()
+            self._auto_refresh_timer = None
         self._db.close()
 
     # ── Rendering ─────────────────────────────────────────────────────
@@ -503,6 +509,19 @@ class AgenticMetricApp(App):
     def action_refresh_all(self) -> None:
         self.notify("Syncing…")
         self.run_worker(self._sync_worker, thread=True, exclusive=True, group="sync")
+
+    def action_toggle_auto_refresh(self) -> None:
+        """Toggle the fast auto-sync timer (runs in addition to the 5-min one)."""
+        if self._auto_refresh_timer is not None:
+            self._auto_refresh_timer.stop()
+            self._auto_refresh_timer = None
+            self.notify("Auto-refresh off")
+            return
+        self._auto_refresh_timer = self.set_interval(
+            AUTO_REFRESH_INTERVAL, self._tick_sync
+        )
+        self._tick_sync()
+        self.notify(f"Auto-refresh on — every {AUTO_REFRESH_INTERVAL}s")
 
     def action_noop(self) -> None:
         """Intercept Ctrl+C so it doesn't quit; hint the real quit key."""
