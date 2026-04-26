@@ -69,10 +69,6 @@ _BUILTIN_PRICING: dict[str, PriceTuple] = {
     "gemini-2.5-flash-lite": (0.10,  0.40, 0.01, 0.0),
     "gemini-2.0-flash":      (0.10,  0.40, 0.025, 0.0),
     "gemini-2.0-flash-lite": (0.075, 0.30, 0.0,  0.0),
-    # ── Moonshot Kimi ──
-    "kimi-k2.6":             (0.95,  4.00, 0.16, 0.0),
-    # ── Zhipu GLM ──
-    "glm-5.1":               (0.95,  3.15, 0.10, 0.0),
 }
 
 _MODEL_ALIASES: dict[str, str] = {

@@ -196,16 +196,6 @@ Prices are USD per 1M tokens. Verified against official pricing docs
 
 </details>
 
-<details>
-<summary>Others</summary>
-
-| Model | Input | Output | Cache Read | Cache Write |
-|-------|------:|-------:|-----------:|------------:|
-| kimi-k2.6 | $0.95 | $4.00 | $0.16 | — |
-| glm-5.1 | $0.95 | $3.15 | $0.10 | — |
-
-</details>
-
 Run `agentic-metric pricing list` for the full table including your overrides.
 
 ## Architecture

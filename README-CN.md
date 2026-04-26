@@ -183,16 +183,6 @@ agentic-metric pricing cache reset claude-sonnet-4                # 删除覆盖
 
 </details>
 
-<details>
-<summary>其他</summary>
-
-| 模型 | Input | Output | Cache Read | Cache Write |
-|------|------:|-------:|-----------:|------------:|
-| kimi-k2.6 | $0.95 | $4.00 | $0.16 | — |
-| glm-5.1 | $0.95 | $3.15 | $0.10 | — |
-
-</details>
-
 运行 `agentic-metric pricing list` 查看完整定价表(包含你的覆盖配置)。
 
 ## 架构
