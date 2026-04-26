@@ -1,5 +1,46 @@
 # Changelog
 
+## v0.3.7 (2026-04-27)
+
+### Changes
+
+- **Heatmap panel redesign (CLI + TUI)**: the heatmap panel now leads with a
+  two-line token summary (`Token total X · cache hit Y%` on top, `Token input
+  … · output … · cache read … · cache write …` below), then the color blocks
+  and axis labels, then the peak bucket line, and finishes with the top 3
+  projects as a `Top projects <path> · $X (Y%)` block. The old `total` summary
+  line below the strip is gone.
+- **Cost drivers panel removed**: the CLI `Cost drivers` panel (containing
+  `Top agent × model` and the `Peak time × model` sub-table in `--full`) is
+  gone. The peak / top project information now lives in the heatmap panel,
+  and the existing `By agent × model` / `Top projects` / `By agent` / `By day`
+  tables remain for detailed drill-down. The CLI header's `peak · cache ·
+  delta` auto-summary line is also removed — the cost cell already shows the
+  delta arrow and the heatmap panel covers peak.
+- **Report header simplified**: the header stats grid now only carries
+  `COST` / `Sessions` / `Turns`. The `Tokens` and `Cache hit` columns were
+  dropped to avoid duplicating the heatmap panel's token summary.
+- **Header range format**: custom ranges render as `Range 2026-04-20 →
+  2026-04-25`, and any single-day report (including same-day `--range`)
+  collapses to `Today 2026-04-27` instead of `Today 2026-04-27 → 2026-04-27`.
+- **TUI summary cells**: each `TODAY` / `WEEK` / `MONTH` cell now carries
+  `cost` + delta + sparkline + `N sess · M turns ● K live`. Tokens and cache
+  hit moved out of the cells and live in the heatmap panel's token summary,
+  so the cells stay compact and the row height no longer clips the tokens
+  line on narrow cells.
+- **TUI trend chart is a line chart**: the 30-day / 12-week / 12-month trend
+  switched from `plt.bar` to `plt.plot` (braille markers) and dropped the
+  per-point `$N.NN` labels that were drawn on top of each bar. `USD` is now a
+  bold prefix in the chart title row instead of a rotated y-axis label, so the
+  unit sits right above the y-axis.
+- **Top projects path shortening (TUI)**: the TUI heatmap now uses the shared
+  `formatting.short_path` helper, so paths under `$HOME` display as
+  `~/…` instead of the full `/home/<user>/…`, matching the CLI.
+- **`--limit` scope clarified**: the `-n / --limit` option now controls how
+  many rows the `Top projects` table shows (it used to size the now-removed
+  `Peak time × model` table). The help text for `--full` and `--limit` was
+  updated to match.
+
 ## v0.3.6 (2026-04-26)
 
 ### Improvements

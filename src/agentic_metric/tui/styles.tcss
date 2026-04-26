@@ -71,7 +71,7 @@ SummaryCell.-focused {
 
 #heatmap-panel {
     height: auto;
-    min-height: 8;
+    min-height: 12;
     margin: 0 1;
     padding: 0 1;
     border: round white;
@@ -86,12 +86,6 @@ SummaryCell.-focused {
 #heatmap {
     height: auto;
     min-height: 4;
-}
-
-#driver-line {
-    height: auto;
-    min-height: 3;
-    color: $text;
 }
 
 /* ─── Chart ─── */

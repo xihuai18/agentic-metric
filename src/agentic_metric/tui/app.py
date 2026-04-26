@@ -22,14 +22,13 @@ from ..store.aggregator import (
     get_heatmap,
     get_range_by_agent_model,
     get_range_by_project,
-    get_range_by_time_model,
     get_range_totals,
     get_today_sessions,
     get_trend,
     resolve_range,
 )
 from ..store.database import Database
-from .widgets import Breakdown, CostDriverSummary, PeriodicHeatmap, SummaryCell, fmt_cost, fmt_tokens
+from .widgets import Breakdown, PeriodicHeatmap, SummaryCell, fmt_cost, fmt_tokens
 
 
 def _total_tokens(d: dict) -> int:
@@ -57,32 +56,6 @@ _TREND_CONFIG = {
     "week":  ("week",  12, "last 12 weeks"),
     "month": ("month", 12, "last 12 months"),
 }
-
-
-def _fmt_bar_label(v: float) -> str:
-    """Short dollar label for trend bar tops."""
-    if v >= 1000:
-        return f"${v / 1000:.1f}k"
-    if v >= 100:
-        return f"${v:.0f}"
-    if v >= 10:
-        return f"${v:.0f}"
-    if v >= 1:
-        return f"${v:.1f}"
-    if v > 0:
-        return f"${v:.2f}"
-    return ""
-
-
-def _bucket_label(row: dict) -> str:
-    date_s = row.get("usage_date") or ""
-    hour = int(row.get("usage_hour") or 0)
-    try:
-        dt = datetime.strptime(date_s, "%Y-%m-%d")
-        day = f"{dt.strftime('%b')} {dt.day}"
-    except ValueError:
-        day = date_s
-    return f"{day} {hour:02d}:00" if day else f"{hour:02d}:00"
 
 
 def _short_path(path: str, max_len: int = 38) -> str:
@@ -124,19 +97,6 @@ class _AutoAwareFooter(Footer):
             if isinstance(child, FooterKey) and child.action == "auto_refresh_off":
                 child.add_class("-auto-on")
             yield child
-
-
-def _split_label(row: dict) -> str:
-    cache = (row.get("cache_read_tokens") or row.get("cache") or 0) + (
-        row.get("cache_creation_tokens") or 0
-    )
-    parts = [
-        f"in {fmt_tokens(row.get('input_tokens') or row.get('input') or 0)}",
-        f"out {fmt_tokens(row.get('output_tokens') or row.get('output') or 0)}",
-    ]
-    if cache > 0:
-        parts.append(f"cache {fmt_tokens(cache)}")
-    return "  ".join(parts)
 
 
 class AgenticMetricApp(App):
@@ -191,7 +151,6 @@ class AgenticMetricApp(App):
         with Vertical(id="heatmap-panel"):
             yield Static("Today by hour", id="heatmap-title")
             yield PeriodicHeatmap(id="heatmap")
-            yield CostDriverSummary(id="driver-line")
         with Vertical(id="chart-panel"):
             yield Static("Trend", id="chart-title")
             yield PlotextPlot(id="chart")
@@ -236,12 +195,21 @@ class AgenticMetricApp(App):
         self._populate_chart()
         self._populate_breakdown()
 
+
     def _populate_heatmap(self) -> None:
         """Populate the heatmap strip for the currently focused view."""
         buckets = get_heatmap(self._db, self._focus, offset=self._offset)
 
+        _label, frm, to = resolve_range(self._focus, offset=self._offset)
+        totals = get_range_totals(self._db, frm, to)
+        project_rows = get_range_by_project(self._db, frm, to, limit=3)
+
         self.query_one("#heatmap", PeriodicHeatmap).update_data(
-            buckets, highlight_index=None,
+            buckets,
+            highlight_index=None,
+            totals=totals,
+            projects=project_rows,
+            total_cost=totals.get("estimated_cost_usd") or 0.0,
         )
 
         titles = {
@@ -261,23 +229,6 @@ class AgenticMetricApp(App):
         self.query_one("#heatmap-title", Static).update(
             Text.from_markup(f"[bold]{title}[/]")
         )
-        self._populate_driver_line()
-
-    def _populate_driver_line(self) -> None:
-        """Show the strongest cost driver for the focused period."""
-        _label, frm, to = resolve_range(self._focus, offset=self._offset)
-        peak_rows = get_range_by_time_model(self._db, frm, to, limit=1)
-        project_rows = get_range_by_project(self._db, frm, to, limit=1)
-
-        peak = peak_rows[0] if peak_rows else None
-        project = None
-        if project_rows and (
-            (project_rows[0].get("estimated_cost_usd") or 0) > 0
-            or _has_unknown_cost(project_rows[0])
-        ):
-            project = project_rows[0]
-
-        self.query_one("#driver-line", CostDriverSummary).update_data(peak, project)
 
     def _populate_summary(self) -> None:
         active_count = self._count_active()
@@ -297,7 +248,9 @@ class AgenticMetricApp(App):
             cost = totals.get("estimated_cost_usd") or 0.0
             cost_unknown = _has_unknown_cost(totals)
             sess = totals.get("session_count") or 0
+            turns = totals.get("user_turns") or 0
             tokens = _total_tokens(totals)
+            cache_pct = _cache_hit_pct(totals)
 
             # Previous period for delta comparison
             _, p_frm, p_to = resolve_range(kind, offset=1)
@@ -318,6 +271,8 @@ class AgenticMetricApp(App):
                 sparkline=sparkline,
                 cost_unknown=cost_unknown,
                 prev_cost_unknown=prev_cost_unknown,
+                turns=turns,
+                cache_pct=cache_pct,
             )
             cell.set_focused(kind == self._focus)
 
@@ -338,29 +293,22 @@ class AgenticMetricApp(App):
         xs = list(range(len(data)))
         max_y = max(ys) or 1
 
-        plt.bar(xs, ys, marker="sd", color="yellow+")
+        plt.plot(xs, ys, marker="braille", color="yellow+")
         # show ~6 ticks to avoid crowding
         step = max(1, len(xs) // 6)
         plt.xticks(xs[::step], labels[::step])
-        plt.ylabel("USD")
 
-        # Stretch the y-axis a bit so bar-top labels don't get clipped.
-        plt.ylim(0, max_y * 1.18)
+        # Pad a tiny bit so the top of the curve isn't flush with the frame.
+        plt.ylim(0, max_y * 1.08)
 
-        # Only label bars that are tall enough relative to the chart; too
-        # many labels makes it noisy.
-        threshold = max_y * 0.08
-        for x, y in zip(xs, ys):
-            if y >= threshold:
-                plt.text(_fmt_bar_label(y), x=x, y=y + max_y * 0.05,
-                         alignment="center", color="cyan+")
-
-        # Let the chart fill whatever the chart-panel gives it rather than
-        # pinning a hard-coded height.
         plot_widget.refresh()
 
+        # "USD" sits above the y-axis in the external title row, alongside
+        # the trend span, instead of appearing as a rotated axis label.
         title = self.query_one("#chart-title", Static)
-        title.update(Text.from_markup(f"[bold]Trend[/] — [bright_white]{span_label}[/]"))
+        title.update(Text.from_markup(
+            f"[bold]USD[/]   [bold]Trend[/] — [bright_white]{span_label}[/]"
+        ))
 
     def _populate_breakdown(self) -> None:
         label, frm, to = resolve_range(self._focus, offset=self._offset)
@@ -440,6 +388,8 @@ class AgenticMetricApp(App):
             sparkline=cell.sparkline,
             cost_unknown=cell.cost_unknown,
             prev_cost_unknown=cell.prev_cost_unknown,
+            turns=cell.turns,
+            cache_pct=cell.cache_pct,
         )
 
     # ── Periodic sync (5 min) ─────────────────────────────────────────
@@ -544,8 +494,7 @@ class AgenticMetricApp(App):
 
         label, frm, to = resolve_range(self._focus, offset=self._offset)
         totals = get_range_totals(self._db, frm, to)
-        peak_rows = get_range_by_time_model(self._db, frm, to, limit=1)
-        project_rows = get_range_by_project(self._db, frm, to, limit=1)
+        project_rows = get_range_by_project(self._db, frm, to, limit=3)
 
         lines = [f"{label}  {frm} -> {to}"]
         stats = [
@@ -569,29 +518,15 @@ class AgenticMetricApp(App):
             token_parts.append(f"cache write {fmt_tokens(cache_write)}")
         lines.append(" | ".join(token_parts))
 
-        if peak_rows:
-            peak = peak_rows[0]
-            peak_model = peak["model"]
-            if peak_model == "Unknown" and peak.get("raw_model"):
-                peak_model = f"Unknown: {peak['raw_model']}"
-            lines.append(
-                "Top agent × model: "
-                f"{peak['agent_type']} / {peak_model} | "
-                f"{_bucket_label(peak)} | "
-                f"{fmt_cost(peak.get('estimated_cost_usd'), unknown=_has_unknown_cost(peak))} | "
-                f"{_split_label(peak)}"
-            )
-
-        if project_rows and (
-            (project_rows[0].get("estimated_cost_usd") or 0) > 0
-            or _has_unknown_cost(project_rows[0])
-        ):
-            project = project_rows[0]
-            lines.append(
-                "Top project: "
-                f"{_short_path(project['project_path'])} | "
-                f"{fmt_cost(project.get('estimated_cost_usd'), unknown=_has_unknown_cost(project))}"
-            )
+        nonzero_projects = [
+            p for p in project_rows
+            if (p.get("estimated_cost_usd") or 0) > 0 or _has_unknown_cost(p)
+        ]
+        if nonzero_projects:
+            lines.append("Top projects:")
+            for p in nonzero_projects:
+                cost_str = fmt_cost(p.get("estimated_cost_usd"), unknown=_has_unknown_cost(p))
+                lines.append(f"  {_short_path(p['project_path'])}  {cost_str}")
 
         self.copy_to_clipboard("\n".join(lines))
         self.notify("Copied current view summary", severity="information")

@@ -16,18 +16,13 @@ from rich.text import Text
 from .formatting import (
     cache_hit_rate as _cache_hit_rate,
     cache_tokens as _cache_tokens,
-    clip as _clip,
     fmt_cost as _fmt_cost,
     fmt_tokens as _fmt_tokens,
     has_cost_signal as _has_cost_signal,
     has_unknown_cost as _has_unknown_cost,
-    share_pct as _share_pct,
     share_suffix as _share_suffix,
     short_path as _short_path,
     shorten_home as _shorten_home,
-    sum_tokens as _sum_tokens,
-    time_bucket_label as _time_bucket_label,
-    time_bucket_label_short as _time_bucket_label_short,
 )
 
 app = typer.Typer(
@@ -147,11 +142,11 @@ def report(
         False, "--no-sync", help="Skip syncing collectors before querying."
     ),
     full: bool = typer.Option(
-        False, "--full", help="Show the full drill-down with extra model/time tables."
+        False, "--full", help="Show the full drill-down with per-agent and per-time tables."
     ),
     limit: int = typer.Option(
         8, "--limit", "-n", min=1, max=25,
-        help="Rows to show in driver tables.",
+        help="Rows shown in the Top projects table.",
     ),
 ) -> None:
     """Show a usage report for a time range."""
@@ -173,7 +168,7 @@ def report(
             if frm > to:
                 console.print(f"[{C_RED}]--range: start date must not be after end date.[/]")
                 raise typer.Exit(1)
-            label = f"{frm} → {to}"
+            label = "Range"
         except ValueError:
             console.print(f"[{C_RED}]--range must look like 2026-04-01:2026-04-23.[/]")
             raise typer.Exit(1)
@@ -196,8 +191,7 @@ def report(
     totals = aggregator.get_range_totals(db, frm, to)
     by_agent = aggregator.get_range_by_agent(db, frm, to)
     by_agent_model = aggregator.get_range_by_agent_model(db, frm, to)
-    by_project = aggregator.get_range_by_project(db, frm, to, limit=10)
-    by_time_model = aggregator.get_range_by_time_model(db, frm, to, limit=limit)
+    by_project = aggregator.get_range_by_project(db, frm, to, limit=limit)
     # Periodic breakdown (hourly/daily/weekly) — only when the range
     # corresponds to a named focus.
     focus_kind = None
@@ -205,7 +199,7 @@ def report(
         focus_kind = "week" if week else ("month" if month else "today")
     periodic = aggregator.get_heatmap(db, focus_kind) if focus_kind else []
 
-    # Previous period totals for delta comparison.
+    # Previous period totals for delta comparison (cost cell arrow).
     prev_totals = None
     if focus_kind:
         _, p_frm, p_to = aggregator.resolve_range(focus_kind, offset=1)
@@ -215,15 +209,15 @@ def report(
 
     _print_report(
         label, frm, to, totals, by_agent, by_agent_model, by_project,
-        by_time_model, periodic, focus_kind, prev_totals, full=full,
+        periodic, focus_kind, prev_totals, full=full,
     )
 
 
 @app.command("today")
 def today_cmd(
     no_sync: bool = typer.Option(False, "--no-sync", help="Skip syncing collectors before querying."),
-    full: bool = typer.Option(False, "--full", help="Show the full drill-down with extra model/time tables."),
-    limit: int = typer.Option(8, "--limit", "-n", min=1, max=25, help="Rows to show in driver tables."),
+    full: bool = typer.Option(False, "--full", help="Show the full drill-down with per-agent and per-time tables."),
+    limit: int = typer.Option(8, "--limit", "-n", min=1, max=25, help="Rows shown in the Top projects table."),
 ) -> None:
     """Shortcut for ``report --today``."""
     report(today_=True, week=False, month=False, range_=None, no_sync=no_sync, full=full, limit=limit)
@@ -232,8 +226,8 @@ def today_cmd(
 @app.command("week")
 def week_cmd(
     no_sync: bool = typer.Option(False, "--no-sync", help="Skip syncing collectors before querying."),
-    full: bool = typer.Option(False, "--full", help="Show the full drill-down with extra model/time tables."),
-    limit: int = typer.Option(8, "--limit", "-n", min=1, max=25, help="Rows to show in driver tables."),
+    full: bool = typer.Option(False, "--full", help="Show the full drill-down with per-agent and per-time tables."),
+    limit: int = typer.Option(8, "--limit", "-n", min=1, max=25, help="Rows shown in the Top projects table."),
 ) -> None:
     """Shortcut for ``report --week``."""
     report(today_=False, week=True, month=False, range_=None, no_sync=no_sync, full=full, limit=limit)
@@ -242,8 +236,8 @@ def week_cmd(
 @app.command("month")
 def month_cmd(
     no_sync: bool = typer.Option(False, "--no-sync", help="Skip syncing collectors before querying."),
-    full: bool = typer.Option(False, "--full", help="Show the full drill-down with extra model/time tables."),
-    limit: int = typer.Option(8, "--limit", "-n", min=1, max=25, help="Rows to show in driver tables."),
+    full: bool = typer.Option(False, "--full", help="Show the full drill-down with per-agent and per-time tables."),
+    limit: int = typer.Option(8, "--limit", "-n", min=1, max=25, help="Rows shown in the Top projects table."),
 ) -> None:
     """Shortcut for ``report --month``."""
     report(today_=False, week=False, month=True, range_=None, no_sync=no_sync, full=full, limit=limit)
@@ -253,8 +247,8 @@ def month_cmd(
 def history_cmd(
     days: int = typer.Option(14, "--days", "-d", min=1, max=365, help="Number of days to include."),
     no_sync: bool = typer.Option(False, "--no-sync", help="Skip syncing collectors before querying."),
-    full: bool = typer.Option(False, "--full", help="Show the full drill-down with extra model/time tables."),
-    limit: int = typer.Option(8, "--limit", "-n", min=1, max=25, help="Rows to show in driver tables."),
+    full: bool = typer.Option(False, "--full", help="Show the full drill-down with per-agent and per-time tables."),
+    limit: int = typer.Option(8, "--limit", "-n", min=1, max=25, help="Rows shown in the Top projects table."),
 ) -> None:
     """Show a recent multi-day usage report."""
     today = datetime.now().date()
@@ -274,23 +268,24 @@ def _print_report(
     label: str, frm: str, to: str,
     totals: dict, by_agent: list[dict],
     by_agent_model: list[dict], by_project: list[dict],
-    by_time_model: list[dict], periodic: list[dict],
+    periodic: list[dict],
     focus_kind: str | None,
     prev_totals: dict | None = None,
     *,
     full: bool = False,
 ) -> None:
-    tot_tokens = _sum_tokens(totals)
     tot_cost = totals.get("estimated_cost_usd") or 0.0
     tot_cost_unknown = _has_unknown_cost(totals)
     tot_sess = totals.get("session_count") or 0
     tot_turns = totals.get("user_turns") or 0
-    cache_pct = _cache_hit_rate(totals)
 
-    # ─── Header panel (label + stats + auto summary line) ───
+    # ─── Header panel (label + stats) ───
     header_text = Text()
     header_text.append(label, style=f"bold {C_PEACH}")
-    header_text.append(f"   {frm} → {to}", style=C_MUTED)
+    if frm == to:
+        header_text.append(f"   {frm}", style=C_MUTED)
+    else:
+        header_text.append(f"   {frm} → {to}", style=C_MUTED)
 
     delta_line = _delta_line(tot_cost, prev_totals, current_unknown=tot_cost_unknown)
     cost_cell = Group(
@@ -298,30 +293,19 @@ def _print_report(
         Text(_fmt_cost(tot_cost, unknown=tot_cost_unknown), style=f"bold {C_YELLOW}"),
         delta_line if delta_line else Text(""),
     )
+    # Tokens / cache hit live in the heatmap panel now — the header only carries
+    # cost, sessions, and turns.
     stats = Table.grid(padding=(0, 4))
-    for _ in range(5):
+    for _ in range(3):
         stats.add_column(justify="left")
     stats.add_row(
         cost_cell,
         _stat("Sessions", f"{tot_sess:,}", C_MAUVE),
         _stat("Turns", f"{tot_turns:,}", C_SKY),
-        _stat("Tokens", _fmt_tokens(tot_tokens), C_TEAL),
-        _stat("Cache hit", f"{cache_pct:.0f}%" if cache_pct >= 0 else "—", C_GREEN),
     )
-
-    summary_line = _auto_summary_line(
-        focus_kind, totals, periodic, prev_totals, cache_pct,
-    )
-    header_children = [header_text]
-    if summary_line:
-        header_children.append(summary_line)
-    header_children.extend([Text(""), stats])
-    token_split = _token_split_line(totals)
-    if token_split:
-        header_children.extend([Text(""), token_split])
 
     header_panel = Panel(
-        Group(*header_children),
+        Group(header_text, Text(""), stats),
         box=box.ROUNDED,
         border_style=C_SURFACE1,
         padding=(1, 2),
@@ -330,10 +314,9 @@ def _print_report(
     # ─── Heatmap strip (today/week/month scope) ───
     heatmap_renderable = None
     if periodic and focus_kind:
-        heatmap_renderable = _build_heatmap_panel(periodic, focus_kind)
-    drivers_renderable = _build_cost_drivers_panel(
-        totals, by_time_model, by_project, detailed=full,
-    )
+        heatmap_renderable = _build_heatmap_panel(
+            periodic, focus_kind, totals, by_project,
+        )
 
     # ─── Table renderables ───
     breakdown_tbl = _build_by_agent_model_table(by_agent_model)
@@ -346,8 +329,6 @@ def _print_report(
     console.print(header_panel)
     if heatmap_renderable is not None:
         console.print(heatmap_renderable)
-    if drivers_renderable is not None:
-        console.print(drivers_renderable)
 
     try:
         term_width = console.size.width
@@ -373,55 +354,13 @@ def _print_report(
     console.print()
 
 
-def _auto_summary_line(
-    focus_kind: str | None,
+def _build_heatmap_panel(
+    buckets: list[dict],
+    focus_kind: str,
     totals: dict,
-    periodic: list[dict],
-    prev_totals: dict | None,
-    cache_pct: float,
-) -> Text | None:
-    """Build a one-liner under the header: peak · cache · delta."""
-    parts: list[tuple[str, str]] = []
-
-    # Peak bucket within the periodic breakdown.
-    if periodic:
-        known_peak = max(periodic, key=lambda b: b.get("cost") or 0)
-        unknown_peak = next((b for b in periodic if _has_unknown_cost(b)), None)
-        peak = known_peak if (known_peak.get("cost") or 0) > 0 else unknown_peak
-        if peak is not None and ((peak.get("cost") or 0) > 0 or _has_unknown_cost(peak)):
-            peak_label = peak["label"]
-            if focus_kind == "today":
-                peak_label = f"{peak_label}:00"
-            parts.append((C_YELLOW, f"peak {peak_label} {_fmt_cost(peak.get('cost'), unknown=_has_unknown_cost(peak))}"))
-
-    if cache_pct >= 0 and cache_pct >= 50:
-        parts.append((C_GREEN, f"cache {cache_pct:.0f}%"))
-
-    if prev_totals is not None and not _has_unknown_cost(totals) and not _has_unknown_cost(prev_totals):
-        prev = prev_totals.get("estimated_cost_usd") or 0.0
-        cur = totals.get("estimated_cost_usd") or 0.0
-        if prev > 0 and cur > 0:
-            ratio = cur / prev
-            if ratio >= 10:
-                parts.append((C_RED, "▲ ≫10× vs last"))
-            elif ratio > 1.01:
-                parts.append((C_RED, f"▲ +{(ratio - 1) * 100:.0f}% vs last"))
-            elif ratio < 0.99:
-                parts.append((C_GREEN, f"▼ -{(1 - ratio) * 100:.0f}% vs last"))
-
-    if not parts:
-        return None
-
-    line = Text()
-    for i, (color, text) in enumerate(parts):
-        if i > 0:
-            line.append("  ·  ", style=C_MUTED)
-        line.append(text, style=color)
-    return line
-
-
-def _build_heatmap_panel(buckets: list[dict], focus_kind: str) -> Panel:
-    """Render the activity heatmap as a CLI panel."""
+    by_project: list[dict],
+) -> Panel:
+    """Render the activity heatmap with token split + peak + top projects."""
     blocks = ["·", "•", "░", "▒", "▓", "█", "█"]
     styles = [
         "grey35",
@@ -473,33 +412,43 @@ def _build_heatmap_panel(buckets: list[dict], focus_kind: str) -> Panel:
         else:
             row_labels.append(" " * cell_w, style="default")
 
-    # Summary below the strip
+    # Peak summary below the strip (no total line — total already lives in header)
     known_peak = max(buckets, key=lambda bb: bb.get("cost") or 0)
     unknown_peak = next((bb for bb in buckets if _has_unknown_cost(bb)), None)
     peak = known_peak if (known_peak.get("cost") or 0) > 0 else (unknown_peak or known_peak)
     peak_unknown = _has_unknown_cost(peak)
-    total_cost = sum((bb.get("cost") or 0) for bb in buckets)
-    total_unknown = any(_has_unknown_cost(bb) for bb in buckets)
-    total_tokens = sum((bb.get("tokens") or 0) for bb in buckets)
-    summary_1 = Text(" ")
+    peak_line = Text(" ")
     if (peak.get("cost") or 0) > 0 or peak_unknown:
-        summary_1.append("peak ", style=C_MUTED)
-        summary_1.append(peak["label"], style="bold")
-        summary_1.append(f"  {_fmt_cost(peak.get('cost'), unknown=peak_unknown)}", style=C_YELLOW)
-        summary_1.append(f"  {_fmt_tokens(peak.get('tokens') or 0)}", style=C_TEAL)
+        peak_line.append("peak ", style=C_MUTED)
+        peak_line.append(peak["label"], style="bold")
+        peak_line.append(f"  {_fmt_cost(peak.get('cost'), unknown=peak_unknown)}", style=C_YELLOW)
+        peak_line.append(f"  {_fmt_tokens(peak.get('tokens') or 0)}", style=C_TEAL)
     else:
-        summary_1.append("peak —", style=C_MUTED)
+        peak_line.append("peak —", style=C_MUTED)
 
-    summary_2 = Text(" ")
-    summary_2.append("total ", style=C_MUTED)
-    summary_2.append(_fmt_cost(total_cost, unknown=total_unknown), style=f"bold {C_YELLOW}")
-    summary_2.append(f"  {_fmt_tokens(total_tokens)} tokens", style=C_TEAL)
+    # Token summary (total + cache hit, then input/output/cache split) above the strip
+    tsplit = _token_summary_block(totals)
+
+    # Top projects (top 3) below the peak line
+    projects_block = _top_projects_block(
+        by_project, totals.get("estimated_cost_usd") or 0.0,
+        total_unknown=_has_unknown_cost(totals),
+    )
+
+    body: list[object] = []
+    if tsplit is not None:
+        body.append(tsplit)
+        body.append(Text(""))
+    body.extend([row_blocks, row_labels, peak_line])
+    if projects_block is not None:
+        body.append(Text(""))
+        body.append(projects_block)
 
     titles = {"today": "Today by hour",
               "week":  "This week by day",
               "month": "This month by week"}
     return Panel(
-        Group(row_blocks, row_labels, summary_1, summary_2),
+        Group(*body),
         title=titles.get(focus_kind, "Heatmap"),
         title_align="left",
         box=box.ROUNDED,
@@ -508,156 +457,46 @@ def _build_heatmap_panel(buckets: list[dict], focus_kind: str) -> Panel:
     )
 
 
-def _build_cost_drivers_panel(
-    totals: dict,
-    by_time_model: list[dict],
+def _top_projects_block(
     by_project: list[dict],
-    *,
-    detailed: bool = False,
-) -> Panel | None:
-    """Render the report explanation panel: peak buckets and top projects."""
-    if not by_time_model and not by_project:
-        return None
-
-    total_cost = totals.get("estimated_cost_usd") or 0.0
-    summary = _driver_summary_line(
-        total_cost,
-        by_time_model,
-        by_project,
-        total_unknown=_has_unknown_cost(totals),
-    )
-
-    body: list[object] = []
-    if summary:
-        body.append(summary)
-    if detailed:
-        time_table = _build_time_model_table(by_time_model, total_cost, total_unknown=_has_unknown_cost(totals))
-        if time_table is not None:
-            if body:
-                body.append(Text(""))
-            body.append(time_table)
-
-    if not body:
-        return None
-
-    return Panel(
-        Group(*body),
-        title="Cost drivers",
-        title_align="left",
-        box=box.ROUNDED,
-        border_style=C_SURFACE1,
-        padding=(1, 2),
-    )
-
-
-def _driver_summary_line(
     total_cost: float,
-    by_time_model: list[dict],
-    by_project: list[dict],
     *,
     total_unknown: bool = False,
-) -> Text | None:
-    total_unknown = total_unknown or any(_has_unknown_cost(r) for r in [*by_time_model, *by_project])
-    line = Text()
-    wrote = False
-    if by_time_model:
-        peak = by_time_model[0]
-        peak_unknown = _has_unknown_cost(peak)
-        line.append("Top agent × model  ", style=C_MUTED)
-        line.append(" · ", style=C_MUTED)
-        peak_model = peak['model']
-        if peak_model == "Unknown" and peak.get("raw_model"):
-            peak_model = f"Unknown: {peak['raw_model']}"
-        line.append(f"{peak['agent_type']} / {peak_model}", style=C_SKY)
-        line.append(" · ", style=C_MUTED)
-        line.append(_time_bucket_label(peak), style=f"bold {C_BLUE}")
-        line.append(f" · {_fmt_cost(peak['estimated_cost_usd'], unknown=peak_unknown)}", style=f"bold {C_YELLOW}")
-        line.append(_share_suffix(peak["estimated_cost_usd"], total_cost, unknown=peak_unknown, total_unknown=total_unknown), style=C_MUTED)
-        wrote = True
-    if by_project:
-        if wrote:
-            line.append("\n")
-        project = by_project[0]
-        project_unknown = _has_unknown_cost(project)
-        line.append("Top project  ", style=C_MUTED)
-        line.append(_short_path(project["project_path"], max_len=40), style=C_BLUE)
-        line.append(f" · {_fmt_cost(project['estimated_cost_usd'], unknown=project_unknown)}", style=f"bold {C_YELLOW}")
-        line.append(_share_suffix(project["estimated_cost_usd"], total_cost, unknown=project_unknown, total_unknown=total_unknown), style=C_MUTED)
-        wrote = True
-    return line if wrote else None
-
-
-def _top_project_line(by_project: list[dict], total_cost: float) -> Text | None:
+    limit: int = 3,
+) -> Group | None:
+    """Render up to ``limit`` projects as a vertical block for heatmap panel."""
     if not by_project:
         return None
-    parts = []
-    for row in by_project[:3]:
-        cost = row.get("estimated_cost_usd") or 0.0
-        if cost <= 0 and not _has_unknown_cost(row):
-            continue
-        parts.append((row["project_path"], cost, _has_unknown_cost(row)))
-    if not parts:
+    entries = [
+        p for p in by_project
+        if (p.get("estimated_cost_usd") or 0) > 0 or _has_unknown_cost(p)
+    ][:limit]
+    if not entries:
         return None
 
-    line = Text()
-    line.append("Projects: ", style=C_MUTED)
-    total_unknown = any(unknown for _, _, unknown in parts)
-    for i, (path, cost, unknown) in enumerate(parts):
-        if i:
-            line.append("  ·  ", style=C_MUTED)
-        line.append(_short_path(path, max_len=34), style=C_BLUE)
-        line.append(f" {_fmt_cost(cost, unknown=unknown)}", style=C_YELLOW)
-        line.append(_share_suffix(cost, total_cost, unknown=unknown, total_unknown=total_unknown), style=C_MUTED)
-    return line
-
-
-def _build_time_model_table(rows: list[dict], total_cost: float, *, total_unknown: bool = False) -> Table | None:
-    rows = [r for r in rows if _has_cost_signal(r)]
-    if not rows:
-        return None
-    wide = console.size.width >= 120
-    tbl = Table(
-        show_header=True,
-        header_style=f"bold {C_SUBTEXT}",
-        box=box.SIMPLE_HEAVY,
-        pad_edge=False,
-        border_style=C_SURFACE1,
-        title="Peak time × model",
-        title_style=f"bold {C_TEXT}",
-        title_justify="left",
-    )
-    tbl.add_column("When", style=C_BLUE, no_wrap=True)
-    tbl.add_column("Driver", style=C_SKY)
-    if wide:
-        tbl.add_column("Sessions", justify="right", style=C_TEXT)
-    tbl.add_column("Input", justify="right", style=C_TEAL)
-    tbl.add_column("Output", justify="right", style=C_TEAL)
-    tbl.add_column("Cache", justify="right", style=C_GREEN)
-    tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}")
-    if wide:
-        tbl.add_column("Share", justify="right", style=C_MUTED)
-    for row in rows[:8]:
-        cost = row["estimated_cost_usd"] or 0.0
-        unknown = _has_unknown_cost(row)
-        model_label = row['model']
-        if model_label == "Unknown" and row.get("raw_model"):
-            model_label = f"Unknown: {row['raw_model']}"
-        cells = [
-            _time_bucket_label(row) if wide else _time_bucket_label_short(row),
-            _clip(f"{row['agent_type']}/{model_label}", 28 if wide else 18),
-        ]
-        if wide:
-            cells.append(f"{row['session_count']:,}")
-        cells.extend([
-            _fmt_tokens(row.get("input_tokens") or 0),
-            _fmt_tokens(row.get("output_tokens") or 0),
-            _fmt_tokens(_cache_tokens(row)),
-            _fmt_cost(cost, unknown=unknown),
-        ])
-        if wide:
-            cells.append(_share_pct(cost, total_cost, unknown=unknown, total_unknown=total_unknown))
-        tbl.add_row(*cells)
-    return tbl
+    any_unknown = total_unknown or any(_has_unknown_cost(p) for p in entries)
+    label_width = len("Top projects")  # align subsequent rows' path column
+    lines: list[Text] = []
+    for i, p in enumerate(entries):
+        unknown = _has_unknown_cost(p)
+        label = "Top projects" if i == 0 else " " * label_width
+        line = Text(" ")
+        line.append(label, style=C_MUTED)
+        line.append("  ")
+        line.append(_short_path(p["project_path"], max_len=44), style=C_BLUE)
+        line.append(
+            f" · {_fmt_cost(p['estimated_cost_usd'], unknown=unknown)}",
+            style=f"bold {C_YELLOW}" if i == 0 else C_YELLOW,
+        )
+        line.append(
+            _share_suffix(
+                p["estimated_cost_usd"], total_cost,
+                unknown=unknown, total_unknown=any_unknown,
+            ),
+            style=C_MUTED,
+        )
+        lines.append(line)
+    return Group(*lines)
 
 
 def _build_by_agent_table(by_agent: list[dict]) -> Table | None:
@@ -829,22 +668,44 @@ def _stat(label: str, value: str, color: str) -> Group:
 # Pure formatting helpers are in cli/formatting.py.
 
 
-def _token_split_line(totals: dict) -> Text | None:
+def _token_summary_block(totals: dict) -> Group | None:
+    """Two-line token block for the heatmap panel (CLI side).
+
+    Line 1: ``Token total N · cache hit P%``
+    Line 2: ``Token input X · output Y · cache read Z · cache write W``
+    """
     if not totals:
         return None
-    line = Text()
-    line.append("Token ", style=C_MUTED)
-    line.append("input ", style=C_MUTED)
-    line.append(_fmt_tokens(totals.get("input_tokens") or 0), style=C_TEAL)
-    line.append("  ·  output ", style=C_MUTED)
-    line.append(_fmt_tokens(totals.get("output_tokens") or 0), style=C_TEAL)
-    line.append("  ·  cache read ", style=C_MUTED)
-    line.append(_fmt_tokens(totals.get("cache_read_tokens") or 0), style=C_GREEN)
-    cache_write = totals.get("cache_creation_tokens") or 0
-    if cache_write:
-        line.append("  ·  cache write ", style=C_MUTED)
-        line.append(_fmt_tokens(cache_write), style=C_GREEN)
-    return line
+    input_t = totals.get("input_tokens") or 0
+    output_t = totals.get("output_tokens") or 0
+    cache_r = totals.get("cache_read_tokens") or 0
+    cache_w = totals.get("cache_creation_tokens") or 0
+    total_t = input_t + output_t + cache_r + cache_w
+    if total_t == 0:
+        return None
+
+    cache_pct = _cache_hit_rate(totals)
+
+    line_total = Text()
+    line_total.append("Token total ", style=C_MUTED)
+    line_total.append(_fmt_tokens(total_t), style=C_TEAL)
+    if cache_pct >= 0:
+        line_total.append("  ·  cache hit ", style=C_MUTED)
+        line_total.append(f"{cache_pct:.0f}%", style=C_GREEN)
+
+    line_split = Text()
+    line_split.append("Token ", style=C_MUTED)
+    line_split.append("input ", style=C_MUTED)
+    line_split.append(_fmt_tokens(input_t), style=C_TEAL)
+    line_split.append("  ·  output ", style=C_MUTED)
+    line_split.append(_fmt_tokens(output_t), style=C_TEAL)
+    line_split.append("  ·  cache read ", style=C_MUTED)
+    line_split.append(_fmt_tokens(cache_r), style=C_GREEN)
+    if cache_w:
+        line_split.append("  ·  cache write ", style=C_MUTED)
+        line_split.append(_fmt_tokens(cache_w), style=C_GREEN)
+
+    return Group(line_total, line_split)
 
 
 def _delta_line(

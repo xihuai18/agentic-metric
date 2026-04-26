@@ -8,6 +8,8 @@ from rich.console import Group
 from rich.text import Text
 from textual.widgets import Static
 
+from ..formatting import short_path as _short_path
+
 
 # ── Formatting helpers ────────────────────────────────────────────────
 
@@ -88,7 +90,9 @@ class SummaryCell(Static):
         self.cost = 0.0
         self.cost_unknown = False
         self.sessions = 0
+        self.turns = 0
         self.tokens = 0
+        self.cache_pct: int | None = None
         self.active = 0
         self.prev_cost: float | None = None
         self.prev_cost_unknown = False
@@ -109,11 +113,15 @@ class SummaryCell(Static):
         sparkline: list[float] | None = None,
         cost_unknown: bool = False,
         prev_cost_unknown: bool = False,
+        turns: int = 0,
+        cache_pct: int | None = None,
     ) -> None:
         self.cost = cost
         self.cost_unknown = cost_unknown
         self.sessions = sessions
+        self.turns = turns
         self.tokens = tokens
+        self.cache_pct = cache_pct
         self.active = active
         self.prev_cost = prev_cost
         self.prev_cost_unknown = prev_cost_unknown
@@ -162,9 +170,11 @@ class SummaryCell(Static):
         if self.sparkline:
             t.append(fmt_sparkline(self.sparkline), style="bright_cyan")
             t.append("\n")
-        t.append(f"{self.sessions:,} sessions", style="white")
-        t.append("  ")
-        t.append(f"{fmt_tokens(self.tokens)} tok", style="white")
+        # Sessions · turns (+ live indicator). Tokens and cache hit live in
+        # the heatmap panel's Token summary, so we don't repeat them here.
+        t.append(f"{self.sessions:,} sess", style="white")
+        t.append(" · ", style="white")
+        t.append(f"{self.turns:,} turns", style="white")
         if self.active:
             t.append("  ")
             t.append(f"● {self.active} live", style="bold bright_green")
@@ -172,35 +182,42 @@ class SummaryCell(Static):
 
 
 class PeriodicHeatmap(Static):
-    """Heatmap strip that renders N buckets across three lines.
+    """Heatmap panel body.
 
-    The input is a list of ``{"label", "cost", "tokens", ...}`` dicts
-    returned by ``aggregator.get_heatmap``. The widget renders:
+    Renders (top to bottom):
+        - token split line (input · output · cache read · cache write)
+        - heatmap colored blocks + axis labels
+        - peak bucket summary (``peak <label>  <cost>  <tokens>``)
+        - top 3 projects (``Top projects  <path> · $X (pct)``)
 
-        line 1: colored block per bucket, shaded by relative cost
-        line 2: axis labels aligned to each bucket
-        line 3: one-line summary — peak bucket, total cost, total tokens
-
-    ``highlight_index`` marks the "current" bucket (e.g. current hour
-    for today, today's weekday for week) with a reverse style. Pass
-    ``None`` to disable.
+    ``highlight_index`` marks a "current" bucket with a reverse style.
+    Pass ``None`` to disable.
     """
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self._buckets: list[dict] = []
         self._highlight: int | None = None
+        self._totals: dict = {}
+        self._projects: list[dict] = []
+        self._total_cost: float = 0.0
 
     def update_data(
         self,
         buckets: list[dict],
         highlight_index: int | None = None,
+        totals: dict | None = None,
+        projects: list[dict] | None = None,
+        total_cost: float = 0.0,
     ) -> None:
         self._buckets = buckets
         self._highlight = highlight_index
+        self._totals = totals or {}
+        self._projects = projects or []
+        self._total_cost = total_cost
         self.refresh()
 
-    def render(self) -> Text:
+    def render(self) -> Group | Text:
         if not self._buckets:
             return Text("  (no data)", style="white")
 
@@ -251,9 +268,6 @@ class PeriodicHeatmap(Static):
         peak_idx = known_peak_idx if (buckets[known_peak_idx].get("cost") or 0) > 0 else (
             unknown_peak_idx if unknown_peak_idx is not None else known_peak_idx
         )
-        total_cost = sum(b.get("cost") or 0 for b in buckets)
-        total_unknown = any(_has_unknown_cost(b) for b in buckets)
-        total_tokens = sum(b.get("tokens") or 0 for b in buckets)
 
         rows: list[Text] = []
         for start in range(0, n, buckets_per_row):
@@ -279,151 +293,135 @@ class PeriodicHeatmap(Static):
             rows.extend([row_blocks, row_labels])
 
         peak_b = buckets[peak_idx]
-        summary_1 = Text("  ")
         peak_unknown = _has_unknown_cost(peak_b)
+        peak_line = Text("  ")
         if (peak_b.get("cost") or 0) > 0 or peak_unknown:
-            summary_1.append("peak ", style="white")
-            summary_1.append(peak_b["label"], style="bold")
-            summary_1.append(
+            peak_line.append("peak ", style="white")
+            peak_line.append(peak_b["label"], style="bold")
+            peak_line.append(
                 f"  {fmt_cost(peak_b.get('cost'), unknown=peak_unknown)}",
                 style="bright_yellow",
             )
-            summary_1.append(
-                f"  {_fmt_tokens_shared(peak_b.get('tokens') or 0)}",
+            peak_line.append(
+                f"  {fmt_tokens(peak_b.get('tokens') or 0)}",
                 style="bright_cyan",
             )
         else:
-            summary_1.append("peak —", style="white")
+            peak_line.append("peak —", style="white")
 
-        summary_2 = Text("  ")
-        summary_2.append("total ", style="white")
-        summary_2.append(fmt_cost(total_cost, unknown=total_unknown), style="bold bright_yellow")
-        summary_2.append(f"  {_fmt_tokens_shared(total_tokens)} tokens", style="bright_cyan")
+        body: list[Text] = []
 
-        return Group(*rows, summary_1, summary_2)
+        tsummary = _token_summary_block(self._totals)
+        if tsummary is not None:
+            body.append(tsummary)
+            body.append(Text(""))
+
+        body.extend(rows)
+        body.append(peak_line)
+
+        projects_block = _top_projects_block(
+            self._projects,
+            self._total_cost,
+            total_unknown=_has_unknown_cost(self._totals),
+        )
+        if projects_block is not None:
+            body.append(Text(""))
+            body.extend(projects_block)
+
+        return Group(*body)
 
 
 # Keep the old name as an alias for backwards compatibility
 HourHeatmap = PeriodicHeatmap
 
 
-def _fmt_tokens_shared(n: int) -> str:
-    return fmt_tokens(n)
+def _token_summary_block(totals: dict) -> Group | None:
+    """Two-line token block used at the top of the heatmap panel.
+
+    Line 1: ``Token total N · cache hit P%``
+    Line 2: ``Token input X · output Y · cache read Z · cache write W``
+    """
+    if not totals:
+        return None
+    input_t = totals.get("input_tokens") or 0
+    output_t = totals.get("output_tokens") or 0
+    cache_r = totals.get("cache_read_tokens") or 0
+    cache_w = totals.get("cache_creation_tokens") or 0
+    total_t = input_t + output_t + cache_r + cache_w
+    if total_t == 0:
+        return None
+
+    # cache hit rate = cache-reuse / (cache-reuse + fresh input)
+    denom = input_t + cache_r + cache_w
+    cache_pct = round(cache_r / denom * 100) if denom > 0 else None
+
+    line_total = Text("  ")
+    line_total.append("Token total ", style="white")
+    line_total.append(fmt_tokens(total_t), style="bright_cyan")
+    if cache_pct is not None:
+        line_total.append("  ·  cache hit ", style="white")
+        line_total.append(f"{cache_pct}%", style="bright_green")
+
+    line_split = Text("  ")
+    line_split.append("Token ", style="white")
+    line_split.append("input ", style="white")
+    line_split.append(fmt_tokens(input_t), style="bright_cyan")
+    line_split.append("  ·  output ", style="white")
+    line_split.append(fmt_tokens(output_t), style="bright_cyan")
+    line_split.append("  ·  cache read ", style="white")
+    line_split.append(fmt_tokens(cache_r), style="bright_green")
+    if cache_w:
+        line_split.append("  ·  cache write ", style="white")
+        line_split.append(fmt_tokens(cache_w), style="bright_green")
+
+    return Group(line_total, line_split)
 
 
-def _bucket_label_shared(row: dict) -> str:
-    date_s = row.get("usage_date") or ""
-    hour = int(row.get("usage_hour") or 0)
-    try:
-        dt = datetime.strptime(date_s, "%Y-%m-%d")
-        day = f"{dt.strftime('%b')} {dt.day}"
-    except ValueError:
-        day = date_s
-    return f"{day} {hour:02d}:00" if day else f"{hour:02d}:00"
+def _top_projects_block(
+    projects: list[dict],
+    total_cost: float,
+    *,
+    total_unknown: bool = False,
+    limit: int = 3,
+) -> list[Text] | None:
+    """Up to ``limit`` project rows. First row is labeled "Top projects"."""
+    if not projects:
+        return None
+    entries = [
+        p for p in projects
+        if (p.get("estimated_cost_usd") or 0) > 0 or _has_unknown_cost(p)
+    ][:limit]
+    if not entries:
+        return None
+
+    any_unknown = total_unknown or any(_has_unknown_cost(p) for p in entries)
+    label_text = "Top projects"
+
+    lines: list[Text] = []
+    for i, p in enumerate(entries):
+        unknown = _has_unknown_cost(p)
+        share = None
+        if total_cost and not any_unknown:
+            share = (p.get("estimated_cost_usd") or 0) / total_cost * 100
+
+        line = Text("  ")
+        if i == 0:
+            line.append(label_text, style="white")
+        else:
+            line.append(" " * len(label_text), style="default")
+        line.append("  ")
+        line.append(_short_path(p["project_path"] or "", max_len=44),
+                    style="bright_blue")
+        line.append(
+            f" · {fmt_cost(p.get('estimated_cost_usd'), unknown=unknown)}",
+            style="bold bright_yellow" if i == 0 else "bright_yellow",
+        )
+        if share is not None:
+            line.append(f" ({share:.1f}%)", style="white")
+        lines.append(line)
+    return lines
 
 
-def _short_path_shared(path: str, max_len: int) -> str:
-    if not path:
-        return "(unspecified)"
-    if len(path) <= max_len:
-        return path
-    return path[: max_len - 1] + "…"
-
-
-def _clip_shared(value: str, max_len: int) -> str:
-    if len(value) <= max_len:
-        return value
-    return value[: max(0, max_len - 1)] + "…"
-
-
-class CostDriverSummary(Static):
-    """Width-aware multi-line cost-driver summary for the TUI."""
-
-    def __init__(self, **kwargs) -> None:
-        super().__init__(**kwargs)
-        self._peak: dict | None = None
-        self._project: dict | None = None
-
-    def update_data(self, peak: dict | None, project: dict | None) -> None:
-        self._peak = peak
-        self._project = project
-        self.refresh()
-
-    def render(self) -> Group | Text:
-        if self._peak is None and self._project is None:
-            return Text("  No cost drivers in this period", style="white")
-
-        try:
-            content_width = max(12, self.size.width - 2)
-        except Exception:
-            content_width = 48
-
-        lines: list[Text] = []
-
-        if self._peak is not None:
-            peak = self._peak
-            peak_unknown = _has_unknown_cost(peak)
-            peak_model = peak["model"]
-            if peak_model == "Unknown" and peak.get("raw_model"):
-                peak_model = f"Unknown: {peak['raw_model']}"
-            model_max = max(16, content_width - len("  Top agent × model "))
-
-            line_1 = Text("  ")
-            line_1.append("Top agent × model ", style="white")
-            line_1.append(
-                _clip_shared(f"{peak['agent_type']} / {peak_model}", model_max),
-                style="bright_cyan",
-            )
-            lines.append(line_1)
-
-            line_2 = Text("  ")
-            line_2.append(_bucket_label_shared(peak), style="bold bright_blue")
-            line_2.append("  ·  ", style="white")
-            line_2.append(
-                fmt_cost(peak.get("estimated_cost_usd"), unknown=peak_unknown),
-                style="bold bright_yellow",
-            )
-            lines.append(line_2)
-
-            line_3 = Text("  ")
-            line_3.append(_clip_shared(_split_label_shared(peak), max(12, content_width - 2)), style="white")
-            lines.append(line_3)
-
-        if self._project is not None and (
-            (self._project.get("estimated_cost_usd") or 0) > 0
-            or _has_unknown_cost(self._project)
-        ):
-            project = self._project
-            project_unknown = _has_unknown_cost(project)
-            path_max = max(12, content_width - len("  Top project  ") - 10)
-
-            line_4 = Text("  ")
-            line_4.append("Top project ", style="white")
-            line_4.append(
-                _short_path_shared(project["project_path"], path_max),
-                style="bright_blue",
-            )
-            line_4.append("  ·  ", style="white")
-            line_4.append(
-                fmt_cost(project.get("estimated_cost_usd"), unknown=project_unknown),
-                style="bright_yellow",
-            )
-            lines.append(line_4)
-
-        return Group(*lines)
-
-
-def _split_label_shared(row: dict) -> str:
-    cache = (row.get("cache_read_tokens") or row.get("cache") or 0) + (
-        row.get("cache_creation_tokens") or 0
-    )
-    parts = [
-        f"in {fmt_tokens(row.get('input_tokens') or row.get('input') or 0)}",
-        f"out {fmt_tokens(row.get('output_tokens') or row.get('output') or 0)}",
-    ]
-    if cache > 0:
-        parts.append(f"cache {fmt_tokens(cache)}")
-    return "  ".join(parts)
 
 
 class Breakdown(Static):
