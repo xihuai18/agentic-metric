@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.3.5 (2026-04-26)
+
+### Fixed
+
+- **Auto-refresh label highlight**: in v0.3.4 only the `R` key cell
+  lit up while auto-refresh was running and the "Auto" label kept
+  its default footer style. The rule is now expressed with Textual's
+  nested CSS syntax so both the key *and* the label flip to bold
+  high-contrast colors when the 30-second sync is active.
+
 ## v0.3.4 (2026-04-26)
 
 ### Improvements

@@ -26,14 +26,21 @@ Footer > .footer--key {
     text-style: bold;
 }
 
-/* Highlight the R binding in the footer while auto-refresh is running. */
-FooterKey.-auto-on .footer-key--key {
-    background: $success;
-}
-
-FooterKey.-auto-on .footer-key--description {
-    color: $warning;
-    text-style: bold;
+/* Highlight the R binding in the footer while auto-refresh is running.
+ * Both the key cell and the "Auto" label light up so the active state
+ * is obvious at a glance. */
+FooterKey.-auto-on {
+    background: $warning;
+    .footer-key--key {
+        color: $surface;
+        background: $success;
+        text-style: bold;
+    }
+    .footer-key--description {
+        color: $surface;
+        background: $warning;
+        text-style: bold;
+    }
 }
 
 /* ─── Top summary row: 3 cells side by side ─── */
