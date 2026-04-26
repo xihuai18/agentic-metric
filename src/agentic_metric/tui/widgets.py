@@ -203,19 +203,18 @@ class PeriodicHeatmap(Static):
         if not self._buckets:
             return Text("  (no data)", style="white")
 
-        # 7-level low → hot gradient. Keeps block-character steps so
-        # the strip still reads without color support, but when colors
-        # are available the transition across the strip forms a
-        # continuous heat gradient.
+        # 7-level single-hue gradient. We keep one green family and vary
+        # density / intensity so the strip reads cleanly in terminals
+        # without turning into a rainbow.
         blocks = [" ", "·", "░", "▒", "▓", "█", "█"]
         colors = [
-            "default",      # 0: idle
-            "bright_blue",  # 1: trace
-            "bright_green", # 2: low
-            "bright_cyan",  # 3: low-mid
-            "bright_yellow",# 4: mid
-            "bright_red",   # 5: high
-            "bright_red",   # 6: peak
+            "default",           # 0: idle
+            "dim green",         # 1: trace
+            "green",             # 2: low
+            "green",             # 3: low-mid
+            "bright_green",      # 4: mid
+            "bright_green",      # 5: high
+            "bold bright_green", # 6: peak
         ]
         max_v = max((b.get("cost") or 0) for b in self._buckets) or 1.0
         levels = len(blocks)
@@ -262,7 +261,7 @@ class PeriodicHeatmap(Static):
             block = blocks[lvl]
             style = colors[lvl]
             if i == self._highlight:
-                style = f"bold {style} reverse"
+                style = f"{style} reverse"
 
             # Fill the whole cell with the block char — no inter-bucket
             # spacing, so adjacent buckets form a continuous strip.

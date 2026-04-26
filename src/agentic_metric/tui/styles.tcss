@@ -30,7 +30,9 @@ Footer > .footer--key {
  * Both the key cell and the "Auto" label light up so the active state
  * is obvious at a glance. */
 FooterKey.-auto-on {
-    background: $warning;
+    background: $success;
+    color: $surface;
+    text-style: bold;
     .footer-key--key {
         color: $surface;
         background: $success;
@@ -38,7 +40,7 @@ FooterKey.-auto-on {
     }
     .footer-key--description {
         color: $surface;
-        background: $warning;
+        background: $success;
         text-style: bold;
     }
 }

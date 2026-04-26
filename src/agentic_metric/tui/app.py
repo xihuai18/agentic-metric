@@ -41,6 +41,15 @@ def _total_tokens(d: dict) -> int:
     )
 
 
+def _cache_hit_pct(d: dict) -> int | None:
+    input_tokens = d.get("input_tokens") or 0
+    cache_tokens = (d.get("cache_read_tokens") or 0) + (d.get("cache_creation_tokens") or 0)
+    denom = input_tokens + cache_tokens
+    if denom <= 0:
+        return None
+    return round((cache_tokens / denom) * 100)
+
+
 # Trend configuration per focused view (long-range chart only; the
 # today hour heatmap is rendered separately).
 _TREND_CONFIG = {
@@ -121,11 +130,13 @@ def _split_label(row: dict) -> str:
     cache = (row.get("cache_read_tokens") or row.get("cache") or 0) + (
         row.get("cache_creation_tokens") or 0
     )
-    return (
-        f"in {fmt_tokens(row.get('input_tokens') or row.get('input') or 0)}  "
-        f"out {fmt_tokens(row.get('output_tokens') or row.get('output') or 0)}  "
-        f"cache {fmt_tokens(cache)}"
-    )
+    parts = [
+        f"in {fmt_tokens(row.get('input_tokens') or row.get('input') or 0)}",
+        f"out {fmt_tokens(row.get('output_tokens') or row.get('output') or 0)}",
+    ]
+    if cache > 0:
+        parts.append(f"cache {fmt_tokens(cache)}")
+    return "  ".join(parts)
 
 
 class AgenticMetricApp(App):
@@ -153,7 +164,8 @@ class AgenticMetricApp(App):
         # styled via the `-auto-on` class in styles.tcss.
         Binding("R", "auto_refresh_on", "Auto", key_display="R"),
         Binding("R", "auto_refresh_off", "Auto", key_display="R"),
-        # Let Ctrl+C pass through to the terminal for native copy.
+        Binding("alt+c", "copy_view", "Copy", key_display="Alt+C"),
+        # Keep Ctrl+C from quitting; some terminals also use it while copying.
         Binding("ctrl+c", "noop", show=False),
         Binding("q", "quit", "Quit"),
     ]
@@ -273,19 +285,19 @@ class AgenticMetricApp(App):
         if peak_rows:
             peak = peak_rows[0]
             peak_unknown = _has_unknown_cost(peak)
-            line.append(" driver ", style="white")
-            line.append(_bucket_label(peak), style="bold bright_blue")
-            line.append("  ", style="white")
+            line.append(" top agent × model ", style="white")
             peak_model = peak['model']
             if peak_model == "Unknown" and peak.get("raw_model"):
                 peak_model = f"Unknown: {peak['raw_model']}"
             line.append(f"{peak['agent_type']} / {peak_model}", style="bright_cyan")
-            line.append("  ", style="white")
+            line.append("  ·  ", style="white")
+            line.append(_bucket_label(peak), style="bold bright_blue")
+            line.append("  ·  ", style="white")
             line.append(
                 fmt_cost(peak.get("estimated_cost_usd"), unknown=peak_unknown),
                 style="bold bright_yellow",
             )
-            line.append("  ", style="white")
+            line.append("  ·  ", style="white")
             line.append(_split_label(peak), style="white")
             has_driver = True
         if project_rows and (
@@ -296,9 +308,9 @@ class AgenticMetricApp(App):
                 line.append("    ", style="white")
             project = project_rows[0]
             project_unknown = _has_unknown_cost(project)
-            line.append(" project ", style="white")
+            line.append("top project ", style="white")
             line.append(_short_path(project["project_path"]), style="bright_blue")
-            line.append("  ", style="white")
+            line.append("  ·  ", style="white")
             line.append(
                 fmt_cost(project.get("estimated_cost_usd"), unknown=project_unknown),
                 style="bright_yellow",
@@ -561,8 +573,70 @@ class AgenticMetricApp(App):
         return True
 
     def action_noop(self) -> None:
-        """Intercept Ctrl+C so it doesn't quit; hint the real quit key."""
-        self.notify("Press [bold]q[/] to quit", severity="information")
+        """Keep Ctrl+C from quitting; point people at the TUI copy key."""
+        self.notify("Press [bold]Alt+C[/] to copy, [bold]q[/] to quit", severity="information")
+
+    def action_copy_view(self) -> None:
+        """Copy selected text, or fall back to a compact snapshot of the current view."""
+        selected = self.screen.get_selected_text()
+        if selected:
+            self.copy_to_clipboard(selected)
+            self.notify("Copied selected text", severity="information")
+            return
+
+        label, frm, to = resolve_range(self._focus, offset=self._offset)
+        totals = get_range_totals(self._db, frm, to)
+        peak_rows = get_range_by_time_model(self._db, frm, to, limit=1)
+        project_rows = get_range_by_project(self._db, frm, to, limit=1)
+
+        lines = [f"{label}  {frm} -> {to}"]
+        stats = [
+            f"Cost {fmt_cost(totals.get('estimated_cost_usd'), unknown=_has_unknown_cost(totals))}",
+            f"Sessions {totals.get('session_count') or 0:,}",
+            f"Turns {totals.get('user_turns') or 0:,}",
+            f"Tokens {fmt_tokens(_total_tokens(totals))}",
+        ]
+        cache_hit = _cache_hit_pct(totals)
+        if cache_hit is not None:
+            stats.append(f"Cache hit {cache_hit}%")
+        lines.append(" | ".join(stats))
+
+        token_parts = [
+            f"Token input {fmt_tokens(totals.get('input_tokens') or 0)}",
+            f"output {fmt_tokens(totals.get('output_tokens') or 0)}",
+            f"cache read {fmt_tokens(totals.get('cache_read_tokens') or 0)}",
+        ]
+        cache_write = totals.get("cache_creation_tokens") or 0
+        if cache_write:
+            token_parts.append(f"cache write {fmt_tokens(cache_write)}")
+        lines.append(" | ".join(token_parts))
+
+        if peak_rows:
+            peak = peak_rows[0]
+            peak_model = peak["model"]
+            if peak_model == "Unknown" and peak.get("raw_model"):
+                peak_model = f"Unknown: {peak['raw_model']}"
+            lines.append(
+                "Top agent × model: "
+                f"{peak['agent_type']} / {peak_model} | "
+                f"{_bucket_label(peak)} | "
+                f"{fmt_cost(peak.get('estimated_cost_usd'), unknown=_has_unknown_cost(peak))} | "
+                f"{_split_label(peak)}"
+            )
+
+        if project_rows and (
+            (project_rows[0].get("estimated_cost_usd") or 0) > 0
+            or _has_unknown_cost(project_rows[0])
+        ):
+            project = project_rows[0]
+            lines.append(
+                "Top project: "
+                f"{_short_path(project['project_path'])} | "
+                f"{fmt_cost(project.get('estimated_cost_usd'), unknown=_has_unknown_cost(project))}"
+            )
+
+        self.copy_to_clipboard("\n".join(lines))
+        self.notify("Copied current view summary", severity="information")
 
 
 def _has_unknown_cost(row: dict | None) -> bool:

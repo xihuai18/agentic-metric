@@ -17,7 +17,7 @@ A local-only monitoring tool for AI coding agents — like `top`, but for your c
 
 - **Live monitoring** — Detect running agent processes, incremental JSONL session parsing
 - **Cost estimation** — Per-model pricing table with CLI management, calculates API-equivalent costs; supports long-context and cache-duration pricing
-- **Unified report** — One `report` command for today / week / month / custom date range, with agent × model breakdown, top projects, top sessions, and hourly/daily/weekly heatmaps
+- **Unified report** — One `report` command for today / week / month / custom date range, with agent × model breakdown, top projects, cost drivers, and hourly/daily/weekly heatmaps
 - **TUI dashboard** — Terminal UI with live refresh, stacked summary cells, heatmap strip, 30-day cost chart, and agent × model breakdown
 - **Multi-agent** — Plugin architecture; supports Claude Code and Codex today, extensible
 
@@ -84,14 +84,14 @@ agentic-metric pricing               # Manage model pricing
 | `--week` | This week (Mon → today) |
 | `--month` | This month |
 | `--range FROM:TO` | Custom date range, e.g. `2026-04-01:2026-04-23` |
-| `--full` | Show extra drill-down tables (agent × model, periodic breakdown) |
+| `--full` | Show extra drill-down tables (by agent, periodic breakdown) |
 | `--limit N` / `-n N` | Rows in driver tables (1–25, default 8) |
 | `--no-sync` | Skip syncing collectors before querying |
 
 `report` shows a header with total cost / sessions / turns / tokens / cache-hit
 rate, a delta vs. the previous equivalent period, a heatmap strip (hours for
-`--today`, days for `--week`, weeks for `--month`), and breakdowns by agent ×
-model, top projects, top sessions, and time buckets.
+`--today`, days for `--week`, weeks for `--month`), plus a default `agent × model`
+breakdown, top projects, top cost drivers, and optional extra drill-down tables.
 
 ### Pricing Management
 

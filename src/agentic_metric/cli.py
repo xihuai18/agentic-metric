@@ -13,7 +13,6 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from .pricing import is_model_priced
 from .formatting import (
     cache_hit_rate as _cache_hit_rate,
     cache_tokens as _cache_tokens,
@@ -25,7 +24,6 @@ from .formatting import (
     share_pct as _share_pct,
     share_suffix as _share_suffix,
     short_path as _short_path,
-    short_session_id as _short_session_id,
     shorten_home as _shorten_home,
     sum_tokens as _sum_tokens,
     time_bucket_label as _time_bucket_label,
@@ -58,8 +56,6 @@ pricing_app.add_typer(cache_pricing_app, name="cache")
 
 
 console = Console()
-
-_COMPACT_TOP_SESSIONS_LIMIT = 5
 
 
 # ANSI named colors — inherit the terminal's own palette / theme.
@@ -202,13 +198,6 @@ def report(
     by_agent_model = aggregator.get_range_by_agent_model(db, frm, to)
     by_project = aggregator.get_range_by_project(db, frm, to, limit=10)
     by_time_model = aggregator.get_range_by_time_model(db, frm, to, limit=limit)
-    top_sessions = aggregator.get_range_top_sessions(
-        db,
-        frm,
-        to,
-        limit=limit if full else min(limit, _COMPACT_TOP_SESSIONS_LIMIT),
-    )
-
     # Periodic breakdown (hourly/daily/weekly) — only when the range
     # corresponds to a named focus.
     focus_kind = None
@@ -226,7 +215,7 @@ def report(
 
     _print_report(
         label, frm, to, totals, by_agent, by_agent_model, by_project,
-        by_time_model, top_sessions, periodic, focus_kind, prev_totals, full=full,
+        by_time_model, periodic, focus_kind, prev_totals, full=full,
     )
 
 
@@ -285,8 +274,8 @@ def _print_report(
     label: str, frm: str, to: str,
     totals: dict, by_agent: list[dict],
     by_agent_model: list[dict], by_project: list[dict],
-    by_time_model: list[dict], top_sessions: list[dict],
-    periodic: list[dict], focus_kind: str | None,
+    by_time_model: list[dict], periodic: list[dict],
+    focus_kind: str | None,
     prev_totals: dict | None = None,
     *,
     full: bool = False,
@@ -343,14 +332,13 @@ def _print_report(
     if periodic and focus_kind:
         heatmap_renderable = _build_heatmap_panel(periodic, focus_kind)
     drivers_renderable = _build_cost_drivers_panel(
-        totals, by_time_model, top_sessions, by_project, detailed=full,
+        totals, by_time_model, by_project, detailed=full,
     )
 
     # ─── Table renderables ───
-    agent_tbl = _build_by_agent_table(by_agent)
-    session_tbl = _build_top_sessions_table(top_sessions, tot_cost, total_unknown=tot_cost_unknown)
+    breakdown_tbl = _build_by_agent_model_table(by_agent_model)
     project_tbl = _build_top_projects_table(by_project)
-    model_tbl = _build_by_agent_model_table(by_agent_model) if full else None
+    agent_tbl = _build_by_agent_table(by_agent) if full else None
     periodic_tbl = _build_periodic_table(periodic, focus_kind) if full else None
 
     # ─── Render ───
@@ -366,18 +354,15 @@ def _print_report(
     except Exception:
         term_width = 0
 
-    if term_width >= 160 and agent_tbl is not None and project_tbl is not None:
-        console.print(Columns([agent_tbl, project_tbl], expand=True, equal=False, padding=(0, 2)))
+    if term_width >= 160 and breakdown_tbl is not None and project_tbl is not None:
+        console.print(Columns([breakdown_tbl, project_tbl], expand=True, equal=False, padding=(0, 2)))
     else:
-        if agent_tbl is not None:
-            console.print(agent_tbl)
+        if breakdown_tbl is not None:
+            console.print(breakdown_tbl)
         if project_tbl is not None:
             console.print(project_tbl)
 
-    if session_tbl is not None:
-        console.print(session_tbl)
-
-    detail_tables = [t for t in (model_tbl, periodic_tbl) if t is not None]
+    detail_tables = [t for t in (agent_tbl, periodic_tbl) if t is not None]
     if detail_tables:
         if term_width >= 160 and len(detail_tables) == 2:
             console.print(Columns(detail_tables, expand=True, equal=False, padding=(0, 2)))
@@ -438,14 +423,14 @@ def _auto_summary_line(
 def _build_heatmap_panel(buckets: list[dict], focus_kind: str) -> Panel:
     """Render the activity heatmap as a CLI panel."""
     blocks = [" ", "·", "░", "▒", "▓", "█", "█"]
-    colors = [
+    styles = [
         "default",
-        C_BLUE,
-        C_GREEN,
+        "dim green",
+        "green",
+        "green",
         "bright_green",
-        C_YELLOW,
-        C_RED,
-        "bright_red",
+        "bright_green",
+        "bold bright_green",
     ]
     levels = len(blocks)
     max_v = max((b.get("cost") or 0) for b in buckets) or 1.0
@@ -479,9 +464,9 @@ def _build_heatmap_panel(buckets: list[dict], focus_kind: str) -> Panel:
     for i, b in enumerate(buckets):
         ratio = (b.get("cost") or 0) / max_v
         lvl = min(levels - 1, int(round(ratio * (levels - 1))))
-        style = colors[lvl]
+        style = styles[lvl]
         if i == highlight:
-            style = f"bold {style} reverse"
+            style = f"{style} reverse"
         row_blocks.append(blocks[lvl] * cell_w, style=style)
         if i % label_every == 0:
             row_labels.append(b["label"][:cell_w].center(cell_w), style=C_MUTED)
@@ -523,20 +508,18 @@ def _build_heatmap_panel(buckets: list[dict], focus_kind: str) -> Panel:
 def _build_cost_drivers_panel(
     totals: dict,
     by_time_model: list[dict],
-    top_sessions: list[dict],
     by_project: list[dict],
     *,
     detailed: bool = False,
 ) -> Panel | None:
-    """Render the report explanation panel: peak buckets and expensive sessions."""
-    if not by_time_model and not top_sessions and not by_project:
+    """Render the report explanation panel: peak buckets and top projects."""
+    if not by_time_model and not by_project:
         return None
 
     total_cost = totals.get("estimated_cost_usd") or 0.0
     summary = _driver_summary_line(
         total_cost,
         by_time_model,
-        top_sessions,
         by_project,
         total_unknown=_has_unknown_cost(totals),
     )
@@ -567,36 +550,26 @@ def _build_cost_drivers_panel(
 def _driver_summary_line(
     total_cost: float,
     by_time_model: list[dict],
-    top_sessions: list[dict],
     by_project: list[dict],
     *,
     total_unknown: bool = False,
 ) -> Text | None:
-    total_unknown = total_unknown or any(_has_unknown_cost(r) for r in [*by_time_model, *top_sessions, *by_project])
+    total_unknown = total_unknown or any(_has_unknown_cost(r) for r in [*by_time_model, *by_project])
     line = Text()
     wrote = False
     if by_time_model:
         peak = by_time_model[0]
         peak_unknown = _has_unknown_cost(peak)
-        line.append("Peak bucket  ", style=C_MUTED)
-        line.append(_time_bucket_label(peak), style=f"bold {C_BLUE}")
+        line.append("Top agent × model  ", style=C_MUTED)
         line.append(" · ", style=C_MUTED)
         peak_model = peak['model']
         if peak_model == "Unknown" and peak.get("raw_model"):
             peak_model = f"Unknown: {peak['raw_model']}"
         line.append(f"{peak['agent_type']} / {peak_model}", style=C_SKY)
+        line.append(" · ", style=C_MUTED)
+        line.append(_time_bucket_label(peak), style=f"bold {C_BLUE}")
         line.append(f" · {_fmt_cost(peak['estimated_cost_usd'], unknown=peak_unknown)}", style=f"bold {C_YELLOW}")
         line.append(_share_suffix(peak["estimated_cost_usd"], total_cost, unknown=peak_unknown, total_unknown=total_unknown), style=C_MUTED)
-        wrote = True
-    if top_sessions:
-        if wrote:
-            line.append("\n")
-        sess = top_sessions[0]
-        sess_unknown = _has_unknown_cost(sess)
-        line.append("Top session  ", style=C_MUTED)
-        line.append(_short_session_id(sess["session_id"]), style=f"bold {C_MAUVE}")
-        line.append(f" · {_fmt_cost(sess['estimated_cost_usd'], unknown=sess_unknown)}", style=f"bold {C_YELLOW}")
-        line.append(_share_suffix(sess["estimated_cost_usd"], total_cost, unknown=sess_unknown, total_unknown=total_unknown), style=C_MUTED)
         wrote = True
     if by_project:
         if wrote:
@@ -680,59 +653,6 @@ def _build_time_model_table(rows: list[dict], total_cost: float, *, total_unknow
         ])
         if wide:
             cells.append(_share_pct(cost, total_cost, unknown=unknown, total_unknown=total_unknown))
-        tbl.add_row(*cells)
-    return tbl
-
-
-def _build_top_sessions_table(rows: list[dict], total_cost: float, *, total_unknown: bool = False) -> Table | None:
-    rows = [r for r in rows if _has_cost_signal(r)]
-    if not rows:
-        return None
-    tbl = Table(
-        show_header=True,
-        header_style=f"bold {C_SUBTEXT}",
-        box=box.SIMPLE_HEAVY,
-        pad_edge=False,
-        border_style=C_SURFACE1,
-        title="Top sessions",
-        title_style=f"bold {C_TEXT}",
-        title_justify="left",
-    )
-    wide = console.size.width >= 120
-    tbl.add_column("Session", style=C_MAUVE, no_wrap=True)
-    tbl.add_column("Agent / model", style=C_SKY)
-    if wide:
-        tbl.add_column("Prompt / project", style=C_TEXT, overflow="fold", max_width=42)
-    tbl.add_column("Input", justify="right", style=C_TEAL)
-    tbl.add_column("Output", justify="right", style=C_TEAL)
-    tbl.add_column("Cache", justify="right", style=C_GREEN)
-    tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}")
-    tbl.add_column("Share", justify="right", style=C_MUTED)
-    for row in rows[:8]:
-        cost = row["estimated_cost_usd"] or 0.0
-        unknown = _has_unknown_cost(row)
-        models_str = row.get("models") or row.get("model") or "(unknown)"
-        if "Unknown" in models_str and row.get("raw_models"):
-            raw_list = [m.strip() for m in row["raw_models"].split(",") if m.strip()]
-            unknown_raw = [m for m in raw_list if not is_model_priced(m)]
-            if unknown_raw:
-                models_str = models_str.replace("Unknown", f"Unknown: {','.join(unknown_raw)}", 1)
-        models = _clip(models_str.replace(",", ", "), 28)
-        prompt = (row.get("first_prompt") or "").strip()
-        prompt_or_project = prompt if prompt else _short_path(row.get("project_path") or "")
-        cells = [
-            _short_session_id(row["session_id"]),
-            f"{row['agent_type']} / {models}",
-        ]
-        if wide:
-            cells.append(_clip(prompt_or_project, 88))
-        cells.extend([
-            _fmt_tokens(row.get("input_tokens") or 0),
-            _fmt_tokens(row.get("output_tokens") or 0),
-            _fmt_tokens(_cache_tokens(row)),
-            _fmt_cost(cost, unknown=unknown),
-            _share_pct(cost, total_cost, unknown=unknown, total_unknown=total_unknown),
-        ])
         tbl.add_row(*cells)
     return tbl
 
@@ -910,8 +830,8 @@ def _token_split_line(totals: dict) -> Text | None:
     if not totals:
         return None
     line = Text()
-    line.append("Token split", style=C_MUTED)
-    line.append("   input ", style=C_MUTED)
+    line.append("Token ", style=C_MUTED)
+    line.append("input ", style=C_MUTED)
     line.append(_fmt_tokens(totals.get("input_tokens") or 0), style=C_TEAL)
     line.append("  ·  output ", style=C_MUTED)
     line.append(_fmt_tokens(totals.get("output_tokens") or 0), style=C_TEAL)
