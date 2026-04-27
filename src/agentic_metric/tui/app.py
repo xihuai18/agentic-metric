@@ -249,6 +249,8 @@ class AgenticMetricApp(App):
             cost_unknown = _has_unknown_cost(totals)
             sess = totals.get("session_count") or 0
             turns = totals.get("user_turns") or 0
+            msgs = totals.get("message_count") or 0
+            requests = max(0, msgs - turns)
             tokens = _total_tokens(totals)
             cache_pct = _cache_hit_pct(totals)
 
@@ -272,6 +274,7 @@ class AgenticMetricApp(App):
                 cost_unknown=cost_unknown,
                 prev_cost_unknown=prev_cost_unknown,
                 turns=turns,
+                requests=requests,
                 cache_pct=cache_pct,
             )
             cell.set_focused(kind == self._focus)
@@ -389,6 +392,7 @@ class AgenticMetricApp(App):
             cost_unknown=cell.cost_unknown,
             prev_cost_unknown=cell.prev_cost_unknown,
             turns=cell.turns,
+            requests=cell.requests,
             cache_pct=cell.cache_pct,
         )
 
@@ -497,10 +501,13 @@ class AgenticMetricApp(App):
         project_rows = get_range_by_project(self._db, frm, to, limit=3)
 
         lines = [f"{label}  {frm} -> {to}"]
+        _ut = totals.get('user_turns') or 0
+        _mc = totals.get('message_count') or 0
         stats = [
             f"Cost {fmt_cost(totals.get('estimated_cost_usd'), unknown=_has_unknown_cost(totals))}",
             f"Sessions {totals.get('session_count') or 0:,}",
-            f"Turns {totals.get('user_turns') or 0:,}",
+            f"Requests {max(0, _mc - _ut):,}",
+            f"Turns {_ut:,}",
             f"Tokens {fmt_tokens(_total_tokens(totals))}",
         ]
         cache_hit = _cache_hit_pct(totals)

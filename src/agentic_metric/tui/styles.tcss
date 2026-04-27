@@ -48,8 +48,9 @@ FooterKey.-auto-on {
 /* ─── Top summary row: 3 cells side by side ─── */
 
 #summary-row {
-    height: 7;
-    min-height: 5;
+    height: auto;
+    min-height: 7;
+    max-height: 9;
     margin: 1 1 0 1;
 }
 

@@ -91,6 +91,7 @@ class SummaryCell(Static):
         self.cost_unknown = False
         self.sessions = 0
         self.turns = 0
+        self.requests = 0
         self.tokens = 0
         self.cache_pct: int | None = None
         self.active = 0
@@ -114,12 +115,14 @@ class SummaryCell(Static):
         cost_unknown: bool = False,
         prev_cost_unknown: bool = False,
         turns: int = 0,
+        requests: int = 0,
         cache_pct: int | None = None,
     ) -> None:
         self.cost = cost
         self.cost_unknown = cost_unknown
         self.sessions = sessions
         self.turns = turns
+        self.requests = requests
         self.tokens = tokens
         self.cache_pct = cache_pct
         self.active = active
@@ -170,14 +173,30 @@ class SummaryCell(Static):
         if self.sparkline:
             t.append(fmt_sparkline(self.sparkline), style="bright_cyan")
             t.append("\n")
-        # Sessions · turns (+ live indicator). Tokens and cache hit live in
-        # the heatmap panel's Token summary, so we don't repeat them here.
-        t.append(f"{self.sessions:,} sess", style="white")
-        t.append(" · ", style="white")
-        t.append(f"{self.turns:,} turns", style="white")
-        if self.active:
-            t.append("  ")
-            t.append(f"● {self.active} live", style="bold bright_green")
+        # Sessions / requests / turns — inline if they fit, stacked otherwise.
+        parts = [f"{self.sessions:,} sess", f"{self.requests:,} req", f"{self.turns:,} turns"]
+        inline = " · ".join(parts)
+        live_str = f"● {self.active} live" if self.active else ""
+        # content_size.width accounts for padding; fall back to 30 if unknown.
+        try:
+            avail = self.content_size.width
+        except Exception:
+            avail = 30
+        need = len(inline) + (2 + len(live_str) if live_str else 0)
+        if avail >= need:
+            t.append(inline, style="white")
+            if live_str:
+                t.append("  ")
+                t.append(live_str, style="bold bright_green")
+        else:
+            t.append(parts[0], style="white")
+            t.append(" · ", style="white")
+            t.append(parts[1], style="white")
+            t.append(" · ", style="white")
+            t.append(parts[2], style="white")
+            if live_str:
+                t.append("\n")
+                t.append(live_str, style="bold bright_green")
         return t
 
 

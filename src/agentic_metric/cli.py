@@ -278,6 +278,8 @@ def _print_report(
     tot_cost_unknown = _has_unknown_cost(totals)
     tot_sess = totals.get("session_count") or 0
     tot_turns = totals.get("user_turns") or 0
+    tot_msgs = totals.get("message_count") or 0
+    tot_requests = max(0, tot_msgs - tot_turns)
 
     # ─── Header panel (label + stats) ───
     header_text = Text()
@@ -295,12 +297,13 @@ def _print_report(
     )
     # Tokens / cache hit live in the heatmap panel now — the header only carries
     # cost, sessions, and turns.
-    stats = Table.grid(padding=(0, 4))
-    for _ in range(3):
+    stats = Table.grid(padding=(0, 3))
+    for _ in range(4):
         stats.add_column(justify="left")
     stats.add_row(
         cost_cell,
         _stat("Sessions", f"{tot_sess:,}", C_MAUVE),
+        _stat("Requests", f"{tot_requests:,}", C_SKY),
         _stat("Turns", f"{tot_turns:,}", C_SKY),
     )
 
