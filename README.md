@@ -17,8 +17,8 @@ A local-only monitoring tool for AI coding agents — like `top`, but for your c
 
 - **Live monitoring** — Detect running agent processes, incremental JSONL session parsing
 - **Cost estimation** — Per-model pricing table with CLI management, calculates API-equivalent costs; supports long-context and cache-duration pricing
-- **Unified report** — One `report` command for today / week / month / custom date range, with agent × model breakdown, top projects, cost drivers, and hourly/daily/weekly heatmaps
-- **TUI dashboard** — Terminal UI with live refresh, stacked summary cells, heatmap strip, 30-day cost chart, and agent × model breakdown
+- **Unified report** — One `report` command for today / week / month / custom date range, with agent × provider × model breakdown, top projects, cost drivers, and hourly/daily/weekly heatmaps
+- **TUI dashboard** — Terminal UI with live refresh, stacked summary cells, heatmap strip, 30-day cost chart, and agent → provider → model breakdown
 - **Multi-agent** — Plugin architecture; supports Claude Code and Codex today, extensible
 
 ## Agent Data Coverage
@@ -65,6 +65,7 @@ uv tool upgrade agentic-metric-x   # Upgrade to latest version
 agentic-metric                       # Launch TUI dashboard (default when no command given)
 agentic-metric tui                   # Launch TUI dashboard explicitly
 agentic-metric sync                  # Force sync collectors to the local database
+agentic-metric sync --rebuild        # Rebuild the derived database from source session logs
 agentic-metric report --today        # Today's usage report
 agentic-metric report --week         # This week (Mon → today)
 agentic-metric report --month        # This month
@@ -90,7 +91,7 @@ agentic-metric pricing               # Manage model pricing
 
 `report` shows a header with total cost / sessions / turns / tokens / cache-hit
 rate, a delta vs. the previous equivalent period, a heatmap strip (hours for
-`--today`, days for `--week`, weeks for `--month`), plus a default `agent × model`
+`--today`, days for `--week`, weeks for `--month`), plus a default `agent × provider × model`
 breakdown, top projects, top cost drivers, and optional extra drill-down tables.
 
 ### Pricing Management
@@ -141,6 +142,11 @@ local history files do not expose reliable non-standard markers.
 
 After a pricing change, the command resyncs local history so event-level costs
 such as long-context requests are recalculated from the original JSONL data.
+
+If cached history ever looks stale after changing roots/providers, run
+`agentic-metric sync --rebuild`. This deletes only this tool's derived SQLite
+database and rebuilds it from the original Claude Code and Codex session files;
+`config.json`, `pricing.json`, and agent data directories are left untouched.
 
 ### TUI Keybindings
 
@@ -246,9 +252,35 @@ Paths differ by platform. `$DATA` refers to:
 | Codex | `~/.codex/sessions/` | JSONL sessions, token usage, model |
 | Codex | Process detection | Running status, working directory |
 
-Claude Code honors `CLAUDE_CONFIG_DIR` and Codex honors `CODEX_HOME` — if you
-have relocated either agent's config directory, the collectors pick up the
-environment variable automatically.
+By default, Claude Code honors `CLAUDE_CONFIG_DIR` and Codex honors
+`CODEX_HOME`. To scan multiple roots or assign a provider explicitly, create
+this tool's own config file:
+
+```json
+{
+  "collectors": {
+    "codex": {
+      "roots": [
+        {"path": "~/.codex", "provider": "openai"},
+        {"path": "~/.codex-custom", "provider": "custom"}
+      ]
+    },
+    "claude_code": {
+      "roots": [
+        {"path": "~/.claude"},
+        {"path": "~/.claude-alt"},
+        {"path": "~/.claude-provider-b", "provider": "provider-b"}
+      ]
+    }
+  }
+}
+```
+
+The default config path is `$DATA/agentic_metric/config.json`; set
+`AGENTIC_METRIC_CONFIG` to point at another JSON file. Claude Code roots
+without a provider are not guessed; Codex roots without a provider can still
+fall back to the JSONL `model_provider`. CLI/TUI reports display `agent`,
+`provider`, and `root` as separate fields.
 
 All aggregated data is stored locally in `$DATA/agentic_metric/data.db` (SQLite).
 

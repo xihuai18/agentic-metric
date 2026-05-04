@@ -13,6 +13,8 @@ class LiveSession:
     session_id: str
     agent_type: str  # 'claude_code', 'codex', etc.
     project_path: str
+    provider: str = ""
+    data_root: str = ""
     git_branch: str = ""
     model: str = ""
     message_count: int = 0

@@ -368,7 +368,7 @@ def test_pricing_fingerprint_includes_lookup_rules(tmp_path):
             assert get_pricing_fingerprint() != base
         with patch("agentic_metric.pricing._UNKNOWN_MODEL_PREFIXES", ("gpt-5-pro", "custom-pro")):
             assert get_pricing_fingerprint() != base
-        with patch("agentic_metric.pricing._NON_BILLABLE_MODELS", {"<synthetic>", "<internal>"}):
+        with patch("agentic_metric.pricing._NON_BILLABLE_MODELS", {"<synthetic>", "<nonbillable>"}):
             assert get_pricing_fingerprint() != base
     _reset_cache()
 

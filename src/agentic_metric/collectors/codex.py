@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import platform
 import time
@@ -68,9 +69,20 @@ class _SessionAccum:
         "fork_baseline_cache_read",
         "fork_baseline_cache_create",
         "usage_buckets",
+        "provider",
+        "provider_locked",
+        "observed_provider",
+        "data_root",
     )
 
-    def __init__(self, file_path: Path, project_path: str, pid: int = 0) -> None:
+    def __init__(
+        self,
+        file_path: Path,
+        project_path: str,
+        pid: int = 0,
+        provider: str = "",
+        data_root: str = "",
+    ) -> None:
         self.file_path = file_path
         self.project_path = project_path
         self.session_id = ""
@@ -110,6 +122,10 @@ class _SessionAccum:
         self.fork_baseline_cache_read = 0
         self.fork_baseline_cache_create = 0
         self.usage_buckets: dict[tuple[str, int, str], dict] = {}
+        self.provider = provider.strip()
+        self.provider_locked = bool(self.provider)
+        self.observed_provider = ""
+        self.data_root = data_root
 
     def read_new_lines(self) -> None:
         """Read only bytes appended since last call.
@@ -190,6 +206,7 @@ class _SessionAccum:
         self.fork_baseline_cache_read = 0
         self.fork_baseline_cache_create = 0
         self.usage_buckets.clear()
+        self.observed_provider = ""
         self._reset_today_counters(today_str)
 
     def _reset_today_counters(self, today_str: str) -> None:
@@ -259,6 +276,12 @@ class _SessionAccum:
     def usage_bucket_rows(self) -> list[dict]:
         return list(self.usage_buckets.values())
 
+    def matches_configured_provider(self) -> bool:
+        """False when this configured root is parsing another provider's session."""
+        if not self.provider_locked or not self.observed_provider:
+            return True
+        return self.observed_provider == self.provider
+
     def _process_raw_line(self, raw_line: bytes) -> bool:
         """Process one JSONL line. Return False for an unparsable line."""
         raw_line = raw_line.strip()
@@ -283,6 +306,9 @@ class _SessionAccum:
 
         if entry_type == "session_meta":
             payload = entry.get("payload", {})
+            provider = str(payload.get("model_provider") or "").strip()
+            if provider:
+                self.observed_provider = provider
             if not self.session_id:
                 self.session_id = payload.get("id", "")
                 source = payload.get("source", {})
@@ -292,6 +318,9 @@ class _SessionAccum:
                 )
             if not self.project_path:
                 self.project_path = payload.get("cwd", "")
+            if not self.provider_locked:
+                if provider:
+                    self.provider = provider
             git = payload.get("git", {})
             if git and not self.git_branch:
                 self.git_branch = git.get("branch", "")
@@ -433,6 +462,8 @@ class _SessionAccum:
             session_id=self.session_id or self.file_path.stem,
             agent_type="codex",
             project_path=self.project_path,
+            provider=self.provider,
+            data_root=self.data_root,
             git_branch=self.git_branch,
             model=self.model,
             message_count=self.message_count,
@@ -466,8 +497,19 @@ class _LiveMonitor:
     ``~/.codex/sessions/YYYY/MM/DD/``.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        sessions_dir: Path | None = None,
+        provider: str = "",
+        data_root: str = "",
+    ) -> None:
+        self.sessions_dir = sessions_dir
+        self.provider = provider.strip()
+        self.data_root = data_root
         self._accums: dict[Path, _SessionAccum] = {}
+
+    def _sessions_dir(self) -> Path:
+        return self.sessions_dir or CODEX_SESSIONS_DIR
 
     def refresh(self) -> list[LiveSession]:
         """Return currently running sessions."""
@@ -490,9 +532,10 @@ class _LiveMonitor:
 
         today = date.today()
         candidate_files: dict[Path, float] = {}
+        sessions_dir = self._sessions_dir()
         for day_offset in range(3):
             day = today - timedelta(days=day_offset)
-            day_dir = CODEX_SESSIONS_DIR / str(day.year) / f"{day.month:02d}" / f"{day.day:02d}"
+            day_dir = sessions_dir / str(day.year) / f"{day.month:02d}" / f"{day.day:02d}"
             if not day_dir.is_dir():
                 continue
             try:
@@ -511,9 +554,9 @@ class _LiveMonitor:
 
         cwd_to_files = self._files_by_active_cwd(candidate_files, cwd_to_pids)
         missing_cwds = set(cwd_to_pids) - set(cwd_to_files)
-        if missing_cwds and CODEX_SESSIONS_DIR.exists():
+        if missing_cwds and sessions_dir.exists():
             try:
-                for jsonl_file in CODEX_SESSIONS_DIR.rglob("rollout-*.jsonl"):
+                for jsonl_file in sessions_dir.rglob("rollout-*.jsonl"):
                     if jsonl_file in candidate_files:
                         continue
                     cwd = normalize_cwd_key(self._read_cwd(jsonl_file))
@@ -545,13 +588,19 @@ class _LiveMonitor:
                 pid = pids[idx] if idx < len(pids) else 0
                 accum = self._accums.get(jsonl_file)
                 if accum is None:
-                    accum = _SessionAccum(jsonl_file, cwd_display.get(cwd, cwd), pid=pid)
+                    accum = _SessionAccum(
+                        jsonl_file,
+                        cwd_display.get(cwd, cwd),
+                        pid=pid,
+                        provider=self.provider,
+                        data_root=self.data_root,
+                    )
                     self._accums[jsonl_file] = accum
                 else:
                     accum.pid = pid
 
                 accum.read_new_lines()
-                if accum.user_turns > 0:
+                if accum.user_turns > 0 and accum.matches_configured_provider():
                     results.append(accum.to_live_session())
 
         # Prune stale accumulators
@@ -564,12 +613,13 @@ class _LiveMonitor:
 
     def _refresh_recent_files(self) -> list[LiveSession]:
         """Windows fallback when process CWD lookup is unavailable."""
-        if not CODEX_SESSIONS_DIR.exists():
+        sessions_dir = self._sessions_dir()
+        if not sessions_dir.exists():
             return []
         cutoff = time.time() - _RECENT_ACTIVITY_SECONDS
         candidates: list[tuple[float, Path]] = []
         try:
-            for jsonl_file in CODEX_SESSIONS_DIR.rglob("rollout-*.jsonl"):
+            for jsonl_file in sessions_dir.rglob("rollout-*.jsonl"):
                 try:
                     mtime = jsonl_file.stat().st_mtime
                     if mtime >= cutoff:
@@ -585,10 +635,15 @@ class _LiveMonitor:
             active_files.add(jsonl_file)
             accum = self._accums.get(jsonl_file)
             if accum is None:
-                accum = _SessionAccum(jsonl_file, project_path="")
+                accum = _SessionAccum(
+                    jsonl_file,
+                    project_path="",
+                    provider=self.provider,
+                    data_root=self.data_root,
+                )
                 self._accums[jsonl_file] = accum
             accum.read_new_lines()
-            if accum.user_turns > 0:
+            if accum.user_turns > 0 and accum.matches_configured_provider():
                 results.append(accum.to_live_session())
 
         stale = [k for k in self._accums if k not in active_files]
@@ -643,8 +698,24 @@ class CodexCollector(BaseCollector):
 
     agent_type = "codex"
 
-    def __init__(self) -> None:
-        self._monitor = _LiveMonitor()
+    def __init__(
+        self,
+        sessions_dir: Path | None = None,
+        provider: str = "",
+        data_root: str = "",
+    ) -> None:
+        self.sessions_dir = sessions_dir
+        self.provider = provider.strip()
+        self.data_root = data_root
+        self.agent_type = "codex"
+        self._monitor = _LiveMonitor(
+            sessions_dir,
+            provider=self.provider,
+            data_root=self.data_root,
+        )
+
+    def _sessions_dir(self) -> Path:
+        return self.sessions_dir or CODEX_SESSIONS_DIR
 
     def get_live_sessions(self) -> list[LiveSession]:
         return self._monitor.refresh()
@@ -656,12 +727,13 @@ class CodexCollector(BaseCollector):
 
     def _sync_jsonl_sessions(self, db) -> None:
         """Walk all ~/.codex/sessions/**/*.jsonl and upsert session data."""
-        if not CODEX_SESSIONS_DIR.exists():
+        sessions_dir = self._sessions_dir()
+        if not sessions_dir.exists():
             return
 
-        sync_prefix = "codex_jsonl:v5:"
+        sync_prefix = f"codex_jsonl:v7:{_sync_key_identity(self.provider, self.data_root)}:"
 
-        for jsonl_file in CODEX_SESSIONS_DIR.rglob("rollout-*.jsonl"):
+        for jsonl_file in sessions_dir.rglob("rollout-*.jsonl"):
             sync_key = f"{sync_prefix}{jsonl_file}"
             prev_state = db.get_sync_state(sync_key)
 
@@ -676,8 +748,25 @@ class CodexCollector(BaseCollector):
                 continue
 
             # Full parse to get cumulative totals
-            accum = _SessionAccum(jsonl_file, project_path="")
+            accum = _SessionAccum(
+                jsonl_file,
+                project_path="",
+                provider=self.provider,
+                data_root=self.data_root,
+            )
             accum.read_new_lines()
+
+            if not accum.matches_configured_provider():
+                session_id = accum.session_id or ""
+                if session_id:
+                    db.delete_session(
+                        session_id,
+                        self.agent_type,
+                        provider=self.provider,
+                        data_root=self.data_root,
+                    )
+                db.set_sync_state(sync_key, _sync_state_value(file_size, mtime_ns))
+                continue
 
             if accum.user_turns == 0:
                 db.set_sync_state(sync_key, _sync_state_value(file_size, mtime_ns))
@@ -691,6 +780,8 @@ class CodexCollector(BaseCollector):
             db.upsert_session(
                 session_id,
                 self.agent_type,
+                provider=accum.provider,
+                data_root=self.data_root,
                 project_path=accum.project_path,
                 git_branch=accum.git_branch,
                 model=accum.model,
@@ -706,9 +797,25 @@ class CodexCollector(BaseCollector):
                 first_prompt=accum.first_prompt,
                 last_prompt=accum.last_prompt,
             )
-            db.replace_session_usage(session_id, self.agent_type, usage_rows)
+            db.replace_session_usage(
+                session_id,
+                self.agent_type,
+                usage_rows,
+                provider=accum.provider,
+                data_root=self.data_root,
+            )
 
             db.set_sync_state(sync_key, _sync_state_value(file_size, mtime_ns))
+
+
+def _sync_key_identity(provider: str, data_root: str) -> str:
+    """Return a stable sync identity for one configured Codex root/provider."""
+    raw = json.dumps(
+        {"provider": provider or "", "data_root": data_root or ""},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
 
 def _sync_state_value(file_size: int, mtime_ns: int) -> str:

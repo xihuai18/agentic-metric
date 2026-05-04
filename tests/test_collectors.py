@@ -6,7 +6,7 @@ from datetime import date, datetime
 from pathlib import Path
 from unittest.mock import patch
 
-from agentic_metric.collectors import CollectorRegistry, BaseCollector
+from agentic_metric.collectors import CollectorRegistry, BaseCollector, create_default_registry
 from agentic_metric.collectors.claude_code import (
     ClaudeCodeCollector,
     _LiveMonitor as ClaudeLiveMonitor,
@@ -60,6 +60,39 @@ def test_registry_get_live_sessions():
     assert sessions[0].agent_type == "mock"
 
 
+def test_default_registry_uses_configured_roots(tmp_path):
+    config_file = tmp_path / "config.json"
+    config_file.write_text(json.dumps({
+        "collectors": {
+            "codex": {
+                "roots": [
+                    {"path": str(tmp_path / "codex-openai"), "provider": "openai"},
+                    {"path": str(tmp_path / "codex-custom"), "provider": "custom"},
+                ],
+            },
+            "claude_code": {
+                "roots": [
+                    {"path": str(tmp_path / "claude-alt")},
+                    {"path": str(tmp_path / "claude-provider-b"), "provider": "provider-b"},
+                ],
+            },
+        },
+    }))
+
+    with patch("agentic_metric.config.CONFIG_FILE", config_file):
+        registry = create_default_registry()
+
+    collectors = registry.get_all()
+    assert [(c.agent_type, c.provider, c.data_root) for c in collectors] == [
+        ("claude_code", "", str(tmp_path / "claude-alt")),
+        ("claude_code", "provider-b", str(tmp_path / "claude-provider-b")),
+        ("codex", "openai", str(tmp_path / "codex-openai")),
+        ("codex", "custom", str(tmp_path / "codex-custom")),
+    ]
+    assert collectors[0].projects_dir == tmp_path / "claude-alt" / "projects"
+    assert collectors[2].sessions_dir == tmp_path / "codex-openai" / "sessions"
+
+
 def test_live_session_total_tokens():
     s = LiveSession(
         session_id="x",
@@ -80,6 +113,240 @@ def test_live_session_duration():
         last_active="2025-01-01T10:30:00Z",
     )
     assert abs(s.duration_minutes - 30.0) < 0.1
+
+
+def test_codex_session_meta_provider_sets_agent_type():
+    accum = CodexSessionAccum(Path("/tmp/fake.jsonl"), project_path="/test")
+    accum._process_entry({
+        "type": "session_meta",
+        "payload": {
+            "id": "sid",
+            "cwd": "/test",
+            "model_provider": "custom",
+        },
+    })
+
+    live = accum.to_live_session()
+    assert live.agent_type == "codex"
+    assert live.provider == "custom"
+
+
+def test_codex_configured_provider_overrides_session_provider():
+    accum = CodexSessionAccum(
+        Path("/tmp/fake.jsonl"),
+        project_path="/test",
+        provider="openai",
+    )
+    accum._process_entry({
+        "type": "session_meta",
+        "payload": {
+            "id": "sid",
+            "cwd": "/test",
+            "model_provider": "custom",
+        },
+    })
+
+    live = accum.to_live_session()
+    assert live.agent_type == "codex"
+    assert live.provider == "openai"
+
+
+def test_codex_history_sync_skips_mismatched_configured_provider(tmp_path):
+    def write_rollout(sessions_root: Path) -> None:
+        day_dir = sessions_root / "2026" / "04" / "23"
+        day_dir.mkdir(parents=True)
+        lines = [
+            {
+                "timestamp": "2026-04-23T10:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "sid",
+                    "cwd": "/tmp/project",
+                    "model_provider": "custom",
+                },
+            },
+            {
+                "timestamp": "2026-04-23T10:00:00Z",
+                "type": "turn_context",
+                "payload": {"model": "gpt-5.5"},
+            },
+            {
+                "timestamp": "2026-04-23T10:00:01Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "hello"},
+            },
+            {
+                "timestamp": "2026-04-23T10:00:02Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {"total_token_usage": {"input_tokens": 100, "output_tokens": 20}},
+                },
+            },
+        ]
+        (day_dir / "rollout-test.jsonl").write_text(
+            "".join(json.dumps(line) + "\n" for line in lines)
+        )
+
+    openai_sessions = tmp_path / "codex-openai" / "sessions"
+    custom_sessions = tmp_path / "codex-custom" / "sessions"
+    write_rollout(openai_sessions)
+    write_rollout(custom_sessions)
+
+    db = Database(db_path=str(tmp_path / "data.db"))
+    CodexCollector(
+        sessions_dir=openai_sessions,
+        provider="openai",
+        data_root=str(tmp_path / "codex-openai"),
+    ).sync_history(db)
+    CodexCollector(
+        sessions_dir=custom_sessions,
+        provider="custom",
+        data_root=str(tmp_path / "codex-custom"),
+    ).sync_history(db)
+
+    rows = db.conn.execute(
+        "SELECT provider, data_root FROM sessions WHERE session_id = 'sid' AND agent_type = 'codex'"
+    ).fetchall()
+    assert [(row["provider"], row["data_root"]) for row in rows] == [
+        ("custom", str(tmp_path / "codex-custom"))
+    ]
+    db.close()
+
+
+def test_codex_history_sync_supports_same_root_provider_filters(tmp_path):
+    def write_rollout(session_id: str, provider: str) -> None:
+        day_dir = sessions_dir / "2026" / "04" / "23"
+        day_dir.mkdir(parents=True, exist_ok=True)
+        lines = [
+            {
+                "timestamp": "2026-04-23T10:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": session_id,
+                    "cwd": "/tmp/project",
+                    "model_provider": provider,
+                },
+            },
+            {
+                "timestamp": "2026-04-23T10:00:00Z",
+                "type": "turn_context",
+                "payload": {"model": "gpt-5.5"},
+            },
+            {
+                "timestamp": "2026-04-23T10:00:01Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": session_id},
+            },
+            {
+                "timestamp": "2026-04-23T10:00:02Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {"total_token_usage": {"input_tokens": 100, "output_tokens": 20}},
+                },
+            },
+        ]
+        (day_dir / f"rollout-{session_id}.jsonl").write_text(
+            "".join(json.dumps(line) + "\n" for line in lines)
+        )
+
+    sessions_dir = tmp_path / "codex" / "sessions"
+    data_root = str(tmp_path / "codex")
+    write_rollout("openai-sid", "openai")
+    write_rollout("custom-sid", "custom")
+
+    db = Database(db_path=str(tmp_path / "data.db"))
+    CodexCollector(
+        sessions_dir=sessions_dir,
+        provider="openai",
+        data_root=data_root,
+    ).sync_history(db)
+    CodexCollector(
+        sessions_dir=sessions_dir,
+        provider="custom",
+        data_root=data_root,
+    ).sync_history(db)
+
+    rows = db.conn.execute(
+        """SELECT session_id, provider, data_root
+           FROM sessions
+           WHERE agent_type = 'codex'
+           ORDER BY session_id"""
+    ).fetchall()
+    assert [(row["session_id"], row["provider"], row["data_root"]) for row in rows] == [
+        ("custom-sid", "custom", data_root),
+        ("openai-sid", "openai", data_root),
+    ]
+    assert db.conn.execute(
+        "SELECT COUNT(*) AS n FROM sync_state WHERE key LIKE 'codex_jsonl:v7:%'"
+    ).fetchone()["n"] == 4
+    db.close()
+
+
+def test_codex_provider_mismatch_removes_only_same_provider_stale_rows(tmp_path):
+    sessions_dir = tmp_path / "codex" / "sessions"
+    data_root = str(tmp_path / "codex")
+    day_dir = sessions_dir / "2026" / "04" / "23"
+    day_dir.mkdir(parents=True)
+    lines = [
+        {
+            "timestamp": "2026-04-23T10:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "id": "custom-sid",
+                "cwd": "/tmp/project",
+                "model_provider": "custom",
+            },
+        },
+        {
+            "timestamp": "2026-04-23T10:00:01Z",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "hello"},
+        },
+        {
+            "timestamp": "2026-04-23T10:00:02Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {"total_token_usage": {"input_tokens": 100, "output_tokens": 20}},
+            },
+        },
+    ]
+    (day_dir / "rollout-custom.jsonl").write_text(
+        "".join(json.dumps(line) + "\n" for line in lines)
+    )
+
+    db = Database(db_path=str(tmp_path / "data.db"))
+    db.upsert_session(
+        "custom-sid",
+        "codex",
+        provider="openai",
+        data_root=data_root,
+        input_tokens=999,
+    )
+    db.commit()
+
+    CodexCollector(
+        sessions_dir=sessions_dir,
+        provider="openai",
+        data_root=data_root,
+    ).sync_history(db)
+    assert db.conn.execute(
+        "SELECT COUNT(*) AS n FROM sessions WHERE session_id = 'custom-sid'"
+    ).fetchone()["n"] == 0
+
+    CodexCollector(
+        sessions_dir=sessions_dir,
+        provider="custom",
+        data_root=data_root,
+    ).sync_history(db)
+    row = db.conn.execute(
+        "SELECT provider, input_tokens FROM sessions WHERE session_id = 'custom-sid'"
+    ).fetchone()
+    assert row["provider"] == "custom"
+    assert row["input_tokens"] == 100
+    db.close()
 
 
 def test_codex_cached_only_update_recomputes_input_tokens():

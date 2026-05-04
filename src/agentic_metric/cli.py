@@ -109,21 +109,47 @@ def _run_tui() -> None:
 
 
 @app.command()
-def sync() -> None:
+def sync(
+    rebuild: bool = typer.Option(
+        False,
+        "--rebuild",
+        help="Delete the derived local database before syncing from source session logs.",
+    ),
+) -> None:
     """Force sync all collectors to the database."""
     from .collectors import create_default_registry
+    from .config import DB_PATH
     from .store.database import Database
+
+    if rebuild:
+        for path in (
+            DB_PATH,
+            DB_PATH.with_name(DB_PATH.name + "-wal"),
+            DB_PATH.with_name(DB_PATH.name + "-shm"),
+        ):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
 
     db = Database()
     registry = create_default_registry()
 
-    console.print(f"[{C_SUBTEXT}]Syncing all collectors…[/]")
+    action = "Rebuilding and syncing" if rebuild else "Syncing"
+    console.print(f"[{C_SUBTEXT}]{action} all collectors…[/]")
     registry.sync_all(db)
     db.close()
 
     console.print(f"[bold {C_GREEN}]✓ Sync complete[/]")
     for c in registry.get_all():
-        console.print(f"  [{C_MUTED}]•[/] [{C_MAUVE}]{c.agent_type}[/]")
+        provider = getattr(c, "provider", "") or "—"
+        data_root = _shorten_home(getattr(c, "data_root", "") or "") or "—"
+        console.print(
+            f"  [{C_MUTED}]•[/] "
+            f"[{C_MAUVE}]{c.agent_type}[/]  "
+            f"[{C_SKY}]{provider}[/]  "
+            f"[{C_MUTED}]{data_root}[/]"
+        )
 
 
 # ── report ─────────────────────────────────────────────────────────
@@ -142,7 +168,7 @@ def report(
         False, "--no-sync", help="Skip syncing collectors before querying."
     ),
     full: bool = typer.Option(
-        False, "--full", help="Show the full drill-down with per-agent and per-time tables."
+        False, "--full", help="Show the full drill-down with per-provider and per-time tables."
     ),
     limit: int = typer.Option(
         8, "--limit", "-n", min=1, max=25,
@@ -216,7 +242,7 @@ def report(
 @app.command("today")
 def today_cmd(
     no_sync: bool = typer.Option(False, "--no-sync", help="Skip syncing collectors before querying."),
-    full: bool = typer.Option(False, "--full", help="Show the full drill-down with per-agent and per-time tables."),
+    full: bool = typer.Option(False, "--full", help="Show the full drill-down with per-provider and per-time tables."),
     limit: int = typer.Option(8, "--limit", "-n", min=1, max=25, help="Rows shown in the Top projects table."),
 ) -> None:
     """Shortcut for ``report --today``."""
@@ -226,7 +252,7 @@ def today_cmd(
 @app.command("week")
 def week_cmd(
     no_sync: bool = typer.Option(False, "--no-sync", help="Skip syncing collectors before querying."),
-    full: bool = typer.Option(False, "--full", help="Show the full drill-down with per-agent and per-time tables."),
+    full: bool = typer.Option(False, "--full", help="Show the full drill-down with per-provider and per-time tables."),
     limit: int = typer.Option(8, "--limit", "-n", min=1, max=25, help="Rows shown in the Top projects table."),
 ) -> None:
     """Shortcut for ``report --week``."""
@@ -236,7 +262,7 @@ def week_cmd(
 @app.command("month")
 def month_cmd(
     no_sync: bool = typer.Option(False, "--no-sync", help="Skip syncing collectors before querying."),
-    full: bool = typer.Option(False, "--full", help="Show the full drill-down with per-agent and per-time tables."),
+    full: bool = typer.Option(False, "--full", help="Show the full drill-down with per-provider and per-time tables."),
     limit: int = typer.Option(8, "--limit", "-n", min=1, max=25, help="Rows shown in the Top projects table."),
 ) -> None:
     """Shortcut for ``report --month``."""
@@ -247,7 +273,7 @@ def month_cmd(
 def history_cmd(
     days: int = typer.Option(14, "--days", "-d", min=1, max=365, help="Number of days to include."),
     no_sync: bool = typer.Option(False, "--no-sync", help="Skip syncing collectors before querying."),
-    full: bool = typer.Option(False, "--full", help="Show the full drill-down with per-agent and per-time tables."),
+    full: bool = typer.Option(False, "--full", help="Show the full drill-down with per-provider and per-time tables."),
     limit: int = typer.Option(8, "--limit", "-n", min=1, max=25, help="Rows shown in the Top projects table."),
 ) -> None:
     """Show a recent multi-day usage report."""
@@ -511,11 +537,13 @@ def _build_by_agent_table(by_agent: list[dict]) -> Table | None:
         box=box.SIMPLE_HEAVY,
         pad_edge=False,
         border_style=C_SURFACE1,
-        title="By agent",
+        title="By provider",
         title_style=f"bold {C_TEXT}",
         title_justify="left",
     )
     tbl.add_column("Agent", style=C_MAUVE)
+    tbl.add_column("Provider", style=C_SKY)
+    tbl.add_column("Root", style=C_MUTED, overflow="fold", max_width=34)
     tbl.add_column("Sessions", justify="right", style=C_TEXT)
     tbl.add_column("Turns", justify="right", style=C_TEXT)
     tbl.add_column("Input", justify="right", style=C_TEAL)
@@ -527,6 +555,8 @@ def _build_by_agent_table(by_agent: list[dict]) -> Table | None:
         cp = _cache_hit_rate(r)
         tbl.add_row(
             r["agent_type"],
+            r.get("provider") or "—",
+            _short_path(r.get("data_root") or "—", max_len=34),
             f"{r['session_count']:,}",
             f"{r['user_turns']:,}",
             _fmt_tokens(r.get("input_tokens") or 0),
@@ -548,26 +578,35 @@ def _build_by_agent_model_table(rows: list[dict]) -> Table | None:
         box=box.SIMPLE_HEAVY,
         pad_edge=False,
         border_style=C_SURFACE1,
-        title="By agent × model",
+        title="By agent × provider × model",
         title_style=f"bold {C_TEXT}",
         title_justify="left",
     )
     tbl.add_column("Agent", style=C_MAUVE)
+    tbl.add_column("Provider", style=C_SKY)
+    tbl.add_column("Root", style=C_MUTED, overflow="fold", max_width=28)
     tbl.add_column("Model", style=C_SKY)
     tbl.add_column("Sessions", justify="right", style=C_TEXT)
     tbl.add_column("Input", justify="right", style=C_TEAL)
     tbl.add_column("Output", justify="right", style=C_TEAL)
     tbl.add_column("Cache", justify="right", style=C_GREEN)
     tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}")
-    current_agent = None
+    current_group = None
     for r in nonzero:
-        shown_agent = r["agent_type"] if r["agent_type"] != current_agent else ""
-        current_agent = r["agent_type"]
+        group = (
+            r["agent_type"],
+            r.get("provider") or "",
+            r.get("data_root") or "",
+        )
+        show_group = group != current_group
+        current_group = group
         model_display = r["model"]
         if model_display == "Unknown" and r.get("raw_model"):
             model_display = f"Unknown: {r['raw_model']}"
         tbl.add_row(
-            shown_agent,
+            r["agent_type"] if show_group else "",
+            (r.get("provider") or "—") if show_group else "",
+            _short_path(r.get("data_root") or "—", max_len=28) if show_group else "",
             model_display,
             f"{r['session_count']:,}",
             _fmt_tokens(r.get("input_tokens") or 0),

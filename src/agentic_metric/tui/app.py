@@ -155,7 +155,7 @@ class AgenticMetricApp(App):
             yield Static("Trend", id="chart-title")
             yield PlotextPlot(id="chart")
         with Vertical(id="breakdown-panel"):
-            yield Static("By agent × model", id="breakdown-title")
+            yield Static("By agent → provider → model", id="breakdown-title")
             yield Breakdown(id="breakdown-body")
         yield _AutoAwareFooter()
 
@@ -318,11 +318,27 @@ class AgenticMetricApp(App):
         rows = get_range_by_agent_model(self._db, frm, to)
         rows = [r for r in rows if (r["estimated_cost_usd"] or 0) > 0 or _has_unknown_cost(r)]
 
-        groups_by_agent: dict[str, dict] = {}
+        agents_by_name: dict[str, dict] = {}
         for r in rows:
             at = r["agent_type"]
-            g = groups_by_agent.setdefault(at, {
+            provider = r.get("provider") or ""
+            data_root = r.get("data_root") or ""
+
+            agent = agents_by_name.setdefault(at, {
                 "agent": at,
+                "cost": 0.0,
+                "tokens": 0,
+                "input": 0,
+                "output": 0,
+                "cache": 0,
+                "unknown_cost_count": 0,
+                "providers": {},
+            })
+
+            provider_key = (provider, data_root)
+            g = agent["providers"].setdefault(provider_key, {
+                "provider": provider,
+                "data_root": data_root,
                 "cost": 0.0,
                 "tokens": 0,
                 "input": 0,
@@ -331,32 +347,53 @@ class AgenticMetricApp(App):
                 "unknown_cost_count": 0,
                 "models": [],
             })
+
             model_tokens = _total_tokens(r)
             model_cache = (r.get("cache_read_tokens") or 0) + (r.get("cache_creation_tokens") or 0)
-            g["cost"] += r["estimated_cost_usd"] or 0.0
-            g["tokens"] += model_tokens
-            g["input"] += r.get("input_tokens") or 0
-            g["output"] += r.get("output_tokens") or 0
-            g["cache"] += model_cache
-            g["unknown_cost_count"] += r.get("unknown_cost_count") or 0
+            cost = r["estimated_cost_usd"] or 0.0
+            input_tokens = r.get("input_tokens") or 0
+            output_tokens = r.get("output_tokens") or 0
+            unknown_count = r.get("unknown_cost_count") or 0
+
+            for bucket in (agent, g):
+                bucket["cost"] += cost
+                bucket["tokens"] += model_tokens
+                bucket["input"] += input_tokens
+                bucket["output"] += output_tokens
+                bucket["cache"] += model_cache
+                bucket["unknown_cost_count"] += unknown_count
+
             g["models"].append({
                 "model": r["model"],
                 "raw_model": r.get("raw_model", ""),
-                "cost": r["estimated_cost_usd"] or 0.0,
-                "unknown_cost_count": r.get("unknown_cost_count") or 0,
+                "cost": cost,
+                "unknown_cost_count": unknown_count,
                 "tokens": model_tokens,
-                "input": r.get("input_tokens") or 0,
-                "output": r.get("output_tokens") or 0,
+                "input": input_tokens,
+                "output": output_tokens,
                 "cache": model_cache,
             })
 
-        groups = sorted(groups_by_agent.values(), key=lambda g: -g["cost"])
+        groups = []
+        for agent in agents_by_name.values():
+            providers = sorted(agent.pop("providers").values(), key=lambda g: -g["cost"])
+            for provider_group in providers:
+                provider_group["models"].sort(
+                    key=lambda m: (
+                        1 if _has_unknown_cost(m) else 0,
+                        m.get("cost") or 0,
+                    ),
+                    reverse=True,
+                )
+            agent["providers"] = providers
+            groups.append(agent)
+        groups.sort(key=lambda g: -g["cost"])
 
         total_cost = sum(g["cost"] for g in groups)
 
         title_widget = self.query_one("#breakdown-title", Static)
         title_widget.update(Text.from_markup(
-            f"[bold]By agent × model[/] — [bright_cyan]{label}[/] [white]({frm} → {to})[/]"
+            f"[bold]By agent → provider → model[/] — [bright_cyan]{label}[/] [white]({frm} → {to})[/]"
         ))
         self.query_one("#breakdown-body", Breakdown).update_data(groups, total_cost)
 

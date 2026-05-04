@@ -12,6 +12,8 @@ from .database import Database
 _USAGE_SOURCE = """(
     SELECT session_id,
            agent_type,
+           provider,
+           data_root,
            usage_date,
            usage_hour,
            project_path,
@@ -27,6 +29,8 @@ _USAGE_SOURCE = """(
     UNION ALL
     SELECT s.session_id,
            s.agent_type,
+           s.provider,
+           s.data_root,
            date(s.started_at, 'localtime') AS usage_date,
            CAST(strftime('%H', s.started_at, 'localtime') AS INTEGER) AS usage_hour,
            s.project_path,
@@ -44,6 +48,7 @@ _USAGE_SOURCE = """(
         FROM session_usage AS u
         WHERE u.session_id = s.session_id
           AND u.agent_type = s.agent_type
+          AND u.data_root = s.data_root
     )
 )"""
 
@@ -54,7 +59,16 @@ def _usage_source(db: Database) -> str:
 
 
 def _session_count_expr(column: str = "session_id") -> str:
-    return f"COUNT(DISTINCT agent_type || ':' || {column})"
+    return (
+        "COUNT(DISTINCT agent_type || ':' || COALESCE(provider, '') || ':' || "
+        f"COALESCE(data_root, '') || ':' || {column})"
+    )
+
+
+def _group_key(agent_type: str, provider: str = "", data_root: str = "") -> str:
+    if not provider and not data_root:
+        return agent_type
+    return f"{agent_type}:{provider or '-'}:{data_root or '-'}"
 
 
 def _preferred_session_model_expr(session_alias: str = "s", usage_alias: str = "u") -> str:
@@ -93,7 +107,9 @@ def get_today_overview(db: Database) -> TodayOverview:
     usage = _usage_source(db)
     rows = db.conn.execute(
         f"""SELECT agent_type,
-                   COUNT(DISTINCT session_id) AS session_count,
+                   provider,
+                   data_root,
+                   {_session_count_expr()} AS session_count,
                    SUM(message_count) AS message_count,
                    SUM(user_turns) AS user_turns,
                    SUM(input_tokens) AS input_tokens,
@@ -104,7 +120,7 @@ def get_today_overview(db: Database) -> TodayOverview:
                    {_unknown_cost_expr()} AS unknown_cost_count
            FROM {usage}
            WHERE usage_date = ?
-           GROUP BY agent_type
+           GROUP BY agent_type, provider, data_root
         """,
         (today,),
     ).fetchall()
@@ -113,6 +129,7 @@ def get_today_overview(db: Database) -> TodayOverview:
     for row in rows:
         r = dict(row)
         at = r["agent_type"]
+        group_key = _group_key(at, r.get("provider") or "", r.get("data_root") or "")
         overview.session_count += r["session_count"] or 0
         overview.message_count += r["message_count"] or 0
         overview.tool_call_count += r["user_turns"] or 0
@@ -122,7 +139,10 @@ def get_today_overview(db: Database) -> TodayOverview:
         overview.cache_creation_tokens += r["cache_creation_tokens"] or 0
         overview.estimated_cost_usd += r["estimated_cost_usd"] or 0
         overview.unknown_cost_count += r["unknown_cost_count"] or 0
-        overview.by_agent[at] = {
+        overview.by_agent[group_key] = {
+            "agent_type": at,
+            "provider": r.get("provider") or "",
+            "data_root": r.get("data_root") or "",
             "session_count": r["session_count"] or 0,
             "turns": r["user_turns"] or 0,
             "message_count": r["message_count"] or 0,
@@ -146,12 +166,31 @@ def merge_live_into_overview(
     - Live sessions not in today's DB rows (e.g. started yesterday but still
       running): add full live values.
     """
-    db_ids = {(s["session_id"], s["agent_type"]) for s in today_sessions}
-    db_by_id = {(s["session_id"], s["agent_type"]): s for s in today_sessions}
+    db_ids = {
+        (
+            s["session_id"],
+            s["agent_type"],
+            s.get("provider") or "",
+            s.get("data_root") or "",
+        )
+        for s in today_sessions
+    }
+    db_by_id = {
+        (
+            s["session_id"],
+            s["agent_type"],
+            s.get("provider") or "",
+            s.get("data_root") or "",
+        ): s
+        for s in today_sessions
+    }
 
     for ls in live_sessions:
         at = ls.agent_type or ""
-        session_key = (ls.session_id, at)
+        provider = ls.provider or ""
+        data_root = ls.data_root or ""
+        group_key = _group_key(at, provider, data_root)
+        session_key = (ls.session_id, at, provider, data_root)
         t_turns = ls.today_user_turns if ls.today_user_turns >= 0 else ls.user_turns
         t_msgs = ls.today_message_count if ls.today_message_count >= 0 else ls.message_count
         t_in = ls.today_input_tokens if ls.today_input_tokens >= 0 else ls.input_tokens
@@ -190,8 +229,8 @@ def merge_live_into_overview(
                 overview.estimated_cost_usd += d_cost
                 overview.unknown_cost_count += d_unknown
 
-                if at in overview.by_agent:
-                    ba = overview.by_agent[at]
+                if group_key in overview.by_agent:
+                    ba = overview.by_agent[group_key]
                     ba["turns"] = ba.get("turns", 0) + d_turns
                     ba["message_count"] = ba.get("message_count", 0) + d_msg
                     ba["input_tokens"] = ba.get("input_tokens", 0) + d_in
@@ -211,7 +250,7 @@ def merge_live_into_overview(
             overview.estimated_cost_usd += t_cost_value
             overview.unknown_cost_count += t_unknown
 
-            ba = overview.by_agent.get(at)
+            ba = overview.by_agent.get(group_key)
             if ba:
                 ba["session_count"] = ba.get("session_count", 0) + 1
                 ba["turns"] = ba.get("turns", 0) + t_turns
@@ -221,7 +260,10 @@ def merge_live_into_overview(
                 ba["cost"] = ba.get("cost", 0) + t_cost_value
                 ba["unknown_cost_count"] = ba.get("unknown_cost_count", 0) + t_unknown
             else:
-                overview.by_agent[at] = {
+                overview.by_agent[group_key] = {
+                    "agent_type": at,
+                    "provider": provider,
+                    "data_root": data_root,
                     "session_count": 1,
                     "turns": t_turns,
                     "message_count": t_msgs,
@@ -253,11 +295,32 @@ def merge_live_into_trends(
         today_trend = DailyTrend(date=today)
         trends.insert(0, today_trend)
 
-    db_ids = {(s["session_id"], s["agent_type"]) for s in today_sessions}
-    db_by_id = {(s["session_id"], s["agent_type"]): s for s in today_sessions}
+    db_ids = {
+        (
+            s["session_id"],
+            s["agent_type"],
+            s.get("provider") or "",
+            s.get("data_root") or "",
+        )
+        for s in today_sessions
+    }
+    db_by_id = {
+        (
+            s["session_id"],
+            s["agent_type"],
+            s.get("provider") or "",
+            s.get("data_root") or "",
+        ): s
+        for s in today_sessions
+    }
 
     for ls in live_sessions:
-        session_key = (ls.session_id, ls.agent_type or "")
+        session_key = (
+            ls.session_id,
+            ls.agent_type or "",
+            ls.provider or "",
+            ls.data_root or "",
+        )
         t_turns = ls.today_user_turns if ls.today_user_turns >= 0 else ls.user_turns
         t_msgs = ls.today_message_count if ls.today_message_count >= 0 else ls.message_count
         t_in = ls.today_input_tokens if ls.today_input_tokens >= 0 else ls.input_tokens
@@ -377,6 +440,8 @@ def get_today_sessions(db: Database) -> list[dict]:
     rows = db.conn.execute(
         f"""SELECT u.session_id,
                    u.agent_type,
+                   u.provider,
+                   u.data_root,
                    COALESCE(NULLIF(s.project_path, ''), MAX(NULLIF(u.project_path, '')), '') AS project_path,
                    COALESCE(s.git_branch, '') AS git_branch,
                    {_preferred_session_model_expr()} AS model,
@@ -394,9 +459,11 @@ def get_today_sessions(db: Database) -> list[dict]:
                    COALESCE(s.last_prompt, '') AS last_prompt
            FROM {usage} AS u
            LEFT JOIN sessions AS s
-             ON s.session_id = u.session_id AND s.agent_type = u.agent_type
+             ON s.session_id = u.session_id
+            AND s.agent_type = u.agent_type
+            AND s.data_root = u.data_root
            WHERE u.usage_date = ?
-           GROUP BY u.session_id, u.agent_type
+           GROUP BY u.session_id, u.agent_type, u.provider, u.data_root
            ORDER BY started_at DESC
         """,
         (today,),
@@ -511,11 +578,13 @@ def get_range_totals(db: Database, from_date: str, to_date: str) -> dict:
 
 
 def get_range_by_agent(db: Database, from_date: str, to_date: str) -> list[dict]:
-    """Return per-agent aggregates within the given date range."""
+    """Return per-(agent, provider, data_root) aggregates within the range."""
     usage = _usage_source(db)
     rows = db.conn.execute(
         f"""SELECT agent_type,
-                  COUNT(DISTINCT session_id) AS session_count,
+                  provider,
+                  data_root,
+                  {_session_count_expr()} AS session_count,
                   COALESCE(SUM(user_turns), 0) AS user_turns,
                   COALESCE(SUM(input_tokens), 0) AS input_tokens,
                   COALESCE(SUM(output_tokens), 0) AS output_tokens,
@@ -525,7 +594,7 @@ def get_range_by_agent(db: Database, from_date: str, to_date: str) -> list[dict]
                   {_unknown_cost_expr()} AS unknown_cost_count
            FROM {usage}
            WHERE usage_date BETWEEN ? AND ?
-           GROUP BY agent_type
+           GROUP BY agent_type, provider, data_root
            ORDER BY estimated_cost_usd DESC, unknown_cost_count DESC
         """,
         (from_date, to_date),
@@ -534,15 +603,17 @@ def get_range_by_agent(db: Database, from_date: str, to_date: str) -> list[dict]
 
 
 def get_range_by_agent_model(db: Database, from_date: str, to_date: str) -> list[dict]:
-    """Return per-(agent, model) aggregates within the given date range.
+    """Return per-(agent, provider, data_root, model) aggregates within the range.
 
     Models reported as empty string are kept under ``"(unknown)"`` for clarity.
     """
     usage = _usage_source(db)
     rows = db.conn.execute(
         f"""SELECT agent_type,
+                  provider,
+                  data_root,
                   model AS raw_model,
-                  COUNT(DISTINCT session_id) AS session_count,
+                  {_session_count_expr()} AS session_count,
                   COALESCE(SUM(input_tokens), 0) AS input_tokens,
                   COALESCE(SUM(output_tokens), 0) AS output_tokens,
                   COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
@@ -551,8 +622,8 @@ def get_range_by_agent_model(db: Database, from_date: str, to_date: str) -> list
                   {_unknown_cost_expr()} AS unknown_cost_count
            FROM {usage}
            WHERE usage_date BETWEEN ? AND ?
-           GROUP BY agent_type, model
-           ORDER BY agent_type, estimated_cost_usd DESC, unknown_cost_count DESC
+           GROUP BY agent_type, provider, data_root, model
+           ORDER BY agent_type, provider, data_root, estimated_cost_usd DESC, unknown_cost_count DESC
         """,
         (from_date, to_date),
     ).fetchall()
@@ -598,6 +669,8 @@ def get_range_by_time_model(db: Database, from_date: str, to_date: str, limit: i
         f"""SELECT usage_date,
                   usage_hour,
                   agent_type,
+                  provider,
+                  data_root,
                   model AS raw_model,
                   {_session_count_expr()} AS session_count,
                   COALESCE(SUM(user_turns), 0) AS user_turns,
@@ -609,7 +682,7 @@ def get_range_by_time_model(db: Database, from_date: str, to_date: str, limit: i
                   {_unknown_cost_expr()} AS unknown_cost_count
            FROM {usage}
            WHERE usage_date BETWEEN ? AND ?
-           GROUP BY usage_date, usage_hour, agent_type, model
+           GROUP BY usage_date, usage_hour, agent_type, provider, data_root, model
            HAVING COALESCE(SUM(estimated_cost_usd), 0) > 0 OR {_unknown_cost_expr()} > 0
            ORDER BY estimated_cost_usd DESC, unknown_cost_count DESC
            LIMIT ?
@@ -635,6 +708,8 @@ def get_range_top_sessions(db: Database, from_date: str, to_date: str, limit: in
     rows = db.conn.execute(
         f"""SELECT u.session_id,
                   u.agent_type,
+                  u.provider,
+                  u.data_root,
                   COALESCE(NULLIF(s.project_path, ''), MAX(NULLIF(u.project_path, '')), '') AS project_path,
                   COALESCE(NULLIF(s.first_prompt, ''), '') AS first_prompt,
                   COALESCE(NULLIF(s.started_at, ''), '') AS started_at,
@@ -660,9 +735,11 @@ def get_range_top_sessions(db: Database, from_date: str, to_date: str, limit: in
                   {_unknown_cost_expr("u.estimated_cost_usd")} AS unknown_cost_count
            FROM {usage} AS u
            LEFT JOIN sessions AS s
-             ON s.session_id = u.session_id AND s.agent_type = u.agent_type
+             ON s.session_id = u.session_id
+            AND s.agent_type = u.agent_type
+            AND s.data_root = u.data_root
            WHERE u.usage_date BETWEEN ? AND ?
-           GROUP BY u.session_id, u.agent_type
+           GROUP BY u.session_id, u.agent_type, u.provider, u.data_root
            HAVING COALESCE(SUM(u.estimated_cost_usd), 0) > 0 OR {_unknown_cost_expr("u.estimated_cost_usd")} > 0
            ORDER BY estimated_cost_usd DESC, unknown_cost_count DESC
            LIMIT ?

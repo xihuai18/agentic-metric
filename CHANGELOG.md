@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.4.0 (2026-05-04)
+
+### Changes
+
+- **Provider and root-aware usage tracking**: sessions and usage rows now carry
+  explicit `provider` and `data_root` fields, so multiple Codex or Claude Code
+  directories can be tracked without merging them into one bucket.
+- **Collector config file**: added `$DATA/agentic_metric/config.json` support
+  (or `AGENTIC_METRIC_CONFIG`) for declaring multiple collector roots and
+  optional provider labels.
+- **Codex provider filtering**: Codex collectors can filter JSONL sessions by
+  the recorded `model_provider`, which lets separate roots/providers be
+  resynced without double-counting.
+- **Rebuild sync mode**: `agentic-metric sync --rebuild` now drops only the
+  derived SQLite database and rebuilds it from the original agent session logs.
+- **Provider-aware CLI and TUI**: reports now show `agent × provider × model`
+  and the TUI renders the same breakdown as a compact
+  `agent → provider → model` tree.
+- **Billing identity refresh**: database identity/versioning was bumped so old
+  derived rows are recalculated under the new provider/root dimensions.
+
 ## v0.3.7 (2026-04-27)
 
 ### Changes

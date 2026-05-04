@@ -1,6 +1,7 @@
 """Tests for store module."""
 
 import json
+import sqlite3
 import tempfile
 from datetime import datetime
 from unittest.mock import patch
@@ -41,6 +42,139 @@ def test_database_creation():
     assert "sessions" in names
     assert "session_usage" in names
     assert "sync_state" in names
+    db.close()
+
+
+def test_database_identity_migration_clears_legacy_history(tmp_path):
+    db_path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """CREATE TABLE sessions (
+               session_id TEXT NOT NULL,
+               agent_type TEXT NOT NULL,
+               project_path TEXT,
+               git_branch TEXT DEFAULT '',
+               model TEXT DEFAULT '',
+               message_count INTEGER DEFAULT 0,
+               user_turns INTEGER DEFAULT 0,
+               input_tokens INTEGER DEFAULT 0,
+               output_tokens INTEGER DEFAULT 0,
+               cache_read_tokens INTEGER DEFAULT 0,
+               cache_creation_tokens INTEGER DEFAULT 0,
+               estimated_cost_usd REAL DEFAULT 0,
+               started_at TEXT,
+               ended_at TEXT,
+               first_prompt TEXT DEFAULT '',
+               summary TEXT DEFAULT '',
+               PRIMARY KEY (session_id, agent_type)
+           );
+           CREATE TABLE session_usage (
+               session_id TEXT NOT NULL,
+               agent_type TEXT NOT NULL,
+               usage_date TEXT NOT NULL,
+               usage_hour INTEGER NOT NULL,
+               project_path TEXT DEFAULT '',
+               model TEXT DEFAULT '',
+               message_count INTEGER DEFAULT 0,
+               user_turns INTEGER DEFAULT 0,
+               input_tokens INTEGER DEFAULT 0,
+               output_tokens INTEGER DEFAULT 0,
+               cache_read_tokens INTEGER DEFAULT 0,
+               cache_creation_tokens INTEGER DEFAULT 0,
+               estimated_cost_usd REAL DEFAULT 0,
+               PRIMARY KEY (session_id, agent_type, usage_date, usage_hour, model)
+           );
+           INSERT INTO sessions (session_id, agent_type, project_path)
+           VALUES ('s1', 'codex:openai', '/tmp/project');
+           INSERT INTO session_usage
+               (session_id, agent_type, usage_date, usage_hour, model, input_tokens)
+           VALUES ('s1', 'codex:openai', '2026-04-24', 10, 'gpt-5.4', 1000);
+           CREATE TABLE sessions_old (dummy TEXT);
+           CREATE TABLE session_usage_old (dummy TEXT);
+        """
+    )
+    conn.close()
+
+    db = Database(db_path=str(db_path))
+    session_cols = {
+        row["name"] for row in db.conn.execute("PRAGMA table_info(sessions)")
+    }
+    usage_cols = {
+        row["name"] for row in db.conn.execute("PRAGMA table_info(session_usage)")
+    }
+    assert {"provider", "data_root"}.issubset(session_cols)
+    assert {"provider", "data_root"}.issubset(usage_cols)
+    assert db.conn.execute("SELECT COUNT(*) AS n FROM sessions").fetchone()["n"] == 0
+    assert db.conn.execute("SELECT COUNT(*) AS n FROM session_usage").fetchone()["n"] == 0
+    assert db.get_sync_state("history_identity:version") == "provider-data-root-v3"
+    db.close()
+
+
+def test_database_identity_migration_reclears_v2_rows(tmp_path):
+    db_path = tmp_path / "v1.db"
+    db = Database(db_path=str(db_path))
+    db.close()
+
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """INSERT INTO sessions
+               (session_id, agent_type, provider, data_root, project_path, model, started_at)
+           VALUES ('s1', 'codex', '', '', '/tmp/project', 'gpt-5.5', '2026-05-04T10:00:00Z');
+           INSERT INTO session_usage
+               (session_id, agent_type, provider, data_root, usage_date, usage_hour, model, input_tokens)
+           VALUES ('s1', 'codex', '', '', '2026-05-04', 10, 'gpt-5.5', 1000);
+           INSERT INTO sync_state (key, value)
+           VALUES ('history_identity:version', 'provider-data-root-v2')
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+           INSERT INTO sync_state (key, value)
+           VALUES ('codex_jsonl:v6:/tmp/session.jsonl', '1:1');
+        """
+    )
+    conn.close()
+
+    db = Database(db_path=str(db_path))
+    assert db.conn.execute("SELECT COUNT(*) AS n FROM sessions").fetchone()["n"] == 0
+    assert db.conn.execute("SELECT COUNT(*) AS n FROM session_usage").fetchone()["n"] == 0
+    assert db.get_sync_state("codex_jsonl:v6:/tmp/session.jsonl") is None
+    assert db.get_sync_state("history_identity:version") == "provider-data-root-v3"
+    db.close()
+
+
+def test_database_purges_unscoped_rows_even_when_identity_current(tmp_path):
+    db_path = tmp_path / "current.db"
+    db = Database(db_path=str(db_path))
+    db.close()
+
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """INSERT INTO sessions
+               (session_id, agent_type, provider, data_root, project_path, model, started_at)
+           VALUES ('legacy', 'codex', '', '', '/tmp/project', 'gpt-5.5', '2026-05-04T10:00:00Z'),
+                  ('scoped', 'codex', 'openai', '/tmp/.codex', '/tmp/project', 'gpt-5.5', '2026-05-04T10:00:00Z');
+           INSERT INTO session_usage
+               (session_id, agent_type, provider, data_root, usage_date, usage_hour, model, input_tokens)
+           VALUES ('legacy', 'codex', '', '', '2026-05-04', 10, 'gpt-5.5', 1000),
+                  ('scoped', 'codex', 'openai', '/tmp/.codex', '2026-05-04', 10, 'gpt-5.5', 2000);
+           INSERT INTO sync_state (key, value)
+           VALUES ('cc_jsonl:v5:/tmp/session.jsonl', '1:1');
+        """
+    )
+    conn.close()
+
+    db = Database(db_path=str(db_path))
+    rows = db.conn.execute(
+        "SELECT session_id, data_root FROM sessions ORDER BY session_id"
+    ).fetchall()
+    usage_rows = db.conn.execute(
+        "SELECT session_id, data_root FROM session_usage ORDER BY session_id"
+    ).fetchall()
+    assert [(row["session_id"], row["data_root"]) for row in rows] == [
+        ("scoped", "/tmp/.codex")
+    ]
+    assert [(row["session_id"], row["data_root"]) for row in usage_rows] == [
+        ("scoped", "/tmp/.codex")
+    ]
+    assert db.get_sync_state("cc_jsonl:v5:/tmp/session.jsonl") is None
     db.close()
 
 
@@ -106,6 +240,86 @@ def test_upsert_session_is_scoped_by_agent_type():
     db.close()
 
 
+def test_upsert_session_is_scoped_by_data_root():
+    db = _make_db()
+    db.upsert_session(
+        "s1",
+        "codex",
+        provider="openai",
+        data_root="/tmp/codex-openai",
+        input_tokens=1000,
+    )
+    db.upsert_session(
+        "s1",
+        "codex",
+        provider="custom",
+        data_root="/tmp/codex-custom",
+        input_tokens=2000,
+    )
+    db.commit()
+
+    rows = db.conn.execute(
+        """SELECT provider, data_root, input_tokens
+           FROM sessions
+           WHERE session_id = 's1' AND agent_type = 'codex'
+           ORDER BY data_root"""
+    ).fetchall()
+    assert len(rows) == 2
+    assert {row["provider"] for row in rows} == {"openai", "custom"}
+    assert {row["input_tokens"] for row in rows} == {1000, 2000}
+    db.close()
+
+
+def test_delete_session_can_be_scoped_by_provider():
+    db = _make_db()
+    db.upsert_session(
+        "s1",
+        "codex",
+        provider="openai",
+        data_root="/tmp/codex",
+        input_tokens=1000,
+    )
+    db.upsert_session(
+        "s2",
+        "codex",
+        provider="custom",
+        data_root="/tmp/codex",
+        input_tokens=2000,
+    )
+    db.replace_session_usage(
+        "s1",
+        "codex",
+        [{"usage_date": "2026-04-23", "usage_hour": 10, "model": "gpt-5.5", "input_tokens": 1000}],
+        provider="openai",
+        data_root="/tmp/codex",
+    )
+    db.replace_session_usage(
+        "s2",
+        "codex",
+        [{"usage_date": "2026-04-23", "usage_hour": 10, "model": "gpt-5.5", "input_tokens": 2000}],
+        provider="custom",
+        data_root="/tmp/codex",
+    )
+    db.commit()
+
+    db.delete_session("s1", "codex", provider="custom", data_root="/tmp/codex")
+    assert db.conn.execute(
+        "SELECT COUNT(*) AS n FROM sessions WHERE session_id = 's1'"
+    ).fetchone()["n"] == 1
+
+    db.delete_session("s1", "codex", provider="openai", data_root="/tmp/codex")
+    assert db.conn.execute(
+        "SELECT COUNT(*) AS n FROM sessions WHERE session_id = 's1'"
+    ).fetchone()["n"] == 0
+    assert db.conn.execute(
+        "SELECT COUNT(*) AS n FROM session_usage WHERE session_id = 's1'"
+    ).fetchone()["n"] == 0
+    assert db.conn.execute(
+        "SELECT COUNT(*) AS n FROM sessions WHERE session_id = 's2'"
+    ).fetchone()["n"] == 1
+    db.close()
+
+
 def test_database_reprices_sessions_when_pricing_changes(tmp_path):
     pricing_file = tmp_path / "pricing.json"
     db_path = str(tmp_path / "data.db")
@@ -115,7 +329,13 @@ def test_database_reprices_sessions_when_pricing_changes(tmp_path):
 
     with patch("agentic_metric.pricing.PRICING_FILE", pricing_file):
         db = Database(db_path=db_path)
-        db.upsert_session("s1", "claude_code", model="custom-model", input_tokens=1_000_000)
+        db.upsert_session(
+            "s1",
+            "claude_code",
+            data_root="/tmp/.claude",
+            model="custom-model",
+            input_tokens=1_000_000,
+        )
         db.commit()
         db.close()
 
@@ -125,7 +345,11 @@ def test_database_reprices_sessions_when_pricing_changes(tmp_path):
         db = Database(db_path=db_path)
         assert db.pricing_changed is True
         row = db.conn.execute(
-            "SELECT estimated_cost_usd FROM sessions WHERE session_id = 's1' AND agent_type = 'claude_code'"
+            """SELECT estimated_cost_usd
+               FROM sessions
+               WHERE session_id = 's1'
+                 AND agent_type = 'claude_code'
+                 AND data_root = '/tmp/.claude'"""
         ).fetchone()
         assert row["estimated_cost_usd"] == 3.0
         db.close()
@@ -149,6 +373,7 @@ def test_database_reprices_session_usage_when_pricing_changes(tmp_path):
         db = Database(db_path=db_path)
         db.upsert_session(
             "s1", "codex",
+            data_root="/tmp/.codex",
             model="expensive-model",
             input_tokens=2_000_000,
             estimated_cost_usd=11.0,
@@ -170,6 +395,7 @@ def test_database_reprices_session_usage_when_pricing_changes(tmp_path):
                     "input_tokens": 1_000_000,
                 },
             ],
+            data_root="/tmp/.codex",
         )
         db.commit()
         db.close()
@@ -182,7 +408,11 @@ def test_database_reprices_session_usage_when_pricing_changes(tmp_path):
         }))
         db = Database(db_path=db_path)
         row = db.conn.execute(
-            "SELECT estimated_cost_usd FROM sessions WHERE session_id = 's1' AND agent_type = 'codex'"
+            """SELECT estimated_cost_usd
+               FROM sessions
+               WHERE session_id = 's1'
+                 AND agent_type = 'codex'
+                 AND data_root = '/tmp/.codex'"""
         ).fetchone()
         assert row["estimated_cost_usd"] == 22.0
         db.close()
@@ -261,6 +491,42 @@ def test_range_reports_group_by_model_only():
     db.close()
 
 
+def test_range_reports_split_provider_and_data_root():
+    db = _make_db()
+    for provider, data_root, input_tokens in (
+        ("openai", "/tmp/codex-openai", 1_000),
+        ("custom", "/tmp/codex-custom", 2_000),
+    ):
+        db.replace_session_usage(
+            "same-session",
+            "codex",
+            [
+                {
+                    "usage_date": "2026-04-24",
+                    "usage_hour": 10,
+                    "model": "gpt-5.4",
+                    "input_tokens": input_tokens,
+                },
+            ],
+            provider=provider,
+            data_root=data_root,
+        )
+    db.commit()
+
+    totals = get_range_totals(db, "2026-04-24", "2026-04-24")
+    assert totals["session_count"] == 2
+
+    rows = get_range_by_agent_model(db, "2026-04-24", "2026-04-24")
+    assert {
+        (row["agent_type"], row["provider"], row["data_root"], row["input_tokens"])
+        for row in rows
+    } == {
+        ("codex", "openai", "/tmp/codex-openai", 1_000),
+        ("codex", "custom", "/tmp/codex-custom", 2_000),
+    }
+    db.close()
+
+
 def test_replace_session_usage_prices_known_model():
     db = _make_db()
     db.replace_session_usage(
@@ -304,6 +570,7 @@ def test_explicit_usage_cost_survives_pricing_reprice(tmp_path):
         db.upsert_session(
             "s1",
             "codex",
+            data_root="/tmp/.codex",
             model="gpt-5.4",
             input_tokens=300_000,
             output_tokens=1_000,
@@ -322,6 +589,7 @@ def test_explicit_usage_cost_survives_pricing_reprice(tmp_path):
                     "estimated_cost_usd": explicit_cost,
                 },
             ],
+            data_root="/tmp/.codex",
         )
         db.set_sync_state("codex_jsonl:v5:/tmp/rollout.jsonl", "1:1")
         db.set_sync_state("pricing:fingerprint", "stale")
@@ -331,12 +599,16 @@ def test_explicit_usage_cost_survives_pricing_reprice(tmp_path):
         row = db.conn.execute(
             """SELECT estimated_cost_usd, cost_is_explicit
                FROM session_usage
-               WHERE session_id = 's1' AND agent_type = 'codex'"""
+               WHERE session_id = 's1'
+                 AND agent_type = 'codex'
+                 AND data_root = '/tmp/.codex'"""
         ).fetchone()
         session = db.conn.execute(
             """SELECT estimated_cost_usd
                FROM sessions
-               WHERE session_id = 's1' AND agent_type = 'codex'"""
+               WHERE session_id = 's1'
+                 AND agent_type = 'codex'
+                 AND data_root = '/tmp/.codex'"""
         ).fetchone()
         assert abs(row["estimated_cost_usd"] - explicit_cost) < 0.001
         assert row["cost_is_explicit"] == 1

@@ -444,7 +444,7 @@ def _top_projects_block(
 
 
 class Breakdown(Static):
-    """Agent × model nested breakdown with cost bars.
+    """Agent → provider → model nested breakdown with cost bars.
 
     Data shape::
 
@@ -453,9 +453,15 @@ class Breakdown(Static):
                 "agent": "claude_code",
                 "cost": 1234.56,
                 "tokens": ...,
-                "models": [
-                    {"model": "claude-opus-4-7", "cost": 800.00, "tokens": ...},
-                    ...
+                "providers": [
+                    {
+                        "provider": "anthropic",
+                        "data_root": "~/.claude-alt",
+                        "models": [
+                            {"model": "claude-opus-4-7", "cost": 800.00, "tokens": ...},
+                            ...
+                        ],
+                    },
                 ]
             },
             ...
@@ -489,20 +495,62 @@ class Breakdown(Static):
             f"cache {fmt_tokens(row.get('cache') or 0)}"
         )
 
+    @staticmethod
+    def _truncate(text: str, width: int) -> str:
+        if width <= 0:
+            return ""
+        if len(text) <= width:
+            return text
+        if width <= 1:
+            return text[:width]
+        return text[: width - 1] + "…"
+
+    def _append_label(self, t: Text, parts: list[tuple[str, str]], width: int) -> None:
+        used = sum(len(text) for text, _style in parts)
+        for text, style in parts:
+            t.append(text, style=style)
+        if used < width:
+            t.append(" " * (width - used), style="white")
+        else:
+            t.append(" ", style="white")
+
+    def _append_value_columns(
+        self,
+        t: Text,
+        row: dict,
+        *,
+        cost: float | None,
+        cost_unknown: bool,
+        share: str = "",
+        cost_style: str = "bright_yellow",
+    ) -> None:
+        t.append(f" {fmt_cost(cost, unknown=cost_unknown):>10}", style=cost_style)
+        t.append(f" {share:>7}", style="white")
+        t.append("  ")
+        t.append(self._split(row), style="white")
+        t.append("\n")
+
     def render(self) -> Text:
         if not self._groups:
             return Text("  No activity in the selected range.", style="white")
 
         total = max(self._total_cost, 1e-9)
         total_unknown = any(_has_unknown_cost(g) for g in self._groups)
-        # Each agent group uses ~3 lines (header + split + blank); each model 1 line.
+        # Each provider uses one line plus model rows; each agent uses one
+        # summary line and a spacer. Compute a per-provider model budget from
+        # the visible height so wide ranges stay readable.
+        provider_count = sum(len(g.get("providers") or [g]) for g in self._groups)
+        provider_count = max(provider_count, 1)
         # Compute how many model lines we can afford from the available height.
-        n_groups = len(self._groups)
         avail = self.size.height
-        overhead = n_groups * 3  # agent header + token split + trailing blank
-        model_budget = max(avail - overhead, n_groups * self._MIN_MODEL_LIMIT)
-        # Distribute budget evenly across groups, but at least _MIN_MODEL_LIMIT each.
-        model_limit = max(self._MIN_MODEL_LIMIT, model_budget // max(n_groups, 1))
+        overhead = len(self._groups) * 2 + provider_count
+        model_budget = max(avail - overhead, provider_count * self._MIN_MODEL_LIMIT)
+        model_limit = max(self._MIN_MODEL_LIMIT, model_budget // provider_count)
+        try:
+            width = self.content_size.width
+        except Exception:
+            width = 120
+        label_width = max(38, min(72, width - 58))
         t = Text()
         for i, g in enumerate(self._groups):
             agent = g["agent"]
@@ -511,46 +559,124 @@ class Breakdown(Static):
             ratio = cost / total
             pct = ratio * 100
 
-            # Agent line — magenta, bold
-            t.append(f"  {agent:<14}", style="bold bright_magenta")
-            t.append(f" {fmt_cost(cost, unknown=unknown):>10} ", style="bold bright_yellow")
-            t.append_text(self._bar(ratio))
-            t.append("   — \n" if unknown or total_unknown else f" {pct:>4.1f}%\n", style="white")
-            t.append("    ")
-            t.append(self._split(g), style="white")
-            t.append("\n")
+            # Agent summary line. Provider and model detail are nested below it.
+            self._append_label(
+                t,
+                [("  ", "white"), (self._truncate(agent, label_width - 2), "bold bright_magenta")],
+                label_width,
+            )
+            self._append_value_columns(
+                t,
+                g,
+                cost=cost,
+                cost_unknown=unknown,
+                share="—" if unknown or total_unknown else f"{pct:.1f}%",
+                cost_style="bold bright_yellow",
+            )
 
-            # Model rows: keep the panel readable, then roll up the tail.
-            # Unknown models are always visible (before the fold), never hidden.
-            raw_models = g.get("models", []) or []
-            nonzero = [m for m in raw_models if (m.get("cost") or 0) > 0 or _has_unknown_cost(m)]
-            known = sorted([m for m in nonzero if not _has_unknown_cost(m)], key=lambda m: -(m.get("cost") or 0))
-            unknown = sorted([m for m in nonzero if _has_unknown_cost(m)], key=lambda m: -(m.get("cost") or 0))
-            visible = known[: model_limit] + unknown
-            hidden = known[model_limit :]
-            for j, m in enumerate(visible):
-                last = (j == len(visible) - 1 and not hidden)
-                connector = "└─" if last else "├─"
-                t.append(f"    {connector} ", style="white")
-                model_name = m.get("model") or "(unknown)"
-                if model_name == "Unknown" and m.get("raw_model"):
-                    model_name = f"Unknown: {m['raw_model']}"
-                t.append(f"{model_name:<28}", style="bright_cyan")
-                t.append(f" {fmt_cost(m.get('cost'), unknown=_has_unknown_cost(m)):>10}", style="bright_yellow")
-                t.append(f"  {self._split(m)}\n", style="white")
-            if hidden:
-                hidden_cost = sum(m.get("cost") or 0 for m in hidden)
-                hidden_unknown = any(_has_unknown_cost(m) for m in hidden)
-                hidden_row = {
-                    "input": sum(m.get("input") or 0 for m in hidden),
-                    "output": sum(m.get("output") or 0 for m in hidden),
-                    "cache": sum(m.get("cache") or 0 for m in hidden),
-                }
-                t.append("    └─ ", style="white")
-                t.append(f"+{len(hidden)} more models".ljust(28), style="white")
-                t.append(f" {fmt_cost(hidden_cost, unknown=hidden_unknown):>10}", style="bright_yellow")
-                t.append(f"  {self._split(hidden_row)}\n", style="white")
-            t.append("\n")
+            providers = g.get("providers") or [g]
+            for p_index, provider_group in enumerate(providers):
+                provider_last = p_index == len(providers) - 1
+                provider_connector = "└─" if provider_last else "├─"
+                provider = provider_group.get("provider") or "—"
+                provider_prefix = f"    {provider_connector} "
+                provider_width = 10
+                path_width = max(8, label_width - len(provider_prefix) - provider_width - 1)
+                data_root = _short_path(provider_group.get("data_root") or "—", max_len=path_width)
+                provider_cost = provider_group.get("cost") or 0.0
+                provider_unknown = _has_unknown_cost(provider_group)
+                provider_ratio = provider_cost / total
+                provider_pct = provider_ratio * 100
+
+                self._append_label(
+                    t,
+                    [
+                        (provider_prefix, "white"),
+                        (self._truncate(provider, provider_width).ljust(provider_width), "bright_cyan"),
+                        (" ", "white"),
+                        (data_root, "white"),
+                    ],
+                    label_width,
+                )
+                self._append_value_columns(
+                    t,
+                    provider_group,
+                    cost=provider_cost,
+                    cost_unknown=provider_unknown,
+                    share="—" if provider_unknown or total_unknown else f"{provider_pct:.1f}%",
+                    cost_style="bold bright_yellow",
+                )
+
+                # Model rows: keep the panel readable, then roll up the tail.
+                # Unknown models are always visible, never hidden.
+                raw_models = provider_group.get("models", []) or []
+                nonzero = [
+                    m for m in raw_models
+                    if (m.get("cost") or 0) > 0 or _has_unknown_cost(m)
+                ]
+                known = sorted(
+                    [m for m in nonzero if not _has_unknown_cost(m)],
+                    key=lambda m: -(m.get("cost") or 0),
+                )
+                unknown_models = sorted(
+                    [m for m in nonzero if _has_unknown_cost(m)],
+                    key=lambda m: -(m.get("cost") or 0),
+                )
+                visible = known[: model_limit] + unknown_models
+                hidden = known[model_limit :]
+                child_prefix = "       " if provider_last else "    │  "
+
+                for j, m in enumerate(visible):
+                    last = (j == len(visible) - 1 and not hidden)
+                    connector = "└─" if last else "├─"
+                    model_prefix = f"{child_prefix}{connector} "
+                    model_name = m.get("model") or "(unknown)"
+                    if model_name == "Unknown" and m.get("raw_model"):
+                        model_name = f"Unknown: {m['raw_model']}"
+                    self._append_label(
+                        t,
+                        [
+                            (model_prefix, "white"),
+                            (self._truncate(model_name, label_width - len(model_prefix)), "bright_cyan"),
+                        ],
+                        label_width,
+                    )
+                    self._append_value_columns(
+                        t,
+                        m,
+                        cost=m.get("cost"),
+                        cost_unknown=_has_unknown_cost(m),
+                        share="",
+                        cost_style="bright_yellow",
+                    )
+                if hidden:
+                    hidden_cost = sum(m.get("cost") or 0 for m in hidden)
+                    hidden_unknown = any(_has_unknown_cost(m) for m in hidden)
+                    hidden_row = {
+                        "input": sum(m.get("input") or 0 for m in hidden),
+                        "output": sum(m.get("output") or 0 for m in hidden),
+                        "cache": sum(m.get("cache") or 0 for m in hidden),
+                    }
+                    model_prefix = f"{child_prefix}└─ "
+                    label = f"+{len(hidden)} more models"
+                    self._append_label(
+                        t,
+                        [
+                            (model_prefix, "white"),
+                            (self._truncate(label, label_width - len(model_prefix)), "white"),
+                        ],
+                        label_width,
+                    )
+                    self._append_value_columns(
+                        t,
+                        hidden_row,
+                        cost=hidden_cost,
+                        cost_unknown=hidden_unknown,
+                        share="",
+                        cost_style="bright_yellow",
+                    )
+            if i != len(self._groups) - 1:
+                t.append("\n")
 
         return t
 

@@ -17,8 +17,8 @@
 
 - **实时监控** — 检测运行中的 agent 进程,增量解析 JSONL 会话数据
 - **成本估算** — 基于各模型定价表计算 API 等效成本,支持 CLI 管理定价;支持长上下文和缓存时长定价
-- **统一的用量报告** — 单个 `report` 命令覆盖今日 / 本周 / 本月 / 自定义区间,含 agent × model 明细、项目排行、cost drivers、小时/天/周热图
-- **TUI 仪表盘** — 终端图形界面,实时刷新,含汇总卡片、热图条、30 天成本柱图、agent × model 分解
+- **统一的用量报告** — 单个 `report` 命令覆盖今日 / 本周 / 本月 / 自定义区间,含 agent × provider × model 明细、项目排行、cost drivers、小时/天/周热图
+- **TUI 仪表盘** — 终端图形界面,实时刷新,含汇总卡片、热图条、30 天成本柱图、agent → provider → model 分解
 - **多 Agent 支持** — 插件架构;目前支持 Claude Code 和 Codex,可扩展
 
 ## 各 Agent 指标覆盖情况
@@ -64,6 +64,7 @@ uv tool upgrade agentic-metric-x   # 升级到最新版
 agentic-metric                       # 启动 TUI 仪表盘(无参数时默认启动)
 agentic-metric tui                   # 显式启动 TUI 仪表盘
 agentic-metric sync                  # 强制同步各 collector 到本地数据库
+agentic-metric sync --rebuild        # 从原始 session 日志重建派生数据库
 agentic-metric report --today        # 今日用量报告
 agentic-metric report --week         # 本周(周一至今)
 agentic-metric report --month        # 本月
@@ -89,7 +90,7 @@ agentic-metric pricing               # 管理模型定价
 
 `report` 会输出:总成本 / sessions / 用户轮次 / tokens / 缓存命中率的汇总条,
 与上一同类周期的差额,一个热图条(`--today` 按小时、`--week` 按日、`--month`
-按周),默认展示 agent × model 明细、项目排行、cost drivers,并可按需展开额外明细表。
+按周),默认展示 agent × provider × model 明细、项目排行、cost drivers,并可按需展开额外明细表。
 
 ### 定价管理
 
@@ -129,6 +130,11 @@ agentic-metric pricing cache reset claude-sonnet-4                # 删除覆盖
 未知模型不会自动套用默认价或模型族价格。界面会显示为 `Unknown`,费用显示为 `?`,直到你用 `agentic-metric pricing set` 添加明确价格。
 
 定价变更后,命令会自动重新同步历史数据,从原始 JSONL 数据重新计算事件级成本(如长上下文请求)。
+
+如果切换 roots/provider 后发现缓存历史不对,可以运行
+`agentic-metric sync --rebuild`。它只会删除本工具自己的派生 SQLite 数据库,
+再从 Claude Code 和 Codex 的原始 session 文件重建;`config.json`、`pricing.json`
+以及 agent 数据目录不会被修改。
 
 ### TUI 快捷键
 
@@ -233,8 +239,34 @@ src/agentic_metric/
 | Codex | `~/.codex/sessions/` | JSONL 会话、token 用量、模型 |
 | Codex | 进程检测 | 运行状态、工作目录 |
 
-Claude Code 支持 `CLAUDE_CONFIG_DIR`,Codex 支持 `CODEX_HOME`,如果你改了
-这两个 agent 的配置目录,collector 会自动读取环境变量。
+默认情况下,Claude Code 支持 `CLAUDE_CONFIG_DIR`,Codex 支持 `CODEX_HOME`,
+collector 会读取这些环境变量。需要同时扫描多个目录或手动指定 provider 时,
+可以创建本工具自己的配置文件:
+
+```json
+{
+  "collectors": {
+    "codex": {
+      "roots": [
+        {"path": "~/.codex", "provider": "openai"},
+        {"path": "~/.codex-custom", "provider": "custom"}
+      ]
+    },
+    "claude_code": {
+      "roots": [
+        {"path": "~/.claude"},
+        {"path": "~/.claude-alt"},
+        {"path": "~/.claude-provider-b", "provider": "provider-b"}
+      ]
+    }
+  }
+}
+```
+
+默认配置路径是 `$DATA/agentic_metric/config.json`,也可以用
+`AGENTIC_METRIC_CONFIG` 指向其他 JSON 文件。Claude Code 目录没有 provider
+时不会被强行推断;Codex 未配置 provider 时会尝试读取 JSONL 里的
+`model_provider`。CLI/TUI 会把 `agent`、`provider`、`root` 分列展示。
 
 所有数据汇总存储在 `$DATA/agentic_metric/data.db`(SQLite)。
 

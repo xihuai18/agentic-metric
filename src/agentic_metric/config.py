@@ -1,5 +1,9 @@
 """Configuration constants and paths."""
 
+from __future__ import annotations
+
+from dataclasses import dataclass
+import json
 import os
 import platform
 from pathlib import Path
@@ -45,6 +49,85 @@ DATA_DIR = (
 )
 DB_PATH = DATA_DIR / "data.db"
 PRICING_FILE = DATA_DIR / "pricing.json"
+CONFIG_FILE = _env_path("AGENTIC_METRIC_CONFIG", DATA_DIR / "config.json")
+
+
+@dataclass(frozen=True)
+class CollectorRoot:
+    """One configured data root for an agent collector."""
+
+    path: Path
+    provider: str = ""
+
+
+def _expand_path(raw: object) -> Path | None:
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    return Path(os.path.expandvars(raw.strip())).expanduser()
+
+
+def _load_config() -> dict:
+    try:
+        data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _collector_roots(name: str, default_path: Path) -> list[CollectorRoot]:
+    """Return configured roots for a collector, falling back to its env/default root.
+
+    Supported config shape in ``CONFIG_FILE``:
+
+    {
+      "collectors": {
+        "codex": {
+          "roots": [
+            {"path": "~/.codex", "provider": "openai"},
+            {"path": "~/.codex-custom", "provider": "custom"}
+          ]
+        },
+        "claude_code": {
+          "roots": [
+            {"path": "~/.claude"},
+            {"path": "~/.claude-alt"}
+          ]
+        }
+      }
+    }
+    """
+    config = _load_config()
+    collectors = config.get("collectors")
+    raw_collector = collectors.get(name) if isinstance(collectors, dict) else None
+    raw_roots = None
+    if isinstance(raw_collector, dict):
+        raw_roots = raw_collector.get("roots")
+    elif isinstance(raw_collector, list):
+        raw_roots = raw_collector
+
+    roots: list[CollectorRoot] = []
+    if isinstance(raw_roots, list):
+        for item in raw_roots:
+            if isinstance(item, str):
+                path = _expand_path(item)
+                provider = ""
+            elif isinstance(item, dict):
+                path = _expand_path(item.get("path"))
+                provider = str(item.get("provider") or "").strip()
+            else:
+                continue
+            if path is not None:
+                roots.append(CollectorRoot(path=path, provider=provider))
+
+    return roots or [CollectorRoot(default_path)]
+
+
+def get_codex_roots() -> list[CollectorRoot]:
+    return _collector_roots("codex", CODEX_HOME)
+
+
+def get_claude_code_roots() -> list[CollectorRoot]:
+    return _collector_roots("claude_code", CLAUDE_HOME)
 
 # Refresh intervals (seconds)
 LIVE_REFRESH_INTERVAL = 1  # running sessions

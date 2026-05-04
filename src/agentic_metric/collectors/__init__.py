@@ -65,10 +65,30 @@ def create_default_registry() -> CollectorRegistry:
     """
     registry = CollectorRegistry()
 
+    from ..config import get_claude_code_roots, get_codex_roots
+
     from .claude_code import ClaudeCodeCollector
-    registry.register(ClaudeCodeCollector())
+    for root in get_claude_code_roots():
+        projects_dir = root.path if root.path.name == "projects" else root.path / "projects"
+        data_root = root.path.parent if root.path.name == "projects" else root.path
+        registry.register(
+            ClaudeCodeCollector(
+                projects_dir=projects_dir,
+                provider=root.provider,
+                data_root=str(data_root),
+            )
+        )
 
     from .codex import CodexCollector
-    registry.register(CodexCollector())
+    for root in get_codex_roots():
+        sessions_dir = root.path if root.path.name == "sessions" else root.path / "sessions"
+        data_root = root.path.parent if root.path.name == "sessions" else root.path
+        registry.register(
+            CodexCollector(
+                sessions_dir=sessions_dir,
+                provider=root.provider,
+                data_root=str(data_root),
+            )
+        )
 
     return registry

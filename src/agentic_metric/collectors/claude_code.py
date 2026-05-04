@@ -529,12 +529,23 @@ class _LiveMonitor:
     subsequent calls only read newly appended bytes.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        projects_dir: Path | None = None,
+        provider: str = "",
+        data_root: str = "",
+    ) -> None:
+        self.projects_dir = projects_dir
+        self.provider = provider.strip()
+        self.data_root = data_root
         # cwd -> project_dir mapping (rebuilt when unknown cwds appear)
         self._cwd_map: dict[str, Path] = {}
         self._cwd_map_built = False
         # file_path -> accumulator (persists across refreshes)
         self._accums: dict[Path, _SessionAccum] = {}
+
+    def _projects_dir(self) -> Path:
+        return self.projects_dir or PROJECTS_DIR
 
     def refresh(self) -> list[LiveSession]:
         """Return currently running sessions. Fast on repeated calls."""
@@ -608,7 +619,10 @@ class _LiveMonitor:
 
                 accum.read_new_lines()
                 if accum.user_turns > 0:
-                    results.append(accum.to_live_session())
+                    live = accum.to_live_session()
+                    live.provider = self.provider
+                    live.data_root = self.data_root
+                    results.append(live)
 
         # Prune stale accumulators
         stale = [k for k in self._accums if k not in active_files]
@@ -620,12 +634,13 @@ class _LiveMonitor:
 
     def _refresh_recent_files(self) -> list[LiveSession]:
         """Windows fallback when process CWD lookup is unavailable."""
-        if not PROJECTS_DIR.exists():
+        projects_dir = self._projects_dir()
+        if not projects_dir.exists():
             return []
         cutoff = time.time() - _RECENT_ACTIVITY_SECONDS
         candidates: list[tuple[float, Path, str]] = []
         try:
-            project_dirs = [p for p in PROJECTS_DIR.iterdir() if p.is_dir()]
+            project_dirs = [p for p in projects_dir.iterdir() if p.is_dir()]
         except OSError:
             return []
         for project_dir in project_dirs:
@@ -650,7 +665,10 @@ class _LiveMonitor:
                 self._accums[jsonl_file] = accum
             accum.read_new_lines()
             if accum.user_turns > 0:
-                results.append(accum.to_live_session())
+                live = accum.to_live_session()
+                live.provider = self.provider
+                live.data_root = self.data_root
+                results.append(live)
 
         stale = [k for k in self._accums if k not in active_files]
         for k in stale:
@@ -661,9 +679,10 @@ class _LiveMonitor:
     def _build_cwd_map(self) -> None:
         """Map real CWDs to PROJECTS_DIR subdirectories by reading JSONL headers."""
         self._cwd_map.clear()
-        if not PROJECTS_DIR.exists():
+        projects_dir = self._projects_dir()
+        if not projects_dir.exists():
             return
-        for project_dir in PROJECTS_DIR.iterdir():
+        for project_dir in projects_dir.iterdir():
             if not project_dir.is_dir():
                 continue
             try:
@@ -713,8 +732,21 @@ class ClaudeCodeCollector(BaseCollector):
 
     agent_type = "claude_code"
 
-    def __init__(self) -> None:
-        self._monitor = _LiveMonitor()
+    def __init__(
+        self,
+        projects_dir: Path | None = None,
+        provider: str = "",
+        data_root: str = "",
+    ) -> None:
+        self.projects_dir = projects_dir
+        self.provider = provider.strip()
+        self.data_root = data_root
+        self.agent_type = "claude_code"
+        self._monitor = _LiveMonitor(
+            projects_dir,
+            provider=self.provider,
+            data_root=self.data_root,
+        )
 
     def get_live_sessions(self) -> list[LiveSession]:
         """Return currently active Claude Code sessions."""
@@ -736,10 +768,11 @@ class ClaudeCodeCollector(BaseCollector):
 
     def _sync_sessions_index(self, db) -> None:
         """Parse all sessions-index.json files under PROJECTS_DIR."""
-        if not PROJECTS_DIR.exists():
+        projects_dir = self.projects_dir or PROJECTS_DIR
+        if not projects_dir.exists():
             return
 
-        for index_file in PROJECTS_DIR.glob("*/sessions-index.json"):
+        for index_file in projects_dir.glob("*/sessions-index.json"):
             try:
                 data = json.loads(index_file.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, UnicodeDecodeError, OSError):
@@ -756,6 +789,8 @@ class ClaudeCodeCollector(BaseCollector):
                 db.upsert_session(
                     session_id,
                     self.agent_type,
+                    provider=self.provider,
+                    data_root=self.data_root,
                     project_path=entry.get("projectPath", ""),
                     git_branch=entry.get("gitBranch", ""),
                     message_count=entry.get("messageCount", 0),
@@ -772,12 +807,13 @@ class ClaudeCodeCollector(BaseCollector):
         Uses db sync_state to track which files/offsets have already been
         processed, making incremental re-syncs cheap.
         """
-        if not PROJECTS_DIR.exists():
+        projects_dir = self.projects_dir or PROJECTS_DIR
+        if not projects_dir.exists():
             return
 
-        sync_prefix = "cc_jsonl:v5:"
+        sync_prefix = "cc_jsonl:v6:"
 
-        for project_dir in PROJECTS_DIR.iterdir():
+        for project_dir in projects_dir.iterdir():
             if not project_dir.is_dir():
                 continue
 
@@ -822,6 +858,8 @@ class ClaudeCodeCollector(BaseCollector):
                 db.upsert_session(
                     session_id,
                     self.agent_type,
+                    provider=self.provider,
+                    data_root=self.data_root,
                     project_path=project_path,
                     git_branch=accum.git_branch,
                     model=accum.model,
@@ -837,7 +875,13 @@ class ClaudeCodeCollector(BaseCollector):
                     first_prompt=accum.first_prompt,
                     last_prompt=accum.last_prompt,
                 )
-                db.replace_session_usage(session_id, self.agent_type, usage_rows)
+                db.replace_session_usage(
+                    session_id,
+                    self.agent_type,
+                    usage_rows,
+                    provider=self.provider,
+                    data_root=self.data_root,
+                )
 
                 db.set_sync_state(sync_key, _sync_state_value(file_size, mtime_ns))
 

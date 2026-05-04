@@ -8,11 +8,14 @@ from ..config import DATA_DIR, DB_PATH
 from ..pricing import estimate_cost, get_pricing_fingerprint
 
 _UNSET = object()
+_HISTORY_IDENTITY_VERSION = "provider-data-root-v3"
 
 _SESSIONS_TABLE_SQL = """\
 CREATE TABLE IF NOT EXISTS sessions (
     session_id TEXT NOT NULL,
     agent_type TEXT NOT NULL,
+    provider TEXT DEFAULT '',
+    data_root TEXT NOT NULL DEFAULT '',
     project_path TEXT,
     git_branch TEXT DEFAULT '',
     model TEXT DEFAULT '',
@@ -28,7 +31,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     first_prompt TEXT DEFAULT '',
     last_prompt TEXT DEFAULT '',
     summary TEXT DEFAULT '',
-    PRIMARY KEY (session_id, agent_type)
+    PRIMARY KEY (session_id, agent_type, data_root)
 );
 """
 
@@ -36,6 +39,8 @@ _SESSION_USAGE_TABLE_SQL = """\
 CREATE TABLE IF NOT EXISTS session_usage (
     session_id TEXT NOT NULL,
     agent_type TEXT NOT NULL,
+    provider TEXT DEFAULT '',
+    data_root TEXT NOT NULL DEFAULT '',
     usage_date TEXT NOT NULL,
     usage_hour INTEGER NOT NULL,
     project_path TEXT DEFAULT '',
@@ -48,7 +53,7 @@ CREATE TABLE IF NOT EXISTS session_usage (
     cache_creation_tokens INTEGER DEFAULT 0,
     estimated_cost_usd REAL DEFAULT 0,
     cost_is_explicit INTEGER DEFAULT 0,
-    PRIMARY KEY (session_id, agent_type, usage_date, usage_hour, model)
+    PRIMARY KEY (session_id, agent_type, data_root, usage_date, usage_hour, model)
 );
 """
 
@@ -57,12 +62,7 @@ CREATE TABLE IF NOT EXISTS sync_state (
     key TEXT PRIMARY KEY,
     value TEXT
 );
-""" + _SESSION_USAGE_TABLE_SQL + """\
-CREATE INDEX IF NOT EXISTS idx_session_usage_date ON session_usage (usage_date);
-CREATE INDEX IF NOT EXISTS idx_session_usage_agent_date ON session_usage (agent_type, usage_date);
-CREATE INDEX IF NOT EXISTS idx_session_usage_model_date ON session_usage (model, usage_date);
-CREATE INDEX IF NOT EXISTS idx_session_usage_project_date ON session_usage (project_path, usage_date);
-"""
+""" + _SESSION_USAGE_TABLE_SQL
 
 
 class Database:
@@ -85,42 +85,166 @@ class Database:
                 "ALTER TABLE sessions ADD COLUMN last_prompt TEXT DEFAULT ''"
             )
             info = self._conn.execute("PRAGMA table_info(sessions)").fetchall()
+            cols = {r[1] for r in info}
 
         pk_cols = [r[1] for r in sorted(info, key=lambda row: row[5]) if r[5] > 0]
-        if pk_cols != ["session_id", "agent_type"]:
-            self._rebuild_sessions_table()
+        if (
+            "provider" not in cols
+            or "data_root" not in cols
+            or pk_cols != ["session_id", "agent_type", "data_root"]
+        ):
+            self._rebuild_sessions_table(cols)
 
         usage_info = self._conn.execute("PRAGMA table_info(session_usage)").fetchall()
         usage_cols = {r[1] for r in usage_info}
-        if "cost_is_explicit" not in usage_cols:
-            self._conn.execute(
-                "ALTER TABLE session_usage ADD COLUMN cost_is_explicit INTEGER DEFAULT 0"
-            )
+        usage_pk_cols = [
+            r[1] for r in sorted(usage_info, key=lambda row: row[5]) if r[5] > 0
+        ]
+        if (
+            "provider" not in usage_cols
+            or "data_root" not in usage_cols
+            or "cost_is_explicit" not in usage_cols
+            or usage_pk_cols != [
+                "session_id",
+                "agent_type",
+                "data_root",
+                "usage_date",
+                "usage_hour",
+                "model",
+            ]
+        ):
+            self._rebuild_session_usage_table(usage_cols)
 
         self._conn.executescript(_SESSION_USAGE_TABLE_SQL + """\
         CREATE INDEX IF NOT EXISTS idx_session_usage_date ON session_usage (usage_date);
         CREATE INDEX IF NOT EXISTS idx_session_usage_agent_date ON session_usage (agent_type, usage_date);
+        CREATE INDEX IF NOT EXISTS idx_session_usage_provider_date ON session_usage (provider, usage_date);
+        CREATE INDEX IF NOT EXISTS idx_session_usage_root_date ON session_usage (data_root, usage_date);
         CREATE INDEX IF NOT EXISTS idx_session_usage_model_date ON session_usage (model, usage_date);
         CREATE INDEX IF NOT EXISTS idx_session_usage_project_date ON session_usage (project_path, usage_date);
         """)
+        self._ensure_history_identity_current()
+        self._purge_unscoped_legacy_history()
 
-    def _rebuild_sessions_table(self) -> None:
+    @staticmethod
+    def _column_expr(cols: set[str], column: str, default_sql: str) -> str:
+        return column if column in cols else default_sql
+
+    @staticmethod
+    def _pure_agent_expr() -> str:
+        return (
+            "CASE WHEN instr(agent_type, ':') > 0 "
+            "THEN substr(agent_type, 1, instr(agent_type, ':') - 1) "
+            "ELSE agent_type END"
+        )
+
+    @staticmethod
+    def _provider_expr(cols: set[str]) -> str:
+        encoded = (
+            "CASE WHEN instr(agent_type, ':') > 0 "
+            "THEN substr(agent_type, instr(agent_type, ':') + 1) ELSE '' END"
+        )
+        if "provider" in cols:
+            return f"COALESCE(NULLIF(provider, ''), {encoded})"
+        return encoded
+
+    def _ensure_history_identity_current(self) -> None:
+        """Invalidate old derived rows when identity dimensions change."""
+        key = "history_identity:version"
+        if self.get_sync_state(key) == _HISTORY_IDENTITY_VERSION:
+            return
+        self._clear_collector_history()
+        self.set_sync_state(key, _HISTORY_IDENTITY_VERSION)
+
+    def _clear_collector_history(self) -> None:
+        """Clear derived collector rows so history can be rebuilt from source logs."""
+        self._conn.execute("DELETE FROM sessions")
+        self._conn.execute("DELETE FROM session_usage")
+        self._conn.execute("DELETE FROM sync_state WHERE key LIKE 'codex_jsonl:%'")
+        self._conn.execute("DELETE FROM sync_state WHERE key LIKE 'cc_jsonl:%'")
+
+    def _purge_unscoped_legacy_history(self) -> None:
+        """Remove rows written before data_root became part of session identity."""
+        stale = self._conn.execute(
+            """SELECT
+                   (SELECT COUNT(*) FROM sessions WHERE data_root = '') +
+                   (SELECT COUNT(*) FROM session_usage WHERE data_root = '') AS n"""
+        ).fetchone()
+        if not stale or stale["n"] == 0:
+            return
+        self._conn.execute("DELETE FROM sessions WHERE data_root = ''")
+        self._conn.execute("DELETE FROM session_usage WHERE data_root = ''")
+        self._conn.execute("DELETE FROM sync_state WHERE key LIKE 'codex_jsonl:v5:%'")
+        self._conn.execute("DELETE FROM sync_state WHERE key LIKE 'cc_jsonl:v5:%'")
+        self._conn.commit()
+
+    def _rebuild_sessions_table(self, cols: set[str]) -> None:
         """Rebuild the sessions table with the current primary key."""
+        self._conn.execute("DROP TABLE IF EXISTS sessions_old")
         self._conn.execute("ALTER TABLE sessions RENAME TO sessions_old")
         self._conn.execute(_SESSIONS_TABLE_SQL)
         self._conn.execute(
-            """INSERT INTO sessions
-                   (session_id, agent_type, project_path, git_branch, model,
+            f"""INSERT OR IGNORE INTO sessions
+                   (session_id, agent_type, provider, data_root,
+                    project_path, git_branch, model,
                     message_count, user_turns, input_tokens, output_tokens,
                     cache_read_tokens, cache_creation_tokens, estimated_cost_usd,
                     started_at, ended_at, first_prompt, last_prompt, summary)
-               SELECT session_id, agent_type, project_path, git_branch, model,
-                      message_count, user_turns, input_tokens, output_tokens,
-                      cache_read_tokens, cache_creation_tokens, estimated_cost_usd,
-                      started_at, ended_at, first_prompt, last_prompt, summary
+               SELECT session_id,
+                      {self._pure_agent_expr()},
+                      {self._provider_expr(cols)},
+                      {self._column_expr(cols, "data_root", "''")},
+                      project_path,
+                      {self._column_expr(cols, "git_branch", "''")},
+                      {self._column_expr(cols, "model", "''")},
+                      {self._column_expr(cols, "message_count", "0")},
+                      {self._column_expr(cols, "user_turns", "0")},
+                      {self._column_expr(cols, "input_tokens", "0")},
+                      {self._column_expr(cols, "output_tokens", "0")},
+                      {self._column_expr(cols, "cache_read_tokens", "0")},
+                      {self._column_expr(cols, "cache_creation_tokens", "0")},
+                      {self._column_expr(cols, "estimated_cost_usd", "0")},
+                      {self._column_expr(cols, "started_at", "''")},
+                      {self._column_expr(cols, "ended_at", "''")},
+                      {self._column_expr(cols, "first_prompt", "''")},
+                      {self._column_expr(cols, "last_prompt", "''")},
+                      {self._column_expr(cols, "summary", "''")}
                FROM sessions_old"""
         )
         self._conn.execute("DROP TABLE sessions_old")
+        self._conn.commit()
+
+    def _rebuild_session_usage_table(self, cols: set[str]) -> None:
+        """Rebuild session_usage with provider/data_root in the key."""
+        self._conn.execute("DROP TABLE IF EXISTS session_usage_old")
+        self._conn.execute("ALTER TABLE session_usage RENAME TO session_usage_old")
+        self._conn.execute(_SESSION_USAGE_TABLE_SQL)
+        self._conn.execute(
+            f"""INSERT OR IGNORE INTO session_usage
+                   (session_id, agent_type, provider, data_root,
+                    usage_date, usage_hour, project_path, model,
+                    message_count, user_turns, input_tokens, output_tokens,
+                    cache_read_tokens, cache_creation_tokens, estimated_cost_usd,
+                    cost_is_explicit)
+               SELECT session_id,
+                      {self._pure_agent_expr()},
+                      {self._provider_expr(cols)},
+                      {self._column_expr(cols, "data_root", "''")},
+                      usage_date,
+                      usage_hour,
+                      {self._column_expr(cols, "project_path", "''")},
+                      {self._column_expr(cols, "model", "''")},
+                      {self._column_expr(cols, "message_count", "0")},
+                      {self._column_expr(cols, "user_turns", "0")},
+                      {self._column_expr(cols, "input_tokens", "0")},
+                      {self._column_expr(cols, "output_tokens", "0")},
+                      {self._column_expr(cols, "cache_read_tokens", "0")},
+                      {self._column_expr(cols, "cache_creation_tokens", "0")},
+                      {self._column_expr(cols, "estimated_cost_usd", "0")},
+                      {self._column_expr(cols, "cost_is_explicit", "0")}
+               FROM session_usage_old"""
+        )
+        self._conn.execute("DROP TABLE session_usage_old")
         self._conn.commit()
 
     def close(self) -> None:
@@ -165,7 +289,7 @@ class Database:
         self._conn.execute("DELETE FROM sync_state WHERE key LIKE 'cc_jsonl:%'")
 
         usage_rows = self._conn.execute(
-            """SELECT session_id, agent_type, usage_date, usage_hour, model,
+            """SELECT session_id, agent_type, data_root, usage_date, usage_hour, model,
                       input_tokens, output_tokens,
                       cache_read_tokens, cache_creation_tokens
                FROM session_usage
@@ -183,6 +307,7 @@ class Database:
                 ),
                 row["session_id"],
                 row["agent_type"],
+                row["data_root"],
                 row["usage_date"],
                 row["usage_hour"],
                 row["model"] or "",
@@ -195,6 +320,7 @@ class Database:
                    SET estimated_cost_usd = ?
                    WHERE session_id = ?
                      AND agent_type = ?
+                     AND data_root = ?
                      AND usage_date = ?
                      AND usage_hour = ?
                      AND model = ?""",
@@ -202,7 +328,7 @@ class Database:
             )
 
         rows = self._conn.execute(
-            """SELECT session_id, agent_type, model,
+            """SELECT session_id, agent_type, data_root, model,
                       input_tokens, output_tokens,
                       cache_read_tokens, cache_creation_tokens
                FROM sessions AS s
@@ -211,6 +337,7 @@ class Database:
                    FROM session_usage AS u
                    WHERE u.session_id = s.session_id
                      AND u.agent_type = s.agent_type
+                     AND u.data_root = s.data_root
                )"""
         ).fetchall()
 
@@ -226,6 +353,7 @@ class Database:
                 ),
                 row["session_id"],
                 row["agent_type"],
+                row["data_root"],
             )
             for row in rows
         ]
@@ -233,7 +361,7 @@ class Database:
             self._conn.executemany(
                 """UPDATE sessions
                    SET estimated_cost_usd = ?
-                   WHERE session_id = ? AND agent_type = ?""",
+                   WHERE session_id = ? AND agent_type = ? AND data_root = ?""",
                 updates,
             )
 
@@ -245,6 +373,7 @@ class Database:
                        FROM session_usage AS u
                        WHERE u.session_id = sessions.session_id
                          AND u.agent_type = sessions.agent_type
+                         AND u.data_root = sessions.data_root
                          AND u.estimated_cost_usd IS NULL
                    ) THEN NULL
                    ELSE (
@@ -252,6 +381,7 @@ class Database:
                        FROM session_usage AS u
                        WHERE u.session_id = sessions.session_id
                          AND u.agent_type = sessions.agent_type
+                         AND u.data_root = sessions.data_root
                    )
                END
                WHERE EXISTS (
@@ -259,6 +389,7 @@ class Database:
                    FROM session_usage AS u
                    WHERE u.session_id = sessions.session_id
                      AND u.agent_type = sessions.agent_type
+                     AND u.data_root = sessions.data_root
                )"""
         )
 
@@ -276,6 +407,8 @@ class Database:
         session_id: str,
         agent_type: str,
         *,
+        provider: str | None = None,
+        data_root: str | None = None,
         project_path: str | None = None,
         git_branch: str | None = None,
         model: str | None = None,
@@ -292,24 +425,28 @@ class Database:
         last_prompt: str | None = None,
         summary: str | None = None,
     ) -> None:
+        data_root_value = data_root or ""
         existing = self._conn.execute(
             """SELECT 1
                FROM sessions
-               WHERE session_id = ? AND agent_type = ?""",
-            (session_id, agent_type),
+               WHERE session_id = ? AND agent_type = ? AND data_root = ?""",
+            (session_id, agent_type, data_root_value),
         ).fetchone()
 
         if existing is None:
             self._conn.execute(
                 """INSERT INTO sessions
-                       (session_id, agent_type, project_path, git_branch, model,
+                       (session_id, agent_type, provider, data_root,
+                        project_path, git_branch, model,
                         message_count, user_turns, input_tokens, output_tokens,
                         cache_read_tokens, cache_creation_tokens, estimated_cost_usd,
                         started_at, ended_at, first_prompt, last_prompt, summary)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     agent_type,
+                    provider or "",
+                    data_root_value,
                     project_path or "",
                     git_branch or "",
                     model or "",
@@ -332,6 +469,7 @@ class Database:
         updates: list[str] = []
         params: list[object] = []
         for field, value in (
+            ("provider", provider),
             ("project_path", project_path),
             ("git_branch", git_branch),
             ("model", model),
@@ -360,11 +498,38 @@ class Database:
         if not updates:
             return
 
-        params.extend((session_id, agent_type))
+        params.extend((session_id, agent_type, data_root_value))
         self._conn.execute(
             f"""UPDATE sessions
                 SET {", ".join(updates)}
-                WHERE session_id = ? AND agent_type = ?""",
+                WHERE session_id = ? AND agent_type = ? AND data_root = ?""",
+            params,
+        )
+
+    def delete_session(
+        self,
+        session_id: str,
+        agent_type: str,
+        *,
+        provider: str | None = None,
+        data_root: str | None = None,
+    ) -> None:
+        """Delete one derived session and its usage rows."""
+        data_root_value = data_root or ""
+        provider_clause = " AND provider = ?" if provider is not None else ""
+        params: tuple[object, ...] = (
+            (session_id, agent_type, data_root_value, provider or "")
+            if provider is not None
+            else (session_id, agent_type, data_root_value)
+        )
+        self._conn.execute(
+            f"""DELETE FROM session_usage
+                WHERE session_id = ? AND agent_type = ? AND data_root = ?{provider_clause}""",
+            params,
+        )
+        self._conn.execute(
+            f"""DELETE FROM sessions
+                WHERE session_id = ? AND agent_type = ? AND data_root = ?{provider_clause}""",
             params,
         )
 
@@ -373,11 +538,16 @@ class Database:
         session_id: str,
         agent_type: str,
         buckets: list[dict],
+        *,
+        provider: str | None = None,
+        data_root: str | None = None,
     ) -> None:
         """Replace one session's per-local-hour usage buckets."""
+        data_root_value = data_root or ""
         self._conn.execute(
-            "DELETE FROM session_usage WHERE session_id = ? AND agent_type = ?",
-            (session_id, agent_type),
+            """DELETE FROM session_usage
+               WHERE session_id = ? AND agent_type = ? AND data_root = ?""",
+            (session_id, agent_type, data_root_value),
         )
         if not buckets:
             return
@@ -406,6 +576,8 @@ class Database:
             rows.append((
                 session_id,
                 agent_type,
+                provider or "",
+                data_root_value,
                 bucket.get("usage_date") or "",
                 int(bucket.get("usage_hour") or 0),
                 bucket.get("project_path") or "",
@@ -422,11 +594,12 @@ class Database:
 
         self._conn.executemany(
             """INSERT INTO session_usage
-                   (session_id, agent_type, usage_date, usage_hour, project_path,
+                   (session_id, agent_type, provider, data_root,
+                    usage_date, usage_hour, project_path,
                     model, message_count, user_turns, input_tokens, output_tokens,
                     cache_read_tokens, cache_creation_tokens, estimated_cost_usd,
                     cost_is_explicit)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             rows,
         )
 
