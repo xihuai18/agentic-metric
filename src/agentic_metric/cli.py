@@ -7,7 +7,6 @@ from importlib.metadata import version as _pkg_version
 
 import typer
 from rich import box
-from rich.columns import Columns
 from rich.console import Console, Group
 from rich.panel import Panel
 from rich.table import Table
@@ -306,6 +305,7 @@ def _print_report(
     tot_turns = totals.get("user_turns") or 0
     tot_msgs = totals.get("message_count") or 0
     tot_requests = max(0, tot_msgs - tot_turns)
+    cache_pct = _cache_hit_rate(totals)
 
     # ─── Header panel (label + stats) ───
     header_text = Text()
@@ -321,13 +321,13 @@ def _print_report(
         Text(_fmt_cost(tot_cost, unknown=tot_cost_unknown), style=f"bold {C_YELLOW}"),
         delta_line if delta_line else Text(""),
     )
-    # Tokens / cache hit live in the heatmap panel now — the header only carries
-    # cost, sessions, and turns.
+    # Token split lives in the heatmap panel; cache share is elevated here too.
     stats = Table.grid(padding=(0, 3))
-    for _ in range(4):
+    for _ in range(5):
         stats.add_column(justify="left")
     stats.add_row(
         cost_cell,
+        _stat("Cache %", f"{cache_pct:.0f}%" if cache_pct >= 0 else "—", C_GREEN),
         _stat("Sessions", f"{tot_sess:,}", C_MAUVE),
         _stat("Requests", f"{tot_requests:,}", C_SKY),
         _stat("Turns", f"{tot_turns:,}", C_SKY),
@@ -359,26 +359,15 @@ def _print_report(
     if heatmap_renderable is not None:
         console.print(heatmap_renderable)
 
-    try:
-        term_width = console.size.width
-    except Exception:
-        term_width = 0
-
-    if term_width >= 160 and breakdown_tbl is not None and project_tbl is not None:
-        console.print(Columns([breakdown_tbl, project_tbl], expand=True, equal=False, padding=(0, 2)))
-    else:
-        if breakdown_tbl is not None:
-            console.print(breakdown_tbl)
-        if project_tbl is not None:
-            console.print(project_tbl)
+    if breakdown_tbl is not None:
+        console.print(breakdown_tbl)
+    if project_tbl is not None:
+        console.print(project_tbl)
 
     detail_tables = [t for t in (agent_tbl, periodic_tbl) if t is not None]
     if detail_tables:
-        if term_width >= 160 and len(detail_tables) == 2:
-            console.print(Columns(detail_tables, expand=True, equal=False, padding=(0, 2)))
-        else:
-            for t in detail_tables:
-                console.print(t)
+        for t in detail_tables:
+            console.print(t)
 
     console.print()
 
@@ -512,7 +501,11 @@ def _top_projects_block(
         line = Text(" ")
         line.append(label, style=C_MUTED)
         line.append("  ")
-        line.append(_short_path(p["project_path"], max_len=44), style=C_BLUE)
+        try:
+            path_len = 22 if console.size.width < 100 else 44
+        except Exception:
+            path_len = 44
+        line.append(_short_path(p["project_path"], max_len=path_len), style=C_BLUE)
         line.append(
             f" · {_fmt_cost(p['estimated_cost_usd'], unknown=unknown)}",
             style=f"bold {C_YELLOW}" if i == 0 else C_YELLOW,
@@ -541,16 +534,16 @@ def _build_by_agent_table(by_agent: list[dict]) -> Table | None:
         title_style=f"bold {C_TEXT}",
         title_justify="left",
     )
-    tbl.add_column("Agent", style=C_MAUVE)
-    tbl.add_column("Provider", style=C_SKY)
-    tbl.add_column("Root", style=C_MUTED, overflow="fold", max_width=34)
-    tbl.add_column("Sessions", justify="right", style=C_TEXT)
-    tbl.add_column("Turns", justify="right", style=C_TEXT)
-    tbl.add_column("Input", justify="right", style=C_TEAL)
-    tbl.add_column("Output", justify="right", style=C_TEAL)
-    tbl.add_column("Cache", justify="right", style=C_GREEN)
-    tbl.add_column("Cache %", justify="right", style=C_GREEN)
-    tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}")
+    tbl.add_column("Agent", style=C_MAUVE, no_wrap=True)
+    tbl.add_column("Provider", style=C_SKY, no_wrap=True)
+    tbl.add_column("Root", style=C_MUTED, overflow="ellipsis", no_wrap=True, max_width=42)
+    tbl.add_column("Sessions", justify="right", style=C_TEXT, no_wrap=True)
+    tbl.add_column("Turns", justify="right", style=C_TEXT, no_wrap=True)
+    tbl.add_column("Cache %", justify="right", style=f"bold {C_GREEN}", no_wrap=True, min_width=7)
+    tbl.add_column("Input", justify="right", style=C_TEAL, no_wrap=True)
+    tbl.add_column("Output", justify="right", style=C_TEAL, no_wrap=True)
+    tbl.add_column("Cache", justify="right", style=C_GREEN, no_wrap=True)
+    tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}", no_wrap=True)
     for r in by_agent:
         cp = _cache_hit_rate(r)
         tbl.add_row(
@@ -559,10 +552,10 @@ def _build_by_agent_table(by_agent: list[dict]) -> Table | None:
             _short_path(r.get("data_root") or "—", max_len=34),
             f"{r['session_count']:,}",
             f"{r['user_turns']:,}",
+            f"{cp:.0f}%" if cp >= 0 else "—",
             _fmt_tokens(r.get("input_tokens") or 0),
             _fmt_tokens(r.get("output_tokens") or 0),
             _fmt_tokens(_cache_tokens(r)),
-            f"{cp:.0f}%" if cp >= 0 else "—",
             _fmt_cost(r.get("estimated_cost_usd"), unknown=_has_unknown_cost(r)),
         )
     return tbl
@@ -582,15 +575,16 @@ def _build_by_agent_model_table(rows: list[dict]) -> Table | None:
         title_style=f"bold {C_TEXT}",
         title_justify="left",
     )
-    tbl.add_column("Agent", style=C_MAUVE)
-    tbl.add_column("Provider", style=C_SKY)
-    tbl.add_column("Root", style=C_MUTED, overflow="fold", max_width=28)
-    tbl.add_column("Model", style=C_SKY)
-    tbl.add_column("Sessions", justify="right", style=C_TEXT)
-    tbl.add_column("Input", justify="right", style=C_TEAL)
-    tbl.add_column("Output", justify="right", style=C_TEAL)
-    tbl.add_column("Cache", justify="right", style=C_GREEN)
-    tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}")
+    tbl.add_column("Agent", style=C_MAUVE, no_wrap=True)
+    tbl.add_column("Provider", style=C_SKY, no_wrap=True)
+    tbl.add_column("Root", style=C_MUTED, overflow="ellipsis", no_wrap=True, max_width=36)
+    tbl.add_column("Model", style=C_SKY, overflow="ellipsis", no_wrap=True, max_width=32)
+    tbl.add_column("Sessions", justify="right", style=C_TEXT, no_wrap=True)
+    tbl.add_column("Cache %", justify="right", style=f"bold {C_GREEN}", no_wrap=True, min_width=7)
+    tbl.add_column("Input", justify="right", style=C_TEAL, no_wrap=True)
+    tbl.add_column("Output", justify="right", style=C_TEAL, no_wrap=True)
+    tbl.add_column("Cache", justify="right", style=C_GREEN, no_wrap=True)
+    tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}", no_wrap=True)
     current_group = None
     for r in nonzero:
         group = (
@@ -603,12 +597,14 @@ def _build_by_agent_model_table(rows: list[dict]) -> Table | None:
         model_display = r["model"]
         if model_display == "Unknown" and r.get("raw_model"):
             model_display = f"Unknown: {r['raw_model']}"
+        cp = _cache_hit_rate(r)
         tbl.add_row(
             r["agent_type"] if show_group else "",
             (r.get("provider") or "—") if show_group else "",
             _short_path(r.get("data_root") or "—", max_len=28) if show_group else "",
             model_display,
             f"{r['session_count']:,}",
+            f"{cp:.0f}%" if cp >= 0 else "—",
             _fmt_tokens(r.get("input_tokens") or 0),
             _fmt_tokens(r.get("output_tokens") or 0),
             _fmt_tokens(_cache_tokens(r)),
@@ -631,12 +627,12 @@ def _build_top_projects_table(rows: list[dict]) -> Table | None:
         title_style=f"bold {C_TEXT}",
         title_justify="left",
     )
-    tbl.add_column("Project", style=C_BLUE, overflow="fold", max_width=48)
-    tbl.add_column("Sessions", justify="right", style=C_TEXT)
-    tbl.add_column("Input", justify="right", style=C_TEAL)
-    tbl.add_column("Output", justify="right", style=C_TEAL)
-    tbl.add_column("Cache", justify="right", style=C_GREEN)
-    tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}")
+    tbl.add_column("Project", style=C_BLUE, overflow="ellipsis", no_wrap=True, max_width=72)
+    tbl.add_column("Sessions", justify="right", style=C_TEXT, no_wrap=True)
+    tbl.add_column("Input", justify="right", style=C_TEAL, no_wrap=True)
+    tbl.add_column("Output", justify="right", style=C_TEAL, no_wrap=True)
+    tbl.add_column("Cache", justify="right", style=C_GREEN, no_wrap=True)
+    tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}", no_wrap=True)
     for r in nonzero:
         path = _shorten_home(r["project_path"] or "(unspecified)")
         tbl.add_row(
@@ -674,10 +670,11 @@ def _build_periodic_table(periodic: list[dict], focus_kind: str | None) -> Table
         title_style=f"bold {C_TEXT}",
         title_justify="left",
     )
-    tbl.add_column(bucket_col, style=C_BLUE)
-    tbl.add_column("Sessions", justify="right", style=C_TEXT)
-    tbl.add_column("Tokens", justify="right", style=C_TEAL)
-    tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}")
+    tbl.add_column(bucket_col, style=C_BLUE, no_wrap=True)
+    tbl.add_column("Sessions", justify="right", style=C_TEXT, no_wrap=True)
+    tbl.add_column("Cache %", justify="right", style=f"bold {C_GREEN}", no_wrap=True, min_width=7)
+    tbl.add_column("Tokens", justify="right", style=C_TEAL, no_wrap=True)
+    tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}", no_wrap=True)
     tbl.add_column("", justify="left", no_wrap=True)
     for b in nonzero:
         cost = b["cost"] or 0.0
@@ -691,9 +688,11 @@ def _build_periodic_table(periodic: list[dict], focus_kind: str | None) -> Table
         label_col = b["label"]
         if b.get("sublabel"):
             label_col = f"{label_col}  [{C_MUTED}]{b['sublabel']}[/{C_MUTED}]"
+        cp = _cache_hit_rate(b)
         tbl.add_row(
             label_col,
             f"{b['session_count']:,}",
+            f"{cp:.0f}%" if cp >= 0 else "—",
             _fmt_tokens(b.get("tokens") or 0),
             _fmt_cost(cost, unknown=unknown),
             bar,
@@ -713,7 +712,7 @@ def _stat(label: str, value: str, color: str) -> Group:
 def _token_summary_block(totals: dict) -> Group | None:
     """Two-line token block for the heatmap panel (CLI side).
 
-    Line 1: ``Token total N · cache hit P%``
+    Line 1: ``Token total N · Cache % P%``
     Line 2: ``Token input X · output Y · cache read Z · cache write W``
     """
     if not totals:
@@ -732,7 +731,7 @@ def _token_summary_block(totals: dict) -> Group | None:
     line_total.append("Token total ", style=C_MUTED)
     line_total.append(_fmt_tokens(total_t), style=C_TEAL)
     if cache_pct >= 0:
-        line_total.append("  ·  cache hit ", style=C_MUTED)
+        line_total.append("  ·  Cache % ", style=C_MUTED)
         line_total.append(f"{cache_pct:.0f}%", style=C_GREEN)
 
     line_split = Text()
@@ -931,7 +930,7 @@ def pricing_set(
         console.print(f"[bold {C_TEXT}]Examples:[/]")
         console.print(f"  [{C_MUTED}]agentic-metric pricing set deepseek-r2 -i 0.5 -o 2.0[/]")
         console.print(f"  [{C_MUTED}]agentic-metric pricing set claude-opus-4-7 -i 4.0 -o 20.0 -cr 0.4 -cw 5.0[/]")
-        raise typer.Exit()
+        raise typer.Exit(1)
 
     from .pricing import set_user_pricing
 
@@ -990,7 +989,7 @@ def pricing_long_context_set(
             f"  [{C_MUTED}]agentic-metric pricing long-context set gpt-5.5 "
             f"--threshold 512000 -i 12 -o 52 -cr 1.2 -cw 0[/]"
         )
-        raise typer.Exit()
+        raise typer.Exit(1)
 
     from .pricing import set_user_long_context_pricing
 
@@ -1072,7 +1071,7 @@ def pricing_cache_set(
         console.print(
             f"  [{C_MUTED}]agentic-metric pricing cache set claude-sonnet-4 --write-1h 6[/]"
         )
-        raise typer.Exit()
+        raise typer.Exit(1)
 
     from .pricing import set_user_cache_pricing
 

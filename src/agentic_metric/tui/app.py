@@ -17,6 +17,7 @@ from textual_plotext import PlotextPlot
 
 from ..collectors import CollectorRegistry, create_default_registry
 from ..config import AUTO_REFRESH_INTERVAL, DATA_SYNC_INTERVAL, LIVE_REFRESH_INTERVAL
+from ..formatting import cache_hit_rate as _cache_hit_rate
 from ..models import LiveSession
 from ..store.aggregator import (
     get_heatmap,
@@ -41,12 +42,24 @@ def _total_tokens(d: dict) -> int:
 
 
 def _cache_hit_pct(d: dict) -> int | None:
-    input_tokens = d.get("input_tokens") or 0
-    cache_tokens = (d.get("cache_read_tokens") or 0) + (d.get("cache_creation_tokens") or 0)
-    denom = input_tokens + cache_tokens
-    if denom <= 0:
+    pct = _cache_hit_rate(d)
+    if pct < 0:
         return None
-    return round((cache_tokens / denom) * 100)
+    return round(pct)
+
+
+def _summary_label(kind: str, range_label: str, offset: int) -> str:
+    """Return the compact label shown in a top summary card."""
+    if offset <= 0:
+        return kind.upper()
+    if offset == 1:
+        return range_label.upper()
+    unit = {
+        "today": "DAYS",
+        "week": "WEEKS",
+        "month": "MONTHS",
+    }.get(kind, "PERIODS")
+    return f"{offset} {unit} AGO"
 
 
 # Trend configuration per focused view (long-range chart only; the
@@ -200,7 +213,7 @@ class AgenticMetricApp(App):
         """Populate the heatmap strip for the currently focused view."""
         buckets = get_heatmap(self._db, self._focus, offset=self._offset)
 
-        _label, frm, to = resolve_range(self._focus, offset=self._offset)
+        label, frm, to = resolve_range(self._focus, offset=self._offset)
         totals = get_range_totals(self._db, frm, to)
         project_rows = get_range_by_project(self._db, frm, to, limit=3)
 
@@ -220,12 +233,11 @@ class AgenticMetricApp(App):
         title = titles.get(self._focus, "")
         if self._offset > 0:
             if self._focus == "today":
-                d = (datetime.now() - timedelta(days=self._offset)).date()
-                title = f"{d.strftime('%b')} {d.day} by hour"
+                title = f"{label} by hour"
             elif self._focus == "week":
-                title = f"{self._offset} week(s) ago by day"
+                title = f"{label} by day"
             elif self._focus == "month":
-                title = f"{self._offset} month(s) ago by week"
+                title = f"{label} by week"
         self.query_one("#heatmap-title", Static).update(
             Text.from_markup(f"[bold]{title}[/]")
         )
@@ -243,7 +255,8 @@ class AgenticMetricApp(App):
             ("week", "#cell-week"),
             ("month", "#cell-month"),
         ):
-            _, frm, to = resolve_range(kind)
+            cell_offset = self._offset if kind == self._focus else 0
+            label, frm, to = resolve_range(kind, offset=cell_offset)
             totals = get_range_totals(self._db, frm, to)
             cost = totals.get("estimated_cost_usd") or 0.0
             cost_unknown = _has_unknown_cost(totals)
@@ -255,7 +268,7 @@ class AgenticMetricApp(App):
             cache_pct = _cache_hit_pct(totals)
 
             # Previous period for delta comparison
-            _, p_frm, p_to = resolve_range(kind, offset=1)
+            _, p_frm, p_to = resolve_range(kind, offset=cell_offset + 1)
             prev = get_range_totals(self._db, p_frm, p_to)
             prev_cost = prev.get("estimated_cost_usd") or 0.0
             prev_cost_unknown = _has_unknown_cost(prev)
@@ -266,11 +279,12 @@ class AgenticMetricApp(App):
             sparkline = [v for _, v in trend]
 
             cell = self.query_one(cell_id, SummaryCell)
+            cell.label = _summary_label(kind, label, cell_offset)
             cell.update_data(
                 cost, sess, tokens,
-                active=active_count if kind == "today" else 0,
+                active=active_count if kind == "today" and cell_offset == 0 else 0,
                 prev_cost=prev_cost,
-                sparkline=sparkline,
+                sparkline=[] if cell_offset else sparkline,
                 cost_unknown=cost_unknown,
                 prev_cost_unknown=prev_cost_unknown,
                 turns=turns,
@@ -331,6 +345,8 @@ class AgenticMetricApp(App):
                 "input": 0,
                 "output": 0,
                 "cache": 0,
+                "cache_read": 0,
+                "cache_write": 0,
                 "unknown_cost_count": 0,
                 "providers": {},
             })
@@ -344,12 +360,16 @@ class AgenticMetricApp(App):
                 "input": 0,
                 "output": 0,
                 "cache": 0,
+                "cache_read": 0,
+                "cache_write": 0,
                 "unknown_cost_count": 0,
                 "models": [],
             })
 
             model_tokens = _total_tokens(r)
-            model_cache = (r.get("cache_read_tokens") or 0) + (r.get("cache_creation_tokens") or 0)
+            cache_read = r.get("cache_read_tokens") or 0
+            cache_write = r.get("cache_creation_tokens") or 0
+            model_cache = cache_read + cache_write
             cost = r["estimated_cost_usd"] or 0.0
             input_tokens = r.get("input_tokens") or 0
             output_tokens = r.get("output_tokens") or 0
@@ -361,6 +381,8 @@ class AgenticMetricApp(App):
                 bucket["input"] += input_tokens
                 bucket["output"] += output_tokens
                 bucket["cache"] += model_cache
+                bucket["cache_read"] += cache_read
+                bucket["cache_write"] += cache_write
                 bucket["unknown_cost_count"] += unknown_count
 
             g["models"].append({
@@ -372,6 +394,8 @@ class AgenticMetricApp(App):
                 "input": input_tokens,
                 "output": output_tokens,
                 "cache": model_cache,
+                "cache_read": cache_read,
+                "cache_write": cache_write,
             })
 
         groups = []
@@ -420,6 +444,8 @@ class AgenticMetricApp(App):
     def _on_live_update(self, sessions: list[LiveSession]) -> None:
         self._live_sessions = sessions
         # Only the TODAY cell's active count needs refreshing each second.
+        if self._focus == "today" and self._offset > 0:
+            return
         cell = self.query_one("#cell-today", SummaryCell)
         cell.update_data(
             cell.cost, cell.sessions, cell.tokens,
@@ -464,7 +490,7 @@ class AgenticMetricApp(App):
             ("month", "#cell-month"),
         ):
             self.query_one(cell_id, SummaryCell).set_focused(k == kind)
-        self._populate_chart_and_breakdown()
+        self._populate_all()
 
 
     def action_prev_view(self) -> None:
@@ -477,17 +503,17 @@ class AgenticMetricApp(App):
 
     def action_back_in_time(self) -> None:
         self._offset += 1
-        self._populate_chart_and_breakdown()
+        self._populate_all()
 
     def action_forward_in_time(self) -> None:
         if self._offset > 0:
             self._offset -= 1
-            self._populate_chart_and_breakdown()
+            self._populate_all()
 
     def action_reset_offset(self) -> None:
         if self._offset != 0:
             self._offset = 0
-            self._populate_chart_and_breakdown()
+            self._populate_all()
 
     def action_refresh_all(self) -> None:
         self.notify("Syncing…")
@@ -549,7 +575,7 @@ class AgenticMetricApp(App):
         ]
         cache_hit = _cache_hit_pct(totals)
         if cache_hit is not None:
-            stats.append(f"Cache hit {cache_hit}%")
+            stats.append(f"Cache % {cache_hit}%")
         lines.append(" | ".join(stats))
 
         token_parts = [

@@ -815,6 +815,14 @@ def get_heatmap(
             + (r["cache_creation_tokens"] or 0)
         )
 
+    def _token_fields(r) -> dict:
+        return {
+            "input_tokens": (r["input_tokens"] if r else 0),
+            "output_tokens": (r["output_tokens"] if r else 0),
+            "cache_read_tokens": (r["cache_read_tokens"] if r else 0),
+            "cache_creation_tokens": (r["cache_creation_tokens"] if r else 0),
+        }
+
     now = _dt.now()
     today = now.date()
     usage = _usage_source(db)
@@ -847,6 +855,7 @@ def get_heatmap(
                 "unknown_cost_count": (r["unknown_cost_count"] if r else 0),
                 "tokens": _sum_tokens_row(r) if r else 0,
                 "session_count": (r["session_count"] if r else 0),
+                **_token_fields(r),
             })
         return out
 
@@ -882,6 +891,7 @@ def get_heatmap(
                 "unknown_cost_count": (r["unknown_cost_count"] if r else 0),
                 "tokens": _sum_tokens_row(r) if r else 0,
                 "session_count": (r["session_count"] if r else 0),
+                **_token_fields(r),
             })
         return out
 
@@ -931,6 +941,7 @@ def get_heatmap(
                 "unknown_cost_count": row["unknown_cost_count"] if row else 0,
                 "tokens": _sum_tokens_row(row) if row else 0,
                 "session_count": row["session_count"] if row else 0,
+                **_token_fields(row),
             })
         return out
 

@@ -8,6 +8,7 @@ from rich.console import Group
 from rich.text import Text
 from textual.widgets import Static
 
+from ..formatting import cache_hit_rate as _cache_hit_rate
 from ..formatting import short_path as _short_path
 
 
@@ -76,6 +77,27 @@ def ts_to_local(ts: str) -> str:
         return dt.strftime("%m-%d %H:%M")
     except (ValueError, TypeError):
         return ts[:16]
+
+
+def _cache_hit_pct(row: dict) -> int | None:
+    input_tokens = row.get("input_tokens")
+    if input_tokens is None:
+        input_tokens = row.get("input") or 0
+
+    cache_read = row.get("cache_read_tokens")
+    if cache_read is None:
+        cache_read = row.get("cache_read")
+    if cache_read is None:
+        cache_read = row.get("cache") or 0
+
+    cache_write = row.get("cache_creation_tokens")
+    if cache_write is None:
+        cache_write = row.get("cache_write") or 0
+
+    denom = (input_tokens or 0) + (cache_read or 0) + (cache_write or 0)
+    if denom <= 0:
+        return None
+    return round((cache_read or 0) / denom * 100)
 
 
 # ── Widgets ───────────────────────────────────────────────────────────
@@ -169,6 +191,10 @@ class SummaryCell(Static):
             t.append("  ")
             t.append(delta[0], style=delta[1])
         t.append("\n")
+        if self.cache_pct is not None:
+            t.append("Cache % ", style="white")
+            t.append(f"{self.cache_pct}%", style="bold bright_green")
+            t.append("\n")
         # Sparkline (trend of the last N buckets for this focus)
         if self.sparkline:
             t.append(fmt_sparkline(self.sparkline), style="bright_cyan")
@@ -357,7 +383,7 @@ HourHeatmap = PeriodicHeatmap
 def _token_summary_block(totals: dict) -> Group | None:
     """Two-line token block used at the top of the heatmap panel.
 
-    Line 1: ``Token total N · cache hit P%``
+    Line 1: ``Token total N · Cache % P%``
     Line 2: ``Token input X · output Y · cache read Z · cache write W``
     """
     if not totals:
@@ -370,16 +396,14 @@ def _token_summary_block(totals: dict) -> Group | None:
     if total_t == 0:
         return None
 
-    # cache hit rate = cache-reuse / (cache-reuse + fresh input)
-    denom = input_t + cache_r + cache_w
-    cache_pct = round(cache_r / denom * 100) if denom > 0 else None
+    cache_pct = _cache_hit_rate(totals)
 
     line_total = Text("  ")
     line_total.append("Token total ", style="white")
     line_total.append(fmt_tokens(total_t), style="bright_cyan")
-    if cache_pct is not None:
-        line_total.append("  ·  cache hit ", style="white")
-        line_total.append(f"{cache_pct}%", style="bright_green")
+    if cache_pct >= 0:
+        line_total.append("  ·  Cache % ", style="white")
+        line_total.append(f"{cache_pct:.0f}%", style="bright_green")
 
     line_split = Text("  ")
     line_split.append("Token ", style="white")
@@ -489,10 +513,24 @@ class Breakdown(Static):
         return bar
 
     def _split(self, row: dict) -> str:
+        cache = row.get("cache") or 0
+        cache_read = row.get("cache_read")
+        cache_write = row.get("cache_write")
+        if cache_read is None and cache_write is None:
+            cache_read = cache
+            cache_write = 0
+        pct = _cache_hit_pct({
+            "input": row.get("input") or 0,
+            "cache_read": cache_read or 0,
+            "cache_write": cache_write or 0,
+        })
+        cache_part = fmt_tokens(cache)
+        if pct is not None:
+            cache_part = f"{cache_part} ({pct}%)"
         return (
             f"in {fmt_tokens(row.get('input') or 0)}  "
             f"out {fmt_tokens(row.get('output') or 0)}  "
-            f"cache {fmt_tokens(row.get('cache') or 0)}"
+            f"cache {cache_part}"
         )
 
     @staticmethod
@@ -656,6 +694,8 @@ class Breakdown(Static):
                         "input": sum(m.get("input") or 0 for m in hidden),
                         "output": sum(m.get("output") or 0 for m in hidden),
                         "cache": sum(m.get("cache") or 0 for m in hidden),
+                        "cache_read": sum(m.get("cache_read") or 0 for m in hidden),
+                        "cache_write": sum(m.get("cache_write") or 0 for m in hidden),
                     }
                     model_prefix = f"{child_prefix}└─ "
                     label = f"+{len(hidden)} more models"

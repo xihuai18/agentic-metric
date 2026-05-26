@@ -3,13 +3,20 @@
 import json
 import sqlite3
 import tempfile
+import asyncio
+from typer.testing import CliRunner
 from datetime import datetime
 from unittest.mock import patch
 
+from rich.console import Console
+
+from agentic_metric import cli as cli_module
+from agentic_metric.formatting import cache_hit_rate
 from agentic_metric.models import DailyTrend, LiveSession, TodayOverview
 from agentic_metric.store.database import Database
 from agentic_metric.store.aggregator import (
     get_daily_trends,
+    get_heatmap,
     get_range_by_project,
     get_range_by_agent_model,
     get_range_daily,
@@ -22,7 +29,9 @@ from agentic_metric.store.aggregator import (
     merge_live_into_trends,
 )
 from agentic_metric.formatting import fmt_cost as cli_fmt_cost
-from agentic_metric.tui.widgets import Breakdown, fmt_cost as tui_fmt_cost
+from agentic_metric.tui.app import _summary_label
+from agentic_metric.tui.widgets import Breakdown, SummaryCell, fmt_cost as tui_fmt_cost
+from agentic_metric.cli import app as cli_app
 
 
 def _make_db() -> Database:
@@ -961,6 +970,188 @@ def test_tui_breakdown_keeps_unknown_visible_before_model_limit():
     rendered = widget.render().plain
     assert "Unknown" in rendered
     assert "?" in rendered
+
+
+def test_report_renders_tables_sequentially_and_highlights_cache_pct(monkeypatch):
+    console = Console(record=True, width=220, color_system=None)
+    monkeypatch.setattr(cli_module, "console", console)
+
+    totals = {
+        "estimated_cost_usd": 12.0,
+        "session_count": 2,
+        "message_count": 10,
+        "user_turns": 4,
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "cache_read_tokens": 300,
+        "cache_creation_tokens": 0,
+    }
+    by_agent = [{
+        "agent_type": "codex",
+        "provider": "openai",
+        "data_root": "/tmp/codex",
+        "session_count": 2,
+        "user_turns": 4,
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "cache_read_tokens": 300,
+        "cache_creation_tokens": 0,
+        "estimated_cost_usd": 12.0,
+    }]
+    by_agent_model = [{
+        **by_agent[0],
+        "model": "gpt-5.5",
+        "raw_model": "gpt-5.5",
+    }]
+    by_project = [{
+        "project_path": "/tmp/a-very-long-project-name-that-should-not-force-a-second-report-column",
+        "session_count": 2,
+        "user_turns": 4,
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "cache_read_tokens": 300,
+        "cache_creation_tokens": 0,
+        "estimated_cost_usd": 12.0,
+    }]
+    periodic = [{
+        "label": "Mon",
+        "session_count": 2,
+        "tokens": 420,
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "cache_read_tokens": 300,
+        "cache_creation_tokens": 0,
+        "cost": 12.0,
+    }]
+
+    cli_module._print_report(
+        "This week",
+        "2026-05-25",
+        "2026-05-26",
+        totals,
+        by_agent,
+        by_agent_model,
+        by_project,
+        periodic,
+        "week",
+        full=True,
+    )
+
+    rendered = console.export_text()
+    assert "Cache %" in rendered
+    assert "75%" in rendered
+    assert not any("By provider" in line and "By day" in line for line in rendered.splitlines())
+
+
+def test_heatmap_buckets_carry_cache_fields_for_cache_pct():
+    db = _make_db()
+    today = datetime.now().strftime("%Y-%m-%d")
+    db.replace_session_usage(
+        "s1",
+        "codex",
+        [{
+            "usage_date": today,
+            "usage_hour": 10,
+            "project_path": "/tmp/project",
+            "model": "gpt-5.5",
+            "message_count": 2,
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "cache_read_tokens": 300,
+            "cache_creation_tokens": 0,
+            "estimated_cost_usd": 12.0,
+        }],
+    )
+    db.commit()
+
+    buckets = get_heatmap(db, "today")
+    bucket = buckets[10]
+
+    assert bucket["input_tokens"] == 100
+    assert bucket["cache_read_tokens"] == 300
+    assert cache_hit_rate(bucket) == 75.0
+    db.close()
+
+
+def test_tui_summary_and_breakdown_render_cache_pct():
+    cell = SummaryCell("TODAY")
+    cell.update_data(1.0, 2, 420, requests=6, turns=4, cache_pct=75)
+    assert "Cache % 75%" in cell.render().plain
+
+    widget = Breakdown()
+    widget._total_cost = 12.0
+    widget._groups = [{
+        "agent": "codex",
+        "cost": 12.0,
+        "unknown_cost_count": 0,
+        "input": 100,
+        "output": 20,
+        "cache": 300,
+        "cache_read": 300,
+        "cache_write": 0,
+        "providers": [],
+    }]
+
+    assert "cache 300 (75%)" in widget.render().plain
+
+
+def test_tui_summary_follows_focused_time_offset(monkeypatch):
+    from agentic_metric.tui.app import AgenticMetricApp
+
+    async def no_initial_sync(self):
+        return None
+
+    monkeypatch.setattr(AgenticMetricApp, "_initial_sync_worker", no_initial_sync)
+
+    async def run() -> None:
+        app = AgenticMetricApp()
+        async with app.run_test(headless=True, size=(120, 36)):
+            labels = lambda: [
+                app.query_one(sel, SummaryCell).label
+                for sel in ("#cell-today", "#cell-week", "#cell-month")
+            ]
+
+            assert labels() == ["TODAY", "WEEK", "MONTH"]
+
+            app.action_focus("week")
+            app.action_back_in_time()
+            assert labels() == ["TODAY", "LAST WEEK", "MONTH"]
+
+            app.action_forward_in_time()
+            assert labels() == ["TODAY", "WEEK", "MONTH"]
+
+            app.action_focus("today")
+            app.action_back_in_time()
+            assert labels() == ["YESTERDAY", "WEEK", "MONTH"]
+
+            app.action_reset_offset()
+            app.action_focus("month")
+            app.action_back_in_time()
+            assert labels() == ["TODAY", "WEEK", "LAST MONTH"]
+
+    asyncio.run(run())
+
+
+def test_tui_summary_labels_multi_period_offsets():
+    assert _summary_label("today", "Yesterday", 1) == "YESTERDAY"
+    assert _summary_label("today", "May 24", 2) == "2 DAYS AGO"
+    assert _summary_label("week", "Last week", 1) == "LAST WEEK"
+    assert _summary_label("week", "2 weeks ago", 2) == "2 WEEKS AGO"
+    assert _summary_label("month", "Last month", 1) == "LAST MONTH"
+    assert _summary_label("month", "Mar 2026", 2) == "2 MONTHS AGO"
+
+
+def test_pricing_set_commands_missing_args_exit_nonzero():
+    runner = CliRunner()
+
+    for args in (
+        ["pricing", "set"],
+        ["pricing", "long-context", "set"],
+        ["pricing", "cache", "set"],
+    ):
+        result = runner.invoke(cli_app, args)
+        assert result.exit_code == 1
+        assert "Usage:" in result.output
 
 
 def test_cost_format_shows_known_amount_plus_unknown_marker():
