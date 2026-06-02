@@ -150,14 +150,14 @@ agentic-metric pricing cache reset claude-sonnet-4                # 删除覆盖
 
 ## 内置模型定价
 
-价格为 USD / 1M tokens。数据来源为官方定价页面(2026-04-25 核实)。
+价格为 USD / 1M tokens。数据来源为官方定价页面(2026-04-25 核实；Claude Opus 4.8 于 2026-06-02 核实)。
 
 <details>
 <summary>Anthropic Claude</summary>
 
 | 模型 | Input | Output | Cache Read | Cache Write |
 |------|------:|-------:|-----------:|------------:|
-| claude-opus-4-7 / 4-6 / 4-5 | $5.00 | $25.00 | $0.50 | $6.25 |
+| claude-opus-4-8 / 4-7 / 4-6 / 4-5 | $5.00 | $25.00 | $0.50 | $6.25 |
 | claude-opus-4-1 / 4 | $15.00 | $75.00 | $1.50 | $18.75 |
 | claude-sonnet-4-6 / 4-5 / 4 / 3-7 | $3.00 | $15.00 | $0.30 | $3.75 |
 | claude-haiku-4-5 | $1.00 | $5.00 | $0.10 | $1.25 |

@@ -163,14 +163,14 @@ database and rebuilds it from the original Claude Code and Codex session files;
 ## Builtin Model Pricing
 
 Prices are USD per 1M tokens. Verified against official pricing docs
-(2026-04-25).
+(2026-04-25; Claude Opus 4.8 on 2026-06-02).
 
 <details>
 <summary>Anthropic Claude</summary>
 
 | Model | Input | Output | Cache Read | Cache Write |
 |-------|------:|-------:|-----------:|------------:|
-| claude-opus-4-7 / 4-6 / 4-5 | $5.00 | $25.00 | $0.50 | $6.25 |
+| claude-opus-4-8 / 4-7 / 4-6 / 4-5 | $5.00 | $25.00 | $0.50 | $6.25 |
 | claude-opus-4-1 / 4 | $15.00 | $75.00 | $1.50 | $18.75 |
 | claude-sonnet-4-6 / 4-5 / 4 / 3-7 | $3.00 | $15.00 | $0.30 | $3.75 |
 | claude-haiku-4-5 | $1.00 | $5.00 | $0.10 | $1.25 |

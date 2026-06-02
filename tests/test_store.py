@@ -1095,13 +1095,18 @@ def test_tui_summary_and_breakdown_render_cache_pct():
     assert "cache 300 (75%)" in widget.render().plain
 
 
-def test_tui_summary_follows_focused_time_offset(monkeypatch):
+def test_tui_summary_follows_focused_time_offset(monkeypatch, tmp_path):
     from agentic_metric.tui.app import AgenticMetricApp
+    from agentic_metric.store.database import Database as RealDatabase
 
     async def no_initial_sync(self):
         return None
 
     monkeypatch.setattr(AgenticMetricApp, "_initial_sync_worker", no_initial_sync)
+    monkeypatch.setattr(
+        "agentic_metric.tui.app.Database",
+        lambda *args, **kwargs: RealDatabase(db_path=str(tmp_path / "data.db")),
+    )
 
     async def run() -> None:
         app = AgenticMetricApp()
