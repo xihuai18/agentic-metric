@@ -1043,6 +1043,44 @@ def test_report_renders_tables_sequentially_and_highlights_cache_pct(monkeypatch
     assert not any("By provider" in line and "By day" in line for line in rendered.splitlines())
 
 
+def test_unknown_models_note_lists_distinct_models():
+    note = cli_module._build_unknown_models_note([
+        {"model": "Unknown", "raw_model": "gpt-6", "unknown_cost_count": 2},
+        {"model": "claude-opus-4-8", "unknown_cost_count": 0},
+        {"model": "Unknown", "raw_model": "gpt-6", "unknown_cost_count": 1},
+    ])
+    assert note is not None
+    from rich.console import Console as _C
+    import io as _io
+    buf = _io.StringIO()
+    _C(file=buf, width=100, no_color=True).print(note)
+    text = buf.getvalue()
+    assert "Unknown models" in text
+    assert text.count("gpt-6") == 1  # deduplicated
+    assert "pricing set" in text
+    # No unknowns → no note
+    assert cli_module._build_unknown_models_note([{"model": "gpt-5.5", "unknown_cost_count": 0}]) is None
+
+
+def test_breakdown_table_rolls_up_models_past_limit():
+    rows = [
+        {"agent_type": "codex", "provider": "openai", "data_root": "~/.codex",
+         "model": f"m{i}", "raw_model": f"m{i}", "session_count": 1,
+         "input_tokens": 10, "output_tokens": 5, "cache_read_tokens": 0,
+         "cache_creation_tokens": 0, "estimated_cost_usd": float(10 - i),
+         "unknown_cost_count": 0}
+        for i in range(5)
+    ]
+    tbl = cli_module._build_by_agent_model_table(rows, limit=2)
+    from rich.console import Console as _C
+    import io as _io
+    buf = _io.StringIO()
+    _C(file=buf, width=120, no_color=True).print(tbl)
+    text = buf.getvalue()
+    assert "+3 more models" in text
+
+
+
 def test_heatmap_buckets_carry_cache_fields_for_cache_pct():
     db = _make_db()
     today = datetime.now().strftime("%Y-%m-%d")

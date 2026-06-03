@@ -129,7 +129,17 @@ def get_codex_roots() -> list[CollectorRoot]:
 def get_claude_code_roots() -> list[CollectorRoot]:
     return _collector_roots("claude_code", CLAUDE_HOME)
 
-# Refresh intervals (seconds)
-LIVE_REFRESH_INTERVAL = 1  # running sessions
-DATA_SYNC_INTERVAL = 300  # history sync to sqlite
-AUTO_REFRESH_INTERVAL = 30  # TUI auto-refresh mode (toggled with R)
+# Refresh intervals (seconds). Defaults can be overridden in CONFIG_FILE:
+#   { "intervals": { "live_refresh": 1, "data_sync": 300, "auto_refresh": 30 } }
+def _interval(name: str, default: int) -> int:
+    section = _load_config().get("intervals")
+    if isinstance(section, dict):
+        val = section.get(name)
+        if isinstance(val, (int, float)) and val > 0:
+            return int(val)
+    return default
+
+
+LIVE_REFRESH_INTERVAL = _interval("live_refresh", 1)  # running sessions
+DATA_SYNC_INTERVAL = _interval("data_sync", 300)  # history sync to sqlite
+AUTO_REFRESH_INTERVAL = _interval("auto_refresh", 30)  # TUI auto-refresh mode (toggled with R)

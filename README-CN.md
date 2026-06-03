@@ -85,7 +85,9 @@ agentic-metric pricing               # 管理模型定价
 | `--month` | 本月用量 |
 | `--range FROM:TO` | 自定义日期区间,如 `2026-04-01:2026-04-23` |
 | `--full` | 显示额外明细表(按 agent 汇总、时间粒度分解) |
-| `--limit N` / `-n N` | 明细表行数(1–25,默认 8) |
+| `--limit N` / `-n N` | 明细表与 provider 内模型分解的行数(1–25,默认 8) |
+| `--json` | 输出机器可读 JSON(便于脚本 / 管道),不渲染表格 |
+| `--watch N` / `-w N` | 每 N 秒刷新报告(Ctrl-C 退出) |
 | `--no-sync` | 跳过查询前的 collector 同步 |
 
 `report` 会输出:总成本 / sessions / 用户轮次 / tokens / 缓存命中率的汇总条,
@@ -145,8 +147,15 @@ agentic-metric pricing cache reset claude-sonnet-4                # 删除覆盖
 | `.` | 回到"现在"(清空 offset) |
 | `t` / `w` / `m` | 直接聚焦 Today / Week / Month |
 | `r` | 手动刷新一次 |
-| `R` | 切换自动刷新(每 30 秒) |
+| `R` | 切换自动刷新(开启时暂停慢速周期 sync) |
+| `p` | 打开只读价格视图(高亮当前范围内的未知模型) |
 | `q` | 退出 |
+
+刷新间隔可在配置文件(`$DATA/agentic_metric/config.json`)覆盖:
+
+```json
+{ "intervals": { "live_refresh": 1, "data_sync": 300, "auto_refresh": 30 } }
+```
 
 ## 内置模型定价
 

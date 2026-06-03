@@ -30,6 +30,7 @@ from ..store.aggregator import (
 )
 from ..store.database import Database
 from .widgets import Breakdown, PeriodicHeatmap, SummaryCell, fmt_cost, fmt_tokens
+from .pricing_screen import PricingScreen
 
 
 def _total_tokens(d: dict) -> int:
@@ -131,6 +132,7 @@ class AgenticMetricApp(App):
         Binding("w", "focus('week')", "Week", show=False),
         Binding("m", "focus('month')", "Month", show=False),
         Binding("r", "refresh_all", "Refresh"),
+        Binding("p", "show_pricing", "Pricing"),
         # Two bindings on the same key; `check_action` picks whichever
         # matches the current state so the footer always shows one label.
         # The "off" variant (visible while auto-refresh is running) is
@@ -152,6 +154,7 @@ class AgenticMetricApp(App):
         self._focus: str = "today"
         self._offset: int = 0  # 0 = current period; N = N units in the past
         self._auto_refresh_timer: Timer | None = None
+        self._sync_timer: Timer | None = None
 
     # ── Layout ────────────────────────────────────────────────────────
 
@@ -174,9 +177,10 @@ class AgenticMetricApp(App):
 
     def on_mount(self) -> None:
         self._today_sessions = get_today_sessions(self._db)
+        self.sub_title = "syncing…"
         self._populate_all()
         self.set_interval(LIVE_REFRESH_INTERVAL, self._tick_live)
-        self.set_interval(DATA_SYNC_INTERVAL, self._tick_sync)
+        self._sync_timer = self.set_interval(DATA_SYNC_INTERVAL, self._tick_sync)
         self.run_worker(self._initial_sync_worker, thread=True, exclusive=True, group="sync")
 
     async def _initial_sync_worker(self) -> None:
@@ -475,6 +479,7 @@ class AgenticMetricApp(App):
 
     def _on_sync_done(self) -> None:
         self._today_sessions = get_today_sessions(self._db)
+        self.sub_title = f"synced {datetime.now().strftime('%H:%M:%S')}"
         self._populate_all()
 
     # ── Actions ───────────────────────────────────────────────────────
@@ -519,10 +524,25 @@ class AgenticMetricApp(App):
         self.notify("Syncing…")
         self.run_worker(self._sync_worker, thread=True, exclusive=True, group="sync")
 
+    def action_show_pricing(self) -> None:
+        """Open the read-only pricing view, flagging unknown models in range."""
+        _label, frm, to = resolve_range(self._focus, offset=self._offset)
+        rows = get_range_by_agent_model(self._db, frm, to)
+        unknown: list[str] = []
+        for r in rows:
+            if not _has_unknown_cost(r):
+                continue
+            name = (r.get("raw_model") or r.get("model") or "").strip()
+            if name and name not in unknown:
+                unknown.append(name)
+        self.push_screen(PricingScreen(unknown))
+
     def action_auto_refresh_on(self) -> None:
-        """Enable the fast auto-sync timer (runs in addition to the 5-min one)."""
+        """Enable fast auto-sync and pause the slow periodic one (single loop)."""
         if self._auto_refresh_timer is not None:
             return
+        if self._sync_timer is not None:
+            self._sync_timer.pause()
         self._auto_refresh_timer = self.set_interval(
             AUTO_REFRESH_INTERVAL, self._tick_sync
         )
@@ -531,11 +551,13 @@ class AgenticMetricApp(App):
         self.refresh_bindings()
 
     def action_auto_refresh_off(self) -> None:
-        """Stop the fast auto-sync timer."""
+        """Stop the fast auto-sync timer and resume the slow periodic one."""
         if self._auto_refresh_timer is None:
             return
         self._auto_refresh_timer.stop()
         self._auto_refresh_timer = None
+        if self._sync_timer is not None:
+            self._sync_timer.resume()
         self.notify("Auto-refresh off")
         self.refresh_bindings()
 

@@ -129,3 +129,23 @@ SummaryCell.-focused {
 #breakdown-body {
     height: 1fr;
 }
+
+/* ─── Pricing modal (press p) ─── */
+
+PricingScreen {
+    align: center middle;
+}
+
+#pricing-box {
+    width: 90%;
+    max-width: 110;
+    height: 85%;
+    background: $surface;
+    border: round $warning;
+    padding: 1 2;
+}
+
+#pricing-content {
+    width: auto;
+    height: auto;
+}

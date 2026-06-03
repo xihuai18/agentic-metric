@@ -86,7 +86,9 @@ agentic-metric pricing               # Manage model pricing
 | `--month` | This month |
 | `--range FROM:TO` | Custom date range, e.g. `2026-04-01:2026-04-23` |
 | `--full` | Show extra drill-down tables (by agent, periodic breakdown) |
-| `--limit N` / `-n N` | Rows in driver tables (1–25, default 8) |
+| `--limit N` / `-n N` | Rows in driver tables and per-provider model breakdown (1–25, default 8) |
+| `--json` | Output machine-readable JSON instead of tables (for scripts / pipes) |
+| `--watch N` / `-w N` | Refresh the report every N seconds (Ctrl-C to stop) |
 | `--no-sync` | Skip syncing collectors before querying |
 
 `report` shows a header with total cost / sessions / turns / tokens / cache-hit
@@ -157,8 +159,15 @@ database and rebuilds it from the original Claude Code and Codex session files;
 | `.` | Jump back to "now" (reset offset) |
 | `t` / `w` / `m` | Focus Today / Week / Month directly |
 | `r` | Refresh data once |
-| `R` | Toggle auto-refresh (every 30s) |
+| `R` | Toggle auto-refresh (pauses the slow periodic sync while active) |
+| `p` | Open the read-only pricing view (flags unknown models in range) |
 | `q` | Quit |
+
+Refresh intervals can be overridden in the config file (`$DATA/agentic_metric/config.json`):
+
+```json
+{ "intervals": { "live_refresh": 1, "data_sync": 300, "auto_refresh": 30 } }
+```
 
 ## Builtin Model Pricing
 

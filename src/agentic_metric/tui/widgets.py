@@ -538,10 +538,19 @@ class Breakdown(Static):
         used = sum(len(text) for text, _style in parts)
         for text, style in parts:
             t.append(text, style=style)
-        if used < width:
-            t.append(" " * (width - used), style="white")
-        else:
+        gap = width - used
+        if gap <= 0:
             t.append(" ", style="white")
+            return
+        # Fill the space between the label and the right-aligned value block
+        # with a faint dot leader so wide panels stay justified instead of
+        # leaving a big blank gap.
+        if gap >= 4:
+            t.append(" ", style="white")
+            t.append("·" * (gap - 2), style="grey35")
+            t.append(" ", style="white")
+        else:
+            t.append(" " * gap, style="white")
 
     def _append_header(self, t: Text, label_width: int) -> None:
         """Column-title row so IN / OUT / CACHED stay labeled."""
@@ -597,10 +606,10 @@ class Breakdown(Static):
             width = self.content_size.width
         except Exception:
             width = 120
-        # Reserve a fixed block for the value columns so labels truncate
-        # instead of wrapping the value columns onto a second line. Cap the
-        # label column so values stay close to their labels on wide panels.
-        label_width = max(24, min(width - self._VALUE_W, 52))
+        # Right-align the value block to the panel edge (labels left, values
+        # right — justified across the full width) and truncate labels so the
+        # value columns never wrap onto a second line.
+        label_width = max(24, width - self._VALUE_W)
         t = Text()
         self._append_header(t, label_width)
         for g in self._groups:

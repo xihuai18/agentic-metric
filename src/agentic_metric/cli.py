@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+import json
+import time
 from importlib.metadata import version as _pkg_version
 
 import typer
@@ -171,7 +173,14 @@ def report(
     ),
     limit: int = typer.Option(
         8, "--limit", "-n", min=1, max=25,
-        help="Rows shown in the Top projects table.",
+        help="Rows shown in Top projects and per-provider model breakdown.",
+    ),
+    json_: bool = typer.Option(
+        False, "--json", help="Output machine-readable JSON instead of tables."
+    ),
+    watch: float = typer.Option(
+        0, "--watch", "-w", min=0,
+        help="Refresh every N seconds (0 disables). Press Ctrl-C to stop.",
     ),
 ) -> None:
     """Show a usage report for a time range."""
@@ -205,67 +214,107 @@ def report(
         else:
             label, frm, to = aggregator.resolve_range("today")
 
-    db = Database()
-    if db.pricing_changed and no_sync:
-        console.print(f"[{C_YELLOW}]Pricing changed; syncing history to refresh event-level costs.[/]")
-    if db.pricing_changed or not no_sync:
-        registry = create_default_registry()
-        registry.sync_all(db)
-        db.commit()
+    def _once() -> None:
+        db = Database()
+        if db.pricing_changed and no_sync:
+            console.print(f"[{C_YELLOW}]Pricing changed; syncing history to refresh event-level costs.[/]")
+        if db.pricing_changed or not no_sync:
+            registry = create_default_registry()
+            registry.sync_all(db)
+            db.commit()
 
-    totals = aggregator.get_range_totals(db, frm, to)
-    by_agent = aggregator.get_range_by_agent(db, frm, to)
-    by_agent_model = aggregator.get_range_by_agent_model(db, frm, to)
-    by_project = aggregator.get_range_by_project(db, frm, to, limit=limit)
-    # Periodic breakdown (hourly/daily/weekly) — only when the range
-    # corresponds to a named focus.
-    focus_kind = None
-    if not range_:
-        focus_kind = "week" if week else ("month" if month else "today")
-    periodic = aggregator.get_heatmap(db, focus_kind) if focus_kind else []
+        totals = aggregator.get_range_totals(db, frm, to)
+        by_agent = aggregator.get_range_by_agent(db, frm, to)
+        by_agent_model = aggregator.get_range_by_agent_model(db, frm, to)
+        by_project = aggregator.get_range_by_project(db, frm, to, limit=limit)
+        # Periodic breakdown (hourly/daily/weekly) — only when the range
+        # corresponds to a named focus.
+        focus_kind = None
+        if not range_:
+            focus_kind = "week" if week else ("month" if month else "today")
+        periodic = aggregator.get_heatmap(db, focus_kind) if focus_kind else []
 
-    # Previous period totals for delta comparison (cost cell arrow).
-    prev_totals = None
-    if focus_kind:
-        _, p_frm, p_to = aggregator.resolve_range(focus_kind, offset=1)
-        prev_totals = aggregator.get_range_totals(db, p_frm, p_to)
+        # Previous period totals for delta comparison (cost cell arrow).
+        prev_totals = None
+        if focus_kind:
+            _, p_frm, p_to = aggregator.resolve_range(focus_kind, offset=1)
+            prev_totals = aggregator.get_range_totals(db, p_frm, p_to)
 
-    db.close()
+        db.close()
 
-    _print_report(
-        label, frm, to, totals, by_agent, by_agent_model, by_project,
-        periodic, focus_kind, prev_totals, full=full,
-    )
+        if json_:
+            _emit_report_json(label, frm, to, totals, by_agent, by_agent_model, by_project)
+        else:
+            _print_report(
+                label, frm, to, totals, by_agent, by_agent_model, by_project,
+                periodic, focus_kind, prev_totals, full=full, limit=limit,
+            )
+
+    if watch and watch > 0 and not json_:
+        try:
+            while True:
+                console.clear()
+                _once()
+                console.print(f"[{C_MUTED}]Refreshing every {watch:g}s — Ctrl-C to stop.[/]")
+                time.sleep(watch)
+        except KeyboardInterrupt:
+            console.print(f"\n[{C_MUTED}]Stopped.[/]")
+    else:
+        _once()
+
+
+def _emit_report_json(
+    label: str, frm: str, to: str,
+    totals: dict, by_agent: list[dict],
+    by_agent_model: list[dict], by_project: list[dict],
+) -> None:
+    """Print the report as machine-readable JSON (for scripts / pipes)."""
+    payload = {
+        "label": label,
+        "from": frm,
+        "to": to,
+        "totals": dict(totals),
+        "by_agent": [dict(r) for r in by_agent],
+        "by_agent_model": [dict(r) for r in by_agent_model],
+        "by_project": [dict(r) for r in by_project],
+    }
+    print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
 
 
 @app.command("today")
 def today_cmd(
     no_sync: bool = typer.Option(False, "--no-sync", help="Skip syncing collectors before querying."),
     full: bool = typer.Option(False, "--full", help="Show the full drill-down with per-provider and per-time tables."),
-    limit: int = typer.Option(8, "--limit", "-n", min=1, max=25, help="Rows shown in the Top projects table."),
+    limit: int = typer.Option(8, "--limit", "-n", min=1, max=25, help="Rows shown in Top projects and model breakdown."),
+    json_: bool = typer.Option(False, "--json", help="Output machine-readable JSON instead of tables."),
+    watch: float = typer.Option(0, "--watch", "-w", min=0, help="Refresh every N seconds (0 disables)."),
 ) -> None:
     """Shortcut for ``report --today``."""
-    report(today_=True, week=False, month=False, range_=None, no_sync=no_sync, full=full, limit=limit)
+    report(today_=True, week=False, month=False, range_=None, no_sync=no_sync, full=full, limit=limit, json_=json_, watch=watch)
 
 
 @app.command("week")
 def week_cmd(
     no_sync: bool = typer.Option(False, "--no-sync", help="Skip syncing collectors before querying."),
     full: bool = typer.Option(False, "--full", help="Show the full drill-down with per-provider and per-time tables."),
-    limit: int = typer.Option(8, "--limit", "-n", min=1, max=25, help="Rows shown in the Top projects table."),
+    limit: int = typer.Option(8, "--limit", "-n", min=1, max=25, help="Rows shown in Top projects and model breakdown."),
+    json_: bool = typer.Option(False, "--json", help="Output machine-readable JSON instead of tables."),
+    watch: float = typer.Option(0, "--watch", "-w", min=0, help="Refresh every N seconds (0 disables)."),
 ) -> None:
     """Shortcut for ``report --week``."""
-    report(today_=False, week=True, month=False, range_=None, no_sync=no_sync, full=full, limit=limit)
+    report(today_=False, week=True, month=False, range_=None, no_sync=no_sync, full=full, limit=limit, json_=json_, watch=watch)
 
 
 @app.command("month")
 def month_cmd(
     no_sync: bool = typer.Option(False, "--no-sync", help="Skip syncing collectors before querying."),
     full: bool = typer.Option(False, "--full", help="Show the full drill-down with per-provider and per-time tables."),
-    limit: int = typer.Option(8, "--limit", "-n", min=1, max=25, help="Rows shown in the Top projects table."),
+    limit: int = typer.Option(8, "--limit", "-n", min=1, max=25, help="Rows shown in Top projects and model breakdown."),
+    json_: bool = typer.Option(False, "--json", help="Output machine-readable JSON instead of tables."),
+    watch: float = typer.Option(0, "--watch", "-w", min=0, help="Refresh every N seconds (0 disables)."),
 ) -> None:
     """Shortcut for ``report --month``."""
-    report(today_=False, week=False, month=True, range_=None, no_sync=no_sync, full=full, limit=limit)
+    report(today_=False, week=False, month=True, range_=None, no_sync=no_sync, full=full, limit=limit, json_=json_, watch=watch)
 
 
 @app.command("history")
@@ -273,7 +322,9 @@ def history_cmd(
     days: int = typer.Option(14, "--days", "-d", min=1, max=365, help="Number of days to include."),
     no_sync: bool = typer.Option(False, "--no-sync", help="Skip syncing collectors before querying."),
     full: bool = typer.Option(False, "--full", help="Show the full drill-down with per-provider and per-time tables."),
-    limit: int = typer.Option(8, "--limit", "-n", min=1, max=25, help="Rows shown in the Top projects table."),
+    limit: int = typer.Option(8, "--limit", "-n", min=1, max=25, help="Rows shown in Top projects and model breakdown."),
+    json_: bool = typer.Option(False, "--json", help="Output machine-readable JSON instead of tables."),
+    watch: float = typer.Option(0, "--watch", "-w", min=0, help="Refresh every N seconds (0 disables)."),
 ) -> None:
     """Show a recent multi-day usage report."""
     today = datetime.now().date()
@@ -286,6 +337,8 @@ def history_cmd(
         no_sync=no_sync,
         full=full,
         limit=limit,
+        json_=json_,
+        watch=watch,
     )
 
 
@@ -298,6 +351,7 @@ def _print_report(
     prev_totals: dict | None = None,
     *,
     full: bool = False,
+    limit: int = 8,
 ) -> None:
     tot_cost = totals.get("estimated_cost_usd") or 0.0
     tot_cost_unknown = _has_unknown_cost(totals)
@@ -338,6 +392,7 @@ def _print_report(
         box=box.ROUNDED,
         border_style=C_SURFACE1,
         padding=(1, 2),
+        expand=False,
     )
 
     # ─── Heatmap strip (today/week/month scope) ───
@@ -348,7 +403,7 @@ def _print_report(
         )
 
     # ─── Table renderables ───
-    breakdown_tbl = _build_by_agent_model_table(by_agent_model)
+    breakdown_tbl = _build_by_agent_model_table(by_agent_model, limit=limit)
     project_tbl = _build_top_projects_table(by_project)
     agent_tbl = _build_by_agent_table(by_agent) if full else None
     periodic_tbl = _build_periodic_table(periodic, focus_kind) if full else None
@@ -369,7 +424,40 @@ def _print_report(
         for t in detail_tables:
             console.print(t)
 
+    unknown_note = _build_unknown_models_note(by_agent_model)
+    if unknown_note is not None:
+        console.print(unknown_note)
+
     console.print()
+
+
+def _build_unknown_models_note(by_agent_model: list[dict]) -> Group | None:
+    """Hint the user how to price models whose cost is shown as '?'."""
+    seen: list[str] = []
+    for r in by_agent_model:
+        if not _has_unknown_cost(r):
+            continue
+        name = (r.get("raw_model") or r.get("model") or "").strip()
+        if name and name not in seen:
+            seen.append(name)
+    if not seen:
+        return None
+
+    lines: list[Text] = [
+        Text.assemble(
+            ("Unknown models", f"bold {C_YELLOW}"),
+            (" — cost shown as ", C_MUTED),
+            ("?", f"bold {C_YELLOW}"),
+            (". Set pricing (USD per 1M tokens):", C_MUTED),
+        )
+    ]
+    for name in seen:
+        lines.append(Text.assemble(
+            ("  agentic-metric pricing set ", C_MUTED),
+            (name, C_MAUVE),
+            (" -i <input> -o <output>", C_MUTED),
+        ))
+    return Group(*lines)
 
 
 def _build_heatmap_panel(
@@ -561,7 +649,7 @@ def _build_by_agent_table(by_agent: list[dict]) -> Table | None:
     return tbl
 
 
-def _build_by_agent_model_table(rows: list[dict]) -> Table | None:
+def _build_by_agent_model_table(rows: list[dict], *, limit: int = 8) -> Table | None:
     nonzero = [r for r in rows if _has_cost_signal(r)]
     if not nonzero:
         return None
@@ -585,15 +673,19 @@ def _build_by_agent_model_table(rows: list[dict]) -> Table | None:
     tbl.add_column("Output", justify="right", style=C_TEAL, no_wrap=True)
     tbl.add_column("Cache", justify="right", style=C_GREEN, no_wrap=True)
     tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}", no_wrap=True)
-    current_group = None
+
+    # Group consecutive rows by (agent, provider, root) and cap the model
+    # rows per group at ``limit``; the tail rolls up into "+N more models".
+    order: list[tuple] = []
+    buckets: dict[tuple, list[dict]] = {}
     for r in nonzero:
-        group = (
-            r["agent_type"],
-            r.get("provider") or "",
-            r.get("data_root") or "",
-        )
-        show_group = group != current_group
-        current_group = group
+        key = (r["agent_type"], r.get("provider") or "", r.get("data_root") or "")
+        if key not in buckets:
+            buckets[key] = []
+            order.append(key)
+        buckets[key].append(r)
+
+    def _model_row(r: dict, show_group: bool) -> None:
         model_display = r["model"]
         if model_display == "Unknown" and r.get("raw_model"):
             model_display = f"Unknown: {r['raw_model']}"
@@ -610,6 +702,33 @@ def _build_by_agent_model_table(rows: list[dict]) -> Table | None:
             _fmt_tokens(_cache_tokens(r)),
             _fmt_cost(r.get("estimated_cost_usd"), unknown=_has_unknown_cost(r)),
         )
+
+    for key in order:
+        members = buckets[key]
+        visible = members[:limit]
+        hidden = members[limit:]
+        for i, r in enumerate(visible):
+            _model_row(r, show_group=(i == 0))
+        if hidden:
+            agg = {
+                "input_tokens": sum(m.get("input_tokens") or 0 for m in hidden),
+                "output_tokens": sum(m.get("output_tokens") or 0 for m in hidden),
+                "cache_read_tokens": sum(m.get("cache_read_tokens") or 0 for m in hidden),
+                "cache_creation_tokens": sum(m.get("cache_creation_tokens") or 0 for m in hidden),
+                "estimated_cost_usd": sum(m.get("estimated_cost_usd") or 0 for m in hidden),
+                "unknown_cost_count": sum(m.get("unknown_cost_count") or 0 for m in hidden),
+            }
+            cp = _cache_hit_rate(agg)
+            tbl.add_row(
+                "", "", "",
+                f"+{len(hidden)} more models",
+                "",
+                f"{cp:.0f}%" if cp >= 0 else "—",
+                _fmt_tokens(agg["input_tokens"]),
+                _fmt_tokens(agg["output_tokens"]),
+                _fmt_tokens(_cache_tokens(agg)),
+                _fmt_cost(agg["estimated_cost_usd"], unknown=_has_unknown_cost(agg)),
+            )
     return tbl
 
 
@@ -805,16 +924,48 @@ def _refresh_history_after_pricing_change() -> None:
 
 
 @pricing_app.command("list")
-def pricing_list() -> None:
+def pricing_list(
+    json_: bool = typer.Option(False, "--json", help="Output pricing as machine-readable JSON."),
+) -> None:
     """List model pricing plus long-context and cache-duration rules."""
     from .pricing import (
         _BUILTIN_PRICING,
         _load_user_pricing,
+        get_all_pricing,
         get_long_context_rules,
         get_user_cache_pricing,
     )
 
     user = _load_user_pricing()
+
+    if json_:
+        merged = get_all_pricing()
+        payload = {
+            "models": {
+                m: {
+                    "input": p[0], "output": p[1],
+                    "cache_read": p[2], "cache_write": p[3],
+                    "source": (
+                        "custom" if m in user and m not in _BUILTIN_PRICING
+                        else "override" if m in user and tuple(p) != tuple(_BUILTIN_PRICING.get(m, ()))
+                        else "builtin"
+                    ),
+                }
+                for m, p in sorted(merged.items())
+            },
+            "long_context": [
+                {
+                    "prefixes": [str(x) for x in r["prefixes"]],
+                    "threshold": int(r["threshold"]),
+                    "prices": [float(v) for v in r["prices"]],
+                    "source": str(r.get("source") or "builtin"),
+                }
+                for r in get_long_context_rules(include_disabled=True)
+            ],
+            "cache": get_user_cache_pricing(),
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+        return
 
     table = Table(
         title="Model Pricing (USD per 1M tokens)",
