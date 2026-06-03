@@ -512,21 +512,17 @@ class Breakdown(Static):
         bar.append("░" * (width - filled), style="white")
         return bar
 
-    # Compact value columns to the right of every tree row:
-    #   cost · share% · total-tokens · cache%
-    # Fixed widths keep them aligned and stop the line from wrapping.
-    _COST_W = 10
-    _SHARE_W = 6
-    _TOK_W = 7
-    _CACHE_W = 4
-    _VALUE_W = 1 + _COST_W + 1 + _SHARE_W + 1 + _TOK_W + 1 + _CACHE_W
-
-    @staticmethod
-    def _row_tokens(row: dict) -> int:
-        total = row.get("tokens")
-        if total:
-            return total
-        return (row.get("input") or 0) + (row.get("output") or 0) + (row.get("cache") or 0)
+    # Fixed-width value columns to the right of every tree row:
+    #   cost · share% · in · out · cached · cache%
+    # Fixed widths keep them aligned and stop the line from wrapping; the
+    # column titles are shown once on a header row at the top of the panel.
+    _W_COST = 10
+    _W_SHARE = 6
+    _W_IN = 7
+    _W_OUT = 7
+    _W_CACHED = 8
+    _W_PCT = 6
+    _VALUE_W = 1 + _W_COST + 1 + _W_SHARE + 1 + _W_IN + 1 + _W_OUT + 1 + _W_CACHED + 1 + _W_PCT
 
     @staticmethod
     def _truncate(text: str, width: int) -> str:
@@ -547,6 +543,20 @@ class Breakdown(Static):
         else:
             t.append(" ", style="white")
 
+    def _append_header(self, t: Text, label_width: int) -> None:
+        """Column-title row so IN / OUT / CACHED stay labeled."""
+        t.append(" " * label_width, style="white")
+        for title, width in (
+            ("Cost", self._W_COST),
+            ("%", self._W_SHARE),
+            ("In", self._W_IN),
+            ("Out", self._W_OUT),
+            ("Cached", self._W_CACHED),
+            ("Cache%", self._W_PCT),
+        ):
+            t.append(f" {title:>{width}}", style="bold white")
+        t.append("\n")
+
     def _append_value_columns(
         self,
         t: Text,
@@ -558,11 +568,13 @@ class Breakdown(Static):
         cost_style: str = "bright_yellow",
     ) -> None:
         cache_pct = _cache_hit_pct(row)
-        cache_str = f"{cache_pct}%" if cache_pct is not None else ""
-        t.append(f" {fmt_cost(cost, unknown=cost_unknown):>{self._COST_W}}", style=cost_style)
-        t.append(f" {share:>{self._SHARE_W}}", style="white")
-        t.append(f" {fmt_tokens(self._row_tokens(row)):>{self._TOK_W}}", style="bright_cyan")
-        t.append(f" {cache_str:>{self._CACHE_W}}", style="bright_green")
+        pct_str = f"{cache_pct}%" if cache_pct is not None else ""
+        t.append(f" {fmt_cost(cost, unknown=cost_unknown):>{self._W_COST}}", style=cost_style)
+        t.append(f" {share:>{self._W_SHARE}}", style="white")
+        t.append(f" {fmt_tokens(row.get('input') or 0):>{self._W_IN}}", style="bright_cyan")
+        t.append(f" {fmt_tokens(row.get('output') or 0):>{self._W_OUT}}", style="bright_cyan")
+        t.append(f" {fmt_tokens(row.get('cache') or 0):>{self._W_CACHED}}", style="bright_green")
+        t.append(f" {pct_str:>{self._W_PCT}}", style="bright_green")
         t.append("\n")
 
     def render(self) -> Text:
@@ -590,6 +602,7 @@ class Breakdown(Static):
         # label column so values stay close to their labels on wide panels.
         label_width = max(24, min(width - self._VALUE_W, 52))
         t = Text()
+        self._append_header(t, label_width)
         for g in self._groups:
             agent = g["agent"]
             cost = g["cost"]
