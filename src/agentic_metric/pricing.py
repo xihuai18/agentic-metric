@@ -66,7 +66,6 @@ _BUILTIN_PRICING: dict[str, PriceTuple] = {
     "gemini-3.1-flash-lite": (0.25,  1.50, 0.025, 0.0),
     "gemini-3-pro":          (2.00, 12.00, 0.20, 0.0),
     "gemini-3-flash":        (0.50,  3.00, 0.05, 0.0),
-    "gemini-2.5-pro":        (1.25, 10.00, 0.125, 0.0),
     "gemini-2.5-flash":      (0.30,  2.50, 0.03, 0.0),
     "gemini-2.5-flash-lite": (0.10,  0.40, 0.01, 0.0),
     "gemini-2.0-flash":      (0.10,  0.40, 0.025, 0.0),
@@ -116,12 +115,6 @@ _LONG_CONTEXT_RULES: list[dict[str, object]] = [
         "prefixes": ("gemini-3.1-pro",),
         "tiers": (
             {"threshold": 200_000, "prices": (4.0, 18.0, 0.40, 0.0)},
-        ),
-    },
-    {
-        "prefixes": ("gemini-2.5-pro",),
-        "tiers": (
-            {"threshold": 200_000, "prices": (2.5, 15.0, 0.25, 0.0)},
         ),
     },
     {

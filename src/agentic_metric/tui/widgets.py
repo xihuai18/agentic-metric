@@ -512,26 +512,21 @@ class Breakdown(Static):
         bar.append("░" * (width - filled), style="white")
         return bar
 
-    def _split(self, row: dict) -> str:
-        cache = row.get("cache") or 0
-        cache_read = row.get("cache_read")
-        cache_write = row.get("cache_write")
-        if cache_read is None and cache_write is None:
-            cache_read = cache
-            cache_write = 0
-        pct = _cache_hit_pct({
-            "input": row.get("input") or 0,
-            "cache_read": cache_read or 0,
-            "cache_write": cache_write or 0,
-        })
-        cache_part = fmt_tokens(cache)
-        if pct is not None:
-            cache_part = f"{cache_part} ({pct}%)"
-        return (
-            f"in {fmt_tokens(row.get('input') or 0)}  "
-            f"out {fmt_tokens(row.get('output') or 0)}  "
-            f"cache {cache_part}"
-        )
+    # Compact value columns to the right of every tree row:
+    #   cost · share% · total-tokens · cache%
+    # Fixed widths keep them aligned and stop the line from wrapping.
+    _COST_W = 10
+    _SHARE_W = 6
+    _TOK_W = 7
+    _CACHE_W = 4
+    _VALUE_W = 1 + _COST_W + 1 + _SHARE_W + 1 + _TOK_W + 1 + _CACHE_W
+
+    @staticmethod
+    def _row_tokens(row: dict) -> int:
+        total = row.get("tokens")
+        if total:
+            return total
+        return (row.get("input") or 0) + (row.get("output") or 0) + (row.get("cache") or 0)
 
     @staticmethod
     def _truncate(text: str, width: int) -> str:
@@ -562,10 +557,12 @@ class Breakdown(Static):
         share: str = "",
         cost_style: str = "bright_yellow",
     ) -> None:
-        t.append(f" {fmt_cost(cost, unknown=cost_unknown):>10}", style=cost_style)
-        t.append(f" {share:>7}", style="white")
-        t.append("  ")
-        t.append(self._split(row), style="white")
+        cache_pct = _cache_hit_pct(row)
+        cache_str = f"{cache_pct}%" if cache_pct is not None else ""
+        t.append(f" {fmt_cost(cost, unknown=cost_unknown):>{self._COST_W}}", style=cost_style)
+        t.append(f" {share:>{self._SHARE_W}}", style="white")
+        t.append(f" {fmt_tokens(self._row_tokens(row)):>{self._TOK_W}}", style="bright_cyan")
+        t.append(f" {cache_str:>{self._CACHE_W}}", style="bright_green")
         t.append("\n")
 
     def render(self) -> Text:
@@ -575,22 +572,25 @@ class Breakdown(Static):
         total = max(self._total_cost, 1e-9)
         total_unknown = any(_has_unknown_cost(g) for g in self._groups)
         # Each provider uses one line plus model rows; each agent uses one
-        # summary line and a spacer. Compute a per-provider model budget from
-        # the visible height so wide ranges stay readable.
+        # summary line. Compute a per-provider model budget from the visible
+        # height so wide ranges stay readable.
         provider_count = sum(len(g.get("providers") or [g]) for g in self._groups)
         provider_count = max(provider_count, 1)
         # Compute how many model lines we can afford from the available height.
         avail = self.size.height
-        overhead = len(self._groups) * 2 + provider_count
+        overhead = len(self._groups) + provider_count
         model_budget = max(avail - overhead, provider_count * self._MIN_MODEL_LIMIT)
         model_limit = max(self._MIN_MODEL_LIMIT, model_budget // provider_count)
         try:
             width = self.content_size.width
         except Exception:
             width = 120
-        label_width = max(38, min(72, width - 58))
+        # Reserve a fixed block for the value columns so labels truncate
+        # instead of wrapping the value columns onto a second line. Cap the
+        # label column so values stay close to their labels on wide panels.
+        label_width = max(24, min(width - self._VALUE_W, 52))
         t = Text()
-        for i, g in enumerate(self._groups):
+        for g in self._groups:
             agent = g["agent"]
             cost = g["cost"]
             unknown = _has_unknown_cost(g)
@@ -600,7 +600,7 @@ class Breakdown(Static):
             # Agent summary line. Provider and model detail are nested below it.
             self._append_label(
                 t,
-                [("  ", "white"), (self._truncate(agent, label_width - 2), "bold bright_magenta")],
+                [(self._truncate(agent, label_width), "bold bright_magenta")],
                 label_width,
             )
             self._append_value_columns(
@@ -615,11 +615,11 @@ class Breakdown(Static):
             providers = g.get("providers") or [g]
             for p_index, provider_group in enumerate(providers):
                 provider_last = p_index == len(providers) - 1
-                provider_connector = "└─" if provider_last else "├─"
+                provider_connector = "└ " if provider_last else "├ "
                 provider = provider_group.get("provider") or "—"
-                provider_prefix = f"    {provider_connector} "
-                provider_width = 10
-                path_width = max(8, label_width - len(provider_prefix) - provider_width - 1)
+                provider_prefix = f"  {provider_connector}"
+                provider_width = 9
+                path_width = max(6, label_width - len(provider_prefix) - provider_width - 1)
                 data_root = _short_path(provider_group.get("data_root") or "—", max_len=path_width)
                 provider_cost = provider_group.get("cost") or 0.0
                 provider_unknown = _has_unknown_cost(provider_group)
@@ -662,12 +662,12 @@ class Breakdown(Static):
                 )
                 visible = known[: model_limit] + unknown_models
                 hidden = known[model_limit :]
-                child_prefix = "       " if provider_last else "    │  "
+                child_bar = "  " if provider_last else "│ "
 
                 for j, m in enumerate(visible):
                     last = (j == len(visible) - 1 and not hidden)
-                    connector = "└─" if last else "├─"
-                    model_prefix = f"{child_prefix}{connector} "
+                    connector = "└ " if last else "├ "
+                    model_prefix = f"  {child_bar}{connector}"
                     model_name = m.get("model") or "(unknown)"
                     if model_name == "Unknown" and m.get("raw_model"):
                         model_name = f"Unknown: {m['raw_model']}"
@@ -697,7 +697,7 @@ class Breakdown(Static):
                         "cache_read": sum(m.get("cache_read") or 0 for m in hidden),
                         "cache_write": sum(m.get("cache_write") or 0 for m in hidden),
                     }
-                    model_prefix = f"{child_prefix}└─ "
+                    model_prefix = f"  {child_bar}└ "
                     label = f"+{len(hidden)} more models"
                     self._append_label(
                         t,
@@ -715,8 +715,6 @@ class Breakdown(Static):
                         share="",
                         cost_style="bright_yellow",
                     )
-            if i != len(self._groups) - 1:
-                t.append("\n")
 
         return t
 

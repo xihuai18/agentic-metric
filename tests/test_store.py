@@ -1092,7 +1092,10 @@ def test_tui_summary_and_breakdown_render_cache_pct():
         "providers": [],
     }]
 
-    assert "cache 300 (75%)" in widget.render().plain
+    rendered = widget.render().plain
+    # Compact value columns: total tokens (420) and cache hit rate (75%).
+    assert "420" in rendered
+    assert "75%" in rendered
 
 
 def test_tui_summary_follows_focused_time_offset(monkeypatch, tmp_path):
