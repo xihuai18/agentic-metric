@@ -152,16 +152,18 @@ database and rebuilds it from the original Claude Code and Codex session files;
 
 ### TUI Keybindings
 
-| Key | Action |
-|-----|--------|
-| `←` / `→` | Switch view (Today / Week / Month) |
-| `↑` / `↓` | Move time range earlier / later |
-| `.` | Jump back to "now" (reset offset) |
-| `t` / `w` / `m` | Focus Today / Week / Month directly |
-| `r` | Refresh data once |
-| `R` | Toggle auto-refresh (pauses the slow periodic sync while active) |
-| `p` | Open the read-only pricing view (flags unknown models in range) |
-| `q` | Quit |
+Shown in the footer as: `←→ View · ↑↓ Range · . Now · r Sync · R Live · p Pricing · q Quit`.
+
+| Key | Footer | Action |
+|-----|--------|--------|
+| `←` / `→` (or `h` / `l`) | View | Switch view (Today / Week / Month) |
+| `↑` / `↓` (or `k` / `j`) | Range | Move time range earlier / later |
+| `.` | Now | Jump back to "now" (reset offset) |
+| `t` / `w` / `m` | — | Focus Today / Week / Month directly |
+| `r` | Sync | Sync now (data already auto-syncs every 5 min by default) |
+| `R` | Live | Toggle fast "live" sync; pauses the slow periodic sync while active |
+| `p` | Pricing | Open the read-only pricing view (flags unknown models in range) |
+| `q` | Quit | Quit |
 
 Refresh intervals can be overridden in the config file (`$DATA/agentic_metric/config.json`):
 

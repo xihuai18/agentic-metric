@@ -140,16 +140,18 @@ agentic-metric pricing cache reset claude-sonnet-4                # 删除覆盖
 
 ### TUI 快捷键
 
-| 键 | 功能 |
-|----|------|
-| `←` / `→` | 切换视图(Today / Week / Month) |
-| `↑` / `↓` | 时间范围往前 / 往后 |
-| `.` | 回到"现在"(清空 offset) |
-| `t` / `w` / `m` | 直接聚焦 Today / Week / Month |
-| `r` | 手动刷新一次 |
-| `R` | 切换自动刷新(开启时暂停慢速周期 sync) |
-| `p` | 打开只读价格视图(高亮当前范围内的未知模型) |
-| `q` | 退出 |
+底栏显示为:`←→ View · ↑↓ Range · . Now · r Sync · R Live · p Pricing · q Quit`。
+
+| 键 | 底栏 | 功能 |
+|----|------|------|
+| `←` / `→`(或 `h` / `l`) | View | 切换视图(Today / Week / Month) |
+| `↑` / `↓`(或 `k` / `j`) | Range | 时间范围往前 / 往后 |
+| `.` | Now | 回到"现在"(清空 offset) |
+| `t` / `w` / `m` | — | 直接聚焦 Today / Week / Month |
+| `r` | Sync | 立即同步(默认已每 5 分钟自动同步) |
+| `R` | Live | 切换快速"实时"同步;开启时暂停慢速周期 sync |
+| `p` | Pricing | 打开只读价格视图(高亮当前范围内的未知模型) |
+| `q` | Quit | 退出 |
 
 刷新间隔可在配置文件(`$DATA/agentic_metric/config.json`)覆盖:
 

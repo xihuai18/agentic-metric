@@ -123,22 +123,25 @@ class AgenticMetricApp(App):
     _VIEWS = ("today", "week", "month")
 
     BINDINGS = [
-        Binding("left,h", "prev_view", "View", key_display="←"),
-        Binding("right,l", "next_view", "View", key_display="→"),
-        Binding("up,k", "back_in_time", "Earlier", key_display="↑"),
-        Binding("down,j", "forward_in_time", "Later", key_display="↓"),
+        # ── Navigation ── paired arrows collapse to one footer entry; the
+        # second key in each pair stays bound but hidden so both still work.
+        Binding("left,h", "prev_view", "View", key_display="←→"),
+        Binding("right,l", "next_view", "View", show=False),
+        Binding("up,k", "back_in_time", "Range", key_display="↑↓"),
+        Binding("down,j", "forward_in_time", "Range", show=False),
         Binding("period,0", "reset_offset", "Now", key_display="."),
         Binding("t", "focus('today')", "Today", show=False),
         Binding("w", "focus('week')", "Week", show=False),
         Binding("m", "focus('month')", "Month", show=False),
-        Binding("r", "refresh_all", "Refresh"),
+        # ── Data ── r = sync now; R = fast "live" sync (auto-sync already
+        # runs every 5 min by default, so this just speeds it up). Two
+        # bindings share R; `check_action` shows whichever matches state,
+        # and the active one is highlighted via `-auto-on` in styles.tcss.
+        Binding("r", "refresh_all", "Sync"),
+        Binding("R", "auto_refresh_on", "Live", key_display="R"),
+        Binding("R", "auto_refresh_off", "Live", key_display="R"),
+        # ── Other ──
         Binding("p", "show_pricing", "Pricing"),
-        # Two bindings on the same key; `check_action` picks whichever
-        # matches the current state so the footer always shows one label.
-        # The "off" variant (visible while auto-refresh is running) is
-        # styled via the `-auto-on` class in styles.tcss.
-        Binding("R", "auto_refresh_on", "Auto", key_display="R"),
-        Binding("R", "auto_refresh_off", "Auto", key_display="R"),
         Binding("alt+c,ctrl+y", "copy_view", "Copy", key_display="Alt+C", priority=True, show=False),
         # Keep Ctrl+C from quitting; some terminals also use it while copying.
         Binding("ctrl+c", "noop", show=False, priority=True),

@@ -69,6 +69,17 @@ C_BLUE     = "bright_blue"
 C_MAUVE    = "bright_magenta"
 C_SURFACE1 = "white"
 
+# Boxed panels (header + heatmap) share one width: capped, but adapting
+# down to narrower terminals.
+MAX_PANEL_WIDTH = 100
+
+
+def _panel_width() -> int:
+    try:
+        return min(console.size.width, MAX_PANEL_WIDTH)
+    except Exception:
+        return MAX_PANEL_WIDTH
+
 
 def _version_callback(value: bool) -> None:
     if value:
@@ -387,19 +398,20 @@ def _print_report(
         _stat("Turns", f"{tot_turns:,}", C_SKY),
     )
 
+    panel_width = _panel_width()
     header_panel = Panel(
         Group(header_text, Text(""), stats),
         box=box.ROUNDED,
         border_style=C_SURFACE1,
         padding=(1, 2),
-        expand=False,
+        width=panel_width,
     )
 
     # ─── Heatmap strip (today/week/month scope) ───
     heatmap_renderable = None
     if periodic and focus_kind:
         heatmap_renderable = _build_heatmap_panel(
-            periodic, focus_kind, totals, by_project,
+            periodic, focus_kind, totals, by_project, width=panel_width,
         )
 
     # ─── Table renderables ───
@@ -465,6 +477,8 @@ def _build_heatmap_panel(
     focus_kind: str,
     totals: dict,
     by_project: list[dict],
+    *,
+    width: int | None = None,
 ) -> Panel:
     """Render the activity heatmap with token split + peak + top projects."""
     blocks = ["·", "•", "░", "▒", "▓", "█", "█"]
@@ -490,7 +504,8 @@ def _build_heatmap_panel(
     else:
         cell_w, label_every = 12, 1
     try:
-        available = max(24, console.size.width - 8)
+        outer = width if width is not None else console.size.width
+        available = max(24, outer - 4)
         cell_w = min(cell_w, max(2, available // max(n, 1)))
     except Exception:
         pass
@@ -560,6 +575,7 @@ def _build_heatmap_panel(
         box=box.ROUNDED,
         border_style=C_SURFACE1,
         padding=(0, 1),
+        width=width,
     )
 
 
