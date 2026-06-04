@@ -15,7 +15,8 @@ PriceTuple = tuple[float, float, float, float]
 # (input, output, cache_read, cache_write) — USD per million tokens.
 # Core OpenAI / Anthropic / Google Gemini prices were verified against
 # official pricing docs on 2026-04-25, with Claude Opus 4.8 verified
-# against Anthropic's 2026-05-28 launch note:
+# against Anthropic's 2026-05-28 launch note, and Gemini 3.5 Flash
+# verified against Google AI Dev pricing on 2026-06-05:
 #   https://openai.com/api/pricing/
 #   https://developers.openai.com/api/docs/models/gpt-5.4/
 #   https://platform.claude.com/docs/en/docs/about-claude/pricing
@@ -62,6 +63,7 @@ _BUILTIN_PRICING: dict[str, PriceTuple] = {
     "gpt-5.3-chat-latest":   (1.75, 14.0,  0.175, 0.0),
     "gpt-5.3":               (1.75, 14.0,  0.175, 0.0),
     # ── Google Gemini ──
+    "gemini-3.5-flash":      (1.50,  9.00, 0.15, 0.0),
     "gemini-3.1-pro":        (2.00, 12.00, 0.20, 0.0),
     "gemini-3.1-flash-lite": (0.25,  1.50, 0.025, 0.0),
     "gemini-3-pro":          (2.00, 12.00, 0.20, 0.0),
@@ -92,7 +94,7 @@ _UNKNOWN_MODEL_PREFIXES = (
     "gpt-5-pro",
 )
 
-_PRICING_FINGERPRINT_VERSION = 11
+_PRICING_FINGERPRINT_VERSION = 12
 
 # Long-context pricing applies per request/prompt, not per stored hour/session.
 # Collectors pass single-event usage into ``estimate_cost`` before aggregating
