@@ -570,6 +570,77 @@ def test_top_projects_split_same_path_by_data_root():
     db.close()
 
 
+def test_top_projects_merge_same_path_across_local_roots():
+    db = _make_db()
+    for session_id, data_root, input_tokens in (
+        ("wcx-sid", "/home/u/.wcx", 1_000),
+        ("codex-sid", "/home/u/.codex", 2_000),
+    ):
+        db.replace_session_usage(
+            session_id,
+            "codex",
+            [
+                {
+                    "usage_date": "2026-04-24",
+                    "usage_hour": 10,
+                    "project_path": "/work/project",
+                    "model": "gpt-5.4",
+                    "input_tokens": input_tokens,
+                },
+            ],
+            provider="openai",
+            data_root=data_root,
+        )
+    db.commit()
+
+    rows = get_range_by_project(db, "2026-04-24", "2026-04-24", limit=10)
+    # Two local roots sharing a project path collapse into one row whose
+    # totals combine both roots' sessions.
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["project_path"] == "/work/project"
+    assert row["input_tokens"] == 3_000
+    assert row["session_count"] == 2
+    db.close()
+
+
+def test_top_projects_limit_applies_after_merge():
+    db = _make_db()
+    # Project A is split across two local roots; each split alone would rank
+    # below B and C, but the merged total must outrank them and survive limit=2.
+    splits = [
+        ("a1", "/home/u/.wcx", "/work/a", 3_000),
+        ("a2", "/home/u/.codex", "/work/a", 3_000),
+        ("b1", "/home/u/.codex", "/work/b", 4_000),
+        ("c1", "/home/u/.codex", "/work/c", 3_500),
+    ]
+    for session_id, data_root, project_path, input_tokens in splits:
+        db.replace_session_usage(
+            session_id,
+            "codex",
+            [
+                {
+                    "usage_date": "2026-04-24",
+                    "usage_hour": 10,
+                    "project_path": project_path,
+                    "model": "gpt-5.4",
+                    "input_tokens": input_tokens,
+                },
+            ],
+            provider="openai",
+            data_root=data_root,
+        )
+    db.commit()
+
+    rows = get_range_by_project(db, "2026-04-24", "2026-04-24", limit=2)
+    paths = [r["project_path"] for r in rows]
+    # Merged A (6_000) ranks first; without merge-before-limit each A split
+    # (3_000) would fall below B (4_000) and C (3_500) and drop out entirely.
+    assert paths == ["/work/a", "/work/b"]
+    assert "/work/c" not in paths
+    db.close()
+
+
 def test_replace_session_usage_prices_known_model():
     db = _make_db()
     db.replace_session_usage(

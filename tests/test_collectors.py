@@ -1002,6 +1002,14 @@ def test_claude_history_sync_scans_subagent_jsonl(tmp_path):
     assert row["project_path"] == "/tmp/project"
     assert row["input_tokens"] == 100
     assert row["output_tokens"] == 20
+    # Usage buckets must record the real cwd too, not the on-disk projects/
+    # dir (which is a local cache path for SSH-backed remotes).
+    usage = db.conn.execute(
+        "SELECT DISTINCT project_path FROM session_usage "
+        "WHERE session_id = 'parent-session:agent-a1' "
+        "AND agent_type = 'claude_code'"
+    ).fetchall()
+    assert [r["project_path"] for r in usage] == ["/tmp/project"]
     db.close()
 
 

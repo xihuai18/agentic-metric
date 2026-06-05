@@ -318,7 +318,8 @@ and `~/.codex` on the remote. Remote sync expands `~` on the remote host, reads
 It also keeps a remote file manifest in the cache, so repeated syncs only
 download changed session/index files instead of transferring full agent
 directories again. Cached files that disappear from the remote manifest are
-moved under `.stale/` and no longer parsed.
+moved under `.stale/` and no longer parsed; usage already recorded from them
+stays in the database, so historical reports keep it.
 If a remote path is missing, that collector is skipped rather than reusing old
 cache contents. CLI/TUI totals stay merged, while breakdowns and top projects
 retain the host/source dimension.
@@ -327,9 +328,11 @@ Reports keep the headline totals merged across local and remote data. Detail
 tables use a compact `Source` label: local rows show the root (`~/.codex`), and
 remote rows show `host:root` (`devcloud:~/.codex`). Top projects use the same
 prefix for remote paths (`devcloud:/data/workspace/project`) so matching local
-and remote project paths are never silently merged. `--full` adds a provider
-rollup by source; the default report keeps the source × agent × provider × model
-breakdown plus top projects.
+and remote project paths are never silently merged. Multiple *local* roots that
+share a project path collapse into one row (they would render identically), so
+the same project worked on through two local agent homes is not double-listed.
+`--full` adds a provider rollup by source; the default report keeps the
+source × agent × provider × model breakdown plus top projects.
 
 All aggregated data is stored locally in `$DATA/agentic_metric/data.db` (SQLite).
 

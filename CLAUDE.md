@@ -29,10 +29,12 @@ src/agentic_metric/
   cli.py              # Typer CLI: report, today, week, month, history, sync, tui
   models.py           # Shared dataclasses: LiveSession, TodayOverview, DailyTrend
   pricing.py          # Per-model cost estimation
-  config.py           # Database path and config
+  config.py           # Database path, collector roots, and SSH remote specs
+  formatting.py       # Pure formatting helpers (cost/tokens, source/host labels)
   collectors/
     claude_code.py    # Claude Code JSONL parser (sessions, usage buckets)
     codex.py          # Codex collector
+    remote.py         # SSH-backed wrapper: mirror a remote root to cache, then parse
     _process.py       # Process detection
   store/
     database.py       # SQLite schema and upsert logic

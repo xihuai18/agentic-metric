@@ -301,7 +301,7 @@ collector 目录,它会复用本机的 collector roots;本机也没有配置时,
 `projects/` 和 `sessions/`,缓存到 `$DATA/agentic_metric/remote-cache/`,再和本机用量一起汇总。
 缓存里也会保存远程文件 manifest,所以重复 sync 只会下载变化过的 session/index
 文件,不会每次重新传完整 agent 目录。已经从远程 manifest 消失的缓存文件会被移到
-`.stale/`,不再参与解析。
+`.stale/`,不再参与解析;但之前已入库的用量仍保留在本地数据库里,历史报表照常包含。
 如果远程目录不存在,这个 collector 会被跳过,不会拿旧缓存继续入库。CLI/TUI
 总量保持合并,明细和 Top projects 会保留 host/source 维度。
 
@@ -309,6 +309,7 @@ collector 目录,它会复用本机的 collector roots;本机也没有配置时,
 root,例如 `~/.codex`;远程行显示 `host:root`,例如 `devcloud:~/.codex`。
 Top projects 也会给远程路径加同样的前缀,例如
 `devcloud:/data/workspace/project`,避免本机和远程相同项目路径被静默合并。
+而同名项目若来自多个**本机** root,会合并为一行(否则显示完全相同),不会重复列出。
 `--full` 会额外展示按 source 汇总的 provider 表;默认报告保留
 source × agent × provider × model 明细和 Top projects。
 

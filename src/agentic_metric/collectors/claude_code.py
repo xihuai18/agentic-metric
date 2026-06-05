@@ -811,7 +811,10 @@ class ClaudeCodeCollector(BaseCollector):
         if not projects_dir.exists():
             return
 
-        sync_prefix = "cc_jsonl:v6:"
+        # v7: usage buckets now record the real cwd instead of the on-disk
+        # projects/ dir. Bumping the key forces a one-time re-parse so already
+        # synced sessions get their project_path corrected without --rebuild.
+        sync_prefix = "cc_jsonl:v7:"
 
         for project_dir in projects_dir.iterdir():
             if not project_dir.is_dir():
@@ -836,8 +839,15 @@ class ClaudeCodeCollector(BaseCollector):
                 if _sync_state_matches(prev_state, file_size, mtime_ns):
                     continue
 
+                # Resolve the real project path from the JSONL cwd up front so
+                # both the session row and its usage buckets record the actual
+                # project, not the on-disk projects/ dir (which is a local cache
+                # path for SSH-backed remotes).
+                real_cwd = _LiveMonitor._read_cwd(jsonl_file)
+                project_path = real_cwd if real_cwd else str(project_dir)
+
                 # Build an accumulator starting from the previous offset
-                accum = _SessionAccum(jsonl_file, project_path=str(project_dir))
+                accum = _SessionAccum(jsonl_file, project_path=project_path)
                 # First pass: read everything from scratch to get full picture
                 # (we need totals, not deltas, for upsert)
                 accum.read_new_lines()
@@ -850,9 +860,6 @@ class ClaudeCodeCollector(BaseCollector):
                 usage_rows = accum.usage_bucket_rows()
                 cost = _usage_rows_cost(usage_rows)
 
-                # Read the cwd from the JSONL to get the real project path
-                real_cwd = _LiveMonitor._read_cwd(jsonl_file)
-                project_path = real_cwd if real_cwd else str(project_dir)
                 session_id = _session_id_for_jsonl(project_dir, jsonl_file, accum.session_id)
 
                 db.upsert_session(
