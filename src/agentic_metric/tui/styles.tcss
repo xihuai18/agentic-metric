@@ -129,6 +129,11 @@ SummaryCell.-focused {
 
 #breakdown-scroll {
     height: 1fr;
+    scrollbar-size-vertical: 1;
+    scrollbar-background: $surface;
+    scrollbar-color: $text-muted;
+    scrollbar-color-hover: $text;
+    scrollbar-color-active: $accent;
 }
 
 #breakdown-body {
