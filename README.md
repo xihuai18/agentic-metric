@@ -5,7 +5,7 @@
 
 [中文文档](README-CN.md)
 
-A local-only monitoring tool for AI coding agents — like `top`, but for your coding agents. Track token usage and costs across **Claude Code** and **Codex** — with a TUI dashboard and CLI.
+A local and SSH remote monitoring tool for AI coding agents — like `top`, but for your coding agents. Track token usage and costs across **Claude Code** and **Codex** — with a TUI dashboard and CLI.
 
 **Supported platforms: Linux, macOS, and Windows.**
 
