@@ -21,6 +21,7 @@ from agentic_metric.collectors.remote import (
     RemoteHistoryCollector,
     RemoteSyncTarget,
     _cache_root_for,
+    _manifest_command,
     _ssh_command,
 )
 from agentic_metric.config import RemoteCollectorRoot, RemoteSpec, get_remote_specs
@@ -153,12 +154,13 @@ def test_default_registry_includes_remote_collectors(tmp_path):
 
 def test_remote_ssh_command_expands_tilde_on_remote_host():
     remote = RemoteSpec(host="devcloud", user="leo", port=2222)
-    cmd = _ssh_command(remote, "~/.codex", "sessions")
+    target = RemoteSyncTarget(remote, "codex", "~/.codex", "openai", 0)
+    cmd = _ssh_command(remote, _manifest_command(target))
 
     assert cmd[:4] == ["ssh", "-p", "2222", "leo@devcloud"]
     assert "root='~/.codex'" in cmd[-1]
     assert 'case "$root"' in cmd[-1]
-    assert 'root="$HOME/${root#~/}"' in cmd[-1]
+    assert 'root="$HOME/${root#\\~/}"' in cmd[-1]
 
 
 def test_live_session_total_tokens():
@@ -379,12 +381,19 @@ def test_remote_codex_collector_syncs_tarball_into_history(tmp_path):
     payload = "".join(json.dumps(line) + "\n" for line in lines).encode()
     tar_bytes = io.BytesIO()
     with tarfile.open(fileobj=tar_bytes, mode="w:gz") as tar:
-        info = tarfile.TarInfo("sessions/2026/04/23/rollout-remote.jsonl")
+        info = tarfile.TarInfo("2026/04/23/rollout-remote.jsonl")
         info.size = len(payload)
         tar.addfile(info, io.BytesIO(payload))
 
-    completed = Mock(returncode=0, stdout=tar_bytes.getvalue(), stderr=b"")
-    run_mock = Mock(return_value=completed)
+    manifest = (
+        b"OK\0"
+        + f"{len(payload)}\t123\t./2026/04/23/rollout-remote.jsonl".encode()
+        + b"\0"
+    )
+    run_mock = Mock(side_effect=[
+        Mock(returncode=0, stdout=manifest, stderr=b""),
+        Mock(returncode=0, stdout=tar_bytes.getvalue(), stderr=b""),
+    ])
     remote = RemoteSpec(host="devcloud", name="dev", timeout=9)
     target = RemoteSyncTarget(
         remote=remote,
@@ -398,7 +407,8 @@ def test_remote_codex_collector_syncs_tarball_into_history(tmp_path):
          patch("agentic_metric.collectors.remote.subprocess.run", run_mock):
         RemoteHistoryCollector(target).sync_history(db)
 
-    assert run_mock.call_args.kwargs["timeout"] == 9
+    assert [call.kwargs["timeout"] for call in run_mock.call_args_list] == [9, 9]
+    assert run_mock.call_args_list[1].kwargs["input"] == b"2026/04/23/rollout-remote.jsonl\0"
     row = db.conn.execute(
         "SELECT provider, data_root, project_path, input_tokens, output_tokens "
         "FROM sessions WHERE session_id = 'remote-sid'"
@@ -442,7 +452,7 @@ def test_remote_missing_path_does_not_parse_stale_cache(tmp_path):
             },
         },
     ]
-    completed = Mock(returncode=0, stdout=b"", stderr=b"")
+    completed = Mock(returncode=0, stdout=b"MISSING\0", stderr=b"")
     db = Database(db_path=str(tmp_path / "data.db"))
 
     with patch("agentic_metric.collectors.remote.DATA_DIR", tmp_path / "data"), \
@@ -466,6 +476,38 @@ def test_remote_missing_path_does_not_parse_stale_cache(tmp_path):
         "SELECT COUNT(*) AS n FROM sessions WHERE session_id = 'stale-sid'"
     ).fetchone()["n"] == 0
     db.close()
+
+
+def test_remote_unchanged_manifest_skips_download(tmp_path):
+    remote = RemoteSpec(host="devcloud", name="dev")
+    target = RemoteSyncTarget(
+        remote=remote,
+        agent_type="codex",
+        remote_root="~/.codex",
+        provider="openai",
+        index=0,
+    )
+    rel = "2026/04/23/rollout-remote.jsonl"
+    manifest = b"OK\0" + b"100\t123\t./2026/04/23/rollout-remote.jsonl\0"
+
+    with patch("agentic_metric.collectors.remote.DATA_DIR", tmp_path / "data"), \
+         patch(
+             "agentic_metric.collectors.remote.subprocess.run",
+             return_value=Mock(returncode=0, stdout=manifest, stderr=b""),
+         ) as run_mock:
+        cache_file = _cache_root_for(target) / "sessions" / rel
+        cache_file.parent.mkdir(parents=True)
+        cache_file.write_text("{}\n")
+        manifest_file = _cache_root_for(target) / ".remote-manifest.json"
+        manifest_file.write_text(
+            json.dumps({rel: {"size": "100", "mtime": "123"}}) + "\n"
+        )
+
+        db = Database(db_path=str(tmp_path / "data.db"))
+        RemoteHistoryCollector(target).sync_history(db)
+        db.close()
+
+    assert run_mock.call_count == 1
 
 
 def test_codex_provider_mismatch_removes_only_same_provider_stale_rows(tmp_path):

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from hashlib import sha1
 from io import BytesIO
+import json
 from pathlib import Path, PurePosixPath
 import posixpath
 import shlex
@@ -113,7 +114,6 @@ def _cache_root_for(target: RemoteSyncTarget) -> Path:
             target.remote.name,
             target.remote.user,
             str(target.remote.port or ""),
-            str(target.remote.timeout),
             " ".join(target.remote.ssh_options),
             target.agent_type,
             str(target.index),
@@ -129,52 +129,136 @@ def _ssh_destination(remote: RemoteSpec) -> str:
     return f"{remote.user}@{remote.host}" if remote.user else remote.host
 
 
-def _ssh_command(remote: RemoteSpec, remote_root: str, subdir: str) -> list[str]:
+def _ssh_command(remote: RemoteSpec, remote_cmd: str) -> list[str]:
     cmd = ["ssh"]
     if remote.port:
         cmd.extend(["-p", str(remote.port)])
     cmd.extend(remote.ssh_options)
     cmd.append(_ssh_destination(remote))
+    cmd.append(remote_cmd)
+    return cmd
 
+
+def _remote_base_script(remote_root: str, subdir: str) -> str:
     root = shlex.quote(remote_root)
     child = shlex.quote(subdir)
-    remote_cmd = (
+    return (
         "set -e; "
         f"root={root}; child={child}; "
         'case "$root" in '
         '"~") root="$HOME" ;; '
-        '"~/"*) root="$HOME/${root#~/}" ;; '
+        '"~/"*) root="$HOME/${root#\\~/}" ;; '
         "esac; "
-        'if [ -d "$root/$child" ]; then '
-        'tar -C "$root" -czf - "$child"; '
-        "fi"
+        'base="$root/$child"; '
     )
-    cmd.append(remote_cmd)
-    return cmd
+
+
+def _manifest_command(target: RemoteSyncTarget) -> str:
+    if target.agent_type == "codex":
+        find_expr = "-name 'rollout-*.jsonl'"
+    else:
+        find_expr = "\\( -name '*.jsonl' -o -name 'sessions-index.json' \\)"
+    return (
+        _remote_base_script(target.source_root, target.source_child)
+        + 'if [ ! -d "$base" ]; then printf "MISSING\\0"; exit 0; fi; '
+        + 'printf "OK\\0"; cd "$base"; '
+        + f"find . -type f {find_expr} -exec stat -c '%s\\t%Y\\t%n\\0' {{}} +"
+    )
+
+
+def _download_command(target: RemoteSyncTarget) -> str:
+    return (
+        _remote_base_script(target.source_root, target.source_child)
+        + 'if [ -d "$base" ]; then cd "$base"; tar -czf - --null -T -; fi'
+    )
 
 
 def _sync_target_to_cache(target: RemoteSyncTarget) -> bool:
     cache_root = _cache_root_for(target)
     cache_root.mkdir(parents=True, exist_ok=True)
 
+    manifest = _read_remote_manifest(target)
+    if manifest is None:
+        return False
+
+    previous = _load_manifest(cache_root)
+    changed = [
+        rel for rel, meta in manifest.items()
+        if previous.get(rel) != meta or not (cache_root / target.source_child / rel).exists()
+    ]
+    if changed:
+        payload = "\0".join(changed).encode("utf-8") + b"\0"
+        proc = _run_ssh(target.remote, _download_command(target), input_bytes=payload)
+        if proc.stdout:
+            _extract_tarball(proc.stdout, cache_root / target.source_child)
+    _save_manifest(cache_root, manifest)
+    return True
+
+
+def _run_ssh(
+    remote: RemoteSpec,
+    remote_cmd: str,
+    *,
+    input_bytes: bytes | None = None,
+) -> subprocess.CompletedProcess:
     try:
         proc = subprocess.run(
-            _ssh_command(target.remote, target.source_root, target.source_child),
+            _ssh_command(remote, remote_cmd),
+            input=input_bytes,
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=target.remote.timeout,
+            timeout=remote.timeout,
         )
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"ssh timed out after {target.remote.timeout}s") from exc
+        raise RuntimeError(f"ssh timed out after {remote.timeout}s") from exc
     if proc.returncode != 0:
         stderr = proc.stderr.decode("utf-8", errors="replace").strip()
         raise RuntimeError(stderr or f"ssh exited with status {proc.returncode}")
-    if not proc.stdout:
-        return False
+    return proc
 
-    _extract_tarball(proc.stdout, cache_root)
-    return True
+
+def _read_remote_manifest(target: RemoteSyncTarget) -> dict[str, dict[str, str]] | None:
+    proc = _run_ssh(target.remote, _manifest_command(target))
+    parts = proc.stdout.split(b"\0")
+    if not parts or parts[0] == b"MISSING":
+        return None
+    if parts[0] != b"OK":
+        raise RuntimeError("unexpected remote manifest response")
+
+    manifest: dict[str, dict[str, str]] = {}
+    for item in parts[1:]:
+        if not item:
+            continue
+        try:
+            size, mtime, name = item.decode("utf-8", errors="surrogateescape").split("\t", 2)
+        except ValueError:
+            continue
+        rel = name[2:] if name.startswith("./") else name
+        safe = _safe_member_path(rel)
+        if safe is None:
+            continue
+        manifest[str(PurePosixPath(*safe.parts))] = {"size": size, "mtime": mtime}
+    return manifest
+
+
+def _manifest_path(cache_root: Path) -> Path:
+    return cache_root / ".remote-manifest.json"
+
+
+def _load_manifest(cache_root: Path) -> dict[str, dict[str, str]]:
+    try:
+        data = json.loads(_manifest_path(cache_root).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_manifest(cache_root: Path, manifest: dict[str, dict[str, str]]) -> None:
+    _manifest_path(cache_root).write_text(
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _extract_tarball(payload: bytes, dest: Path) -> None:
