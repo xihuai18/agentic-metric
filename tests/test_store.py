@@ -1477,6 +1477,26 @@ def test_report_renders_tables_sequentially_and_highlights_cache_pct(monkeypatch
         "agent_type": "codex",
         "message_count": 10,
     }]
+    by_provider_model = [{
+        "provider": "openai",
+        "model": "gpt-5.5",
+        "raw_model": "gpt-5.5",
+        "session_count": 2,
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "cache_read_tokens": 300,
+        "cache_creation_tokens": 0,
+        "estimated_cost_usd": 12.0,
+    }]
+    by_agent_type_model = [{
+        **by_provider_model[0],
+        "agent_type": "codex",
+    }]
+    by_project_model = [{
+        **by_provider_model[0],
+        "project_path": by_project[0]["project_path"],
+        "data_root": "",
+    }]
     periodic = [{
         "label": "Mon",
         "session_count": 2,
@@ -1504,6 +1524,9 @@ def test_report_renders_tables_sequentially_and_highlights_cache_pct(monkeypatch
         periodic,
         "week",
         full=True,
+        by_provider_model=by_provider_model,
+        by_agent_type_model=by_agent_type_model,
+        by_project_model=by_project_model,
     )
 
     rendered = console.export_text()
@@ -1514,6 +1537,9 @@ def test_report_renders_tables_sequentially_and_highlights_cache_pct(monkeypatch
     assert "By provider" in rendered
     assert "By model" in rendered
     assert "By project × agent" in rendered
+    assert "By provider × model" in rendered
+    assert "By agent × model" in rendered
+    assert "By project × model" in rendered
     assert not any("By provider" in line and "By day" in line for line in rendered.splitlines())
 
 

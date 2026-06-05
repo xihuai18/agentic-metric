@@ -18,10 +18,10 @@ from textual.widgets import Static
 _SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
     ("Navigation", [
         ("← → / h l", "Switch view (Today / Week / Month)"),
-        ("↑ ↓ / k j", "Move time range earlier / later"),
+        ("PageUp / PageDown", "Move time range earlier / later (PgUp = previous)"),
         (". / 0", "Jump back to now (reset offset)"),
         ("t / w / m", "Focus Today / Week / Month directly"),
-        ("PageUp / PageDown", "Scroll the breakdown panel"),
+        ("↑ ↓ / k j", "Scroll the breakdown panel"),
         ("Ctrl+B / Ctrl+F", "Scroll the breakdown panel"),
     ]),
     ("Data", [

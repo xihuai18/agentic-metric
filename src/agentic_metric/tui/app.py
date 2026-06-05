@@ -6,12 +6,11 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.timer import Timer
-from textual.widgets import Footer, Header, Static
+from textual.widgets import Footer, Header
 from textual.widgets._footer import FooterKey
 
 from ..collectors import CollectorRegistry, create_default_registry
@@ -124,14 +123,16 @@ class AgenticMetricApp(App):
     _VIEWS = ("today", "week", "month")
 
     BINDINGS = [
-        # ── Navigation ── paired arrows collapse to one footer entry; the
+        # ── Navigation ── paired keys collapse to one footer entry; the
         # second key in each pair stays bound but hidden so both still work.
+        # ←→ switch view (today/week/month); PgUp/PgDn step the time range
+        # (PgUp = previous period); ↑↓ scroll the breakdown panel.
         Binding("left,h", "prev_view", "View", key_display="←→"),
         Binding("right,l", "next_view", "View", show=False),
-        Binding("up,k", "back_in_time", "Range", key_display="↑↓"),
-        Binding("down,j", "forward_in_time", "Range", show=False),
-        Binding("pageup", "scroll_breakdown_up", show=False),
-        Binding("pagedown", "scroll_breakdown_down", show=False),
+        Binding("pageup", "back_in_time", "Range", key_display="PgUp/PgDn", priority=True),
+        Binding("pagedown", "forward_in_time", "Range", show=False, priority=True),
+        Binding("up,k", "scroll_breakdown_up", show=False),
+        Binding("down,j", "scroll_breakdown_down", show=False),
         Binding("ctrl+b", "scroll_breakdown_up", show=False),
         Binding("ctrl+f", "scroll_breakdown_down", show=False),
         Binding("period,0", "reset_offset", "Now", key_display="."),
@@ -172,13 +173,10 @@ class AgenticMetricApp(App):
             yield SummaryCell("WEEK", id="cell-week")
             yield SummaryCell("MONTH", id="cell-month")
         with Vertical(id="heatmap-panel"):
-            yield Static("Today by hour", id="heatmap-title")
             yield PeriodicHeatmap(id="heatmap")
         with Vertical(id="chart-panel"):
-            yield Static("Trend", id="chart-title")
             yield TrendBlocks(id="chart")
         with Vertical(id="breakdown-panel"):
-            yield Static("By agent → provider → model", id="breakdown-title")
             with VerticalScroll(id="breakdown-scroll"):
                 yield Breakdown(id="breakdown-body")
         yield _AutoAwareFooter()
@@ -250,9 +248,7 @@ class AgenticMetricApp(App):
                 title = f"{label} by day"
             elif self._focus == "month":
                 title = f"{label} by week"
-        self.query_one("#heatmap-title", Static).update(
-            Text.from_markup(f"[bold]{title}[/]")
-        )
+        self.query_one("#heatmap-panel", Vertical).border_title = title
 
     def _populate_summary(self) -> None:
         active_count = self._count_active()
@@ -310,12 +306,11 @@ class AgenticMetricApp(App):
         data = get_trend(self._db, unit, count)
         self.query_one("#chart", TrendBlocks).update_data(data, span_label)
 
-        # Keep the unit and span in the panel title so the block strip can
-        # stay three lines tall.
-        title = self.query_one("#chart-title", Static)
-        title.update(Text.from_markup(
-            f"[bold]USD[/]   [bold]Trend[/] — [bright_white]{span_label}[/]"
-        ))
+        # Title sits on the panel border; keep the unit + span there so the
+        # block strip can stay three lines tall.
+        self.query_one("#chart-panel", Vertical).border_title = (
+            f"Trend · USD — {span_label}"
+        )
 
     def _populate_breakdown(self) -> None:
         label, frm, to = resolve_range(self._focus, offset=self._offset)
@@ -427,10 +422,9 @@ class AgenticMetricApp(App):
 
         total_cost = sum(h["cost"] for h in groups)
 
-        title_widget = self.query_one("#breakdown-title", Static)
-        title_widget.update(Text.from_markup(
-            f"[bold]By host → agent → provider → model[/] — [bright_cyan]{label}[/] [white]({frm} → {to})[/]"
-        ))
+        self.query_one("#breakdown-panel", Vertical).border_title = (
+            f"By host → agent → provider → model — {label} ({frm} → {to})"
+        )
         self.query_one("#breakdown-body", Breakdown).update_data(groups, total_cost)
 
     # ── Counters ──────────────────────────────────────────────────────
@@ -583,6 +577,11 @@ class AgenticMetricApp(App):
             return self._auto_refresh_timer is None
         if action == "auto_refresh_off":
             return self._auto_refresh_timer is not None
+        # PgUp/PgDn step the range with priority=True so the scrollable
+        # breakdown can't swallow them. Disable that priority while a modal
+        # (help/pricing) is on top, so the key reaches the modal instead.
+        if action in ("back_in_time", "forward_in_time"):
+            return len(self.screen_stack) <= 1
         return True
 
     def action_noop(self) -> None:

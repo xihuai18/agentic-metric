@@ -746,6 +746,131 @@ def get_range_by_agent_model(db: Database, from_date: str, to_date: str) -> list
     return out
 
 
+def _range_by_key_model(
+    db: Database,
+    from_date: str,
+    to_date: str,
+    *,
+    select_expr: str,
+    group_expr: str,
+    key_name: str,
+) -> list[dict]:
+    """Per-(key, model) aggregates: one row per ``group_expr`` × model."""
+    usage = _usage_source(db)
+    rows = db.conn.execute(
+        f"""SELECT {select_expr} AS {key_name},
+                  model AS raw_model,
+                  {_session_count_expr()} AS session_count,
+                  COALESCE(SUM(user_turns), 0) AS user_turns,
+                  COALESCE(SUM(message_count), 0) AS message_count,
+                  COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                  COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                  COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+                  COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
+                  COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd,
+                  {_unknown_cost_expr()} AS unknown_cost_count
+           FROM {usage}
+           WHERE usage_date BETWEEN ? AND ?
+           GROUP BY {group_expr}, model
+           ORDER BY estimated_cost_usd DESC, unknown_cost_count DESC
+        """,
+        (from_date, to_date),
+    ).fetchall()
+    out = []
+    for r in rows:
+        row = dict(r)
+        raw = row.pop("raw_model") or ""
+        row["raw_model"] = raw
+        row["model"] = _model_label(raw)
+        out.append(row)
+    return out
+
+
+def get_range_by_provider_model(db: Database, from_date: str, to_date: str) -> list[dict]:
+    """Return per-(provider, model) aggregates within the range.
+
+    Surfaces how a single model splits across billing channels — the same
+    model can run through different providers at different prices — a view
+    the wide source×agent×provider×model table fragments across hosts and
+    agents.
+    """
+    return _range_by_key_model(
+        db,
+        from_date,
+        to_date,
+        select_expr="CASE WHEN provider = '' THEN '—' ELSE provider END",
+        group_expr="provider",
+        key_name="provider",
+    )
+
+
+def get_range_by_agent_type_model(db: Database, from_date: str, to_date: str) -> list[dict]:
+    """Return per-(agent, model) aggregates within the range."""
+    return _range_by_key_model(
+        db,
+        from_date,
+        to_date,
+        select_expr="agent_type",
+        group_expr="agent_type",
+        key_name="agent_type",
+    )
+
+
+def get_range_by_project_model(
+    db: Database, from_date: str, to_date: str, limit: int = 10
+) -> list[dict]:
+    """Return top per-(project, model) rows, merged by source like by_project."""
+    usage = _usage_source(db)
+    rows = db.conn.execute(
+        f"""SELECT data_root,
+                  CASE WHEN project_path = '' THEN '(unspecified)'
+                       ELSE project_path END AS project_path,
+                  model AS raw_model,
+                  {_session_count_expr()} AS session_count,
+                  COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                  COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                  COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+                  COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
+                  COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd,
+                  {_unknown_cost_expr()} AS unknown_cost_count
+           FROM {usage}
+           WHERE usage_date BETWEEN ? AND ?
+           GROUP BY data_root, project_path, model
+        """,
+        (from_date, to_date),
+    ).fetchall()
+
+    sum_fields = (
+        "session_count", "input_tokens", "output_tokens",
+        "cache_read_tokens", "cache_creation_tokens",
+        "estimated_cost_usd", "unknown_cost_count",
+    )
+    merged: dict[tuple[str, str, str], dict] = {}
+    for r in rows:
+        row = dict(r)
+        raw = row.pop("raw_model") or ""
+        row["raw_model"] = raw
+        row["model"] = _model_label(raw)
+        key = (
+            source_label(row.get("data_root") or ""),
+            row["project_path"],
+            row["model"],
+        )
+        existing = merged.get(key)
+        if existing is None:
+            merged[key] = row
+            continue
+        for field in sum_fields:
+            existing[field] = (existing.get(field) or 0) + (row.get(field) or 0)
+
+    out = sorted(
+        merged.values(),
+        key=lambda r: (r.get("estimated_cost_usd") or 0, r.get("unknown_cost_count") or 0),
+        reverse=True,
+    )
+    return out[:limit]
+
+
 def get_range_by_project(db: Database, from_date: str, to_date: str, limit: int = 10) -> list[dict]:
     """Return per-project aggregates within the given date range, sorted by cost desc.
 

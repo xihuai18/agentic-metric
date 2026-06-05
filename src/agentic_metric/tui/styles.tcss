@@ -72,16 +72,13 @@ SummaryCell.-focused {
 
 #heatmap-panel {
     height: auto;
-    min-height: 12;
+    min-height: 11;
     margin: 0 1;
     padding: 0 1;
     border: round white;
-}
-
-#heatmap-title {
-    height: 1;
-    color: $text;
-    text-style: bold;
+    border-title-align: left;
+    border-title-color: $text;
+    border-title-style: bold;
 }
 
 #heatmap {
@@ -92,18 +89,15 @@ SummaryCell.-focused {
 /* ─── Compact trend strip ─── */
 
 #chart-panel {
-    height: 6;
+    height: 5;
     min-height: 5;
-    max-height: 6;
+    max-height: 5;
     margin: 0 1;
     padding: 0 1;
     border: round white;
-}
-
-#chart-title {
-    height: 1;
-    color: $text;
-    text-style: bold;
+    border-title-align: left;
+    border-title-color: $text;
+    border-title-style: bold;
 }
 
 #chart {
@@ -119,12 +113,9 @@ SummaryCell.-focused {
     margin: 0 1 1 1;
     padding: 0 1;
     border: round white;
-}
-
-#breakdown-title {
-    height: 1;
-    color: $text;
-    text-style: bold;
+    border-title-align: left;
+    border-title-color: $text;
+    border-title-style: bold;
 }
 
 #breakdown-scroll {

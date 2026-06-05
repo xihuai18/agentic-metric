@@ -261,8 +261,11 @@ def report(
         by_model = aggregator.get_range_by_model(db, frm, to)
         by_agent = aggregator.get_range_by_agent(db, frm, to)
         by_agent_model = aggregator.get_range_by_agent_model(db, frm, to)
+        by_provider_model = aggregator.get_range_by_provider_model(db, frm, to)
+        by_agent_type_model = aggregator.get_range_by_agent_type_model(db, frm, to)
         by_project = aggregator.get_range_by_project(db, frm, to, limit=limit)
         by_project_agent = aggregator.get_range_by_project_agent(db, frm, to, limit=limit)
+        by_project_model = aggregator.get_range_by_project_model(db, frm, to, limit=limit)
         # Periodic breakdown (hourly/daily/weekly) — only when the range
         # corresponds to a named focus.
         focus_kind = None
@@ -284,6 +287,9 @@ def report(
                 by_host, by_agent_type, by_provider, by_model,
                 by_agent, by_agent_model, by_project, by_project_agent,
                 sync_errors=sync_errors,
+                by_provider_model=by_provider_model,
+                by_agent_type_model=by_agent_type_model,
+                by_project_model=by_project_model,
             )
         else:
             if sync_errors:
@@ -294,6 +300,9 @@ def report(
                 by_host, by_agent_type, by_provider, by_model,
                 by_agent, by_agent_model, by_project, by_project_agent,
                 periodic, focus_kind, prev_totals, full=full, limit=limit,
+                by_provider_model=by_provider_model,
+                by_agent_type_model=by_agent_type_model,
+                by_project_model=by_project_model,
             )
 
     if watch and watch > 0 and not json_:
@@ -316,6 +325,9 @@ def _emit_report_json(
     by_provider: list[dict], by_model: list[dict], by_agent: list[dict],
     by_agent_model: list[dict], by_project: list[dict], by_project_agent: list[dict],
     sync_errors: list[str] | None = None,
+    by_provider_model: list[dict] | None = None,
+    by_agent_type_model: list[dict] | None = None,
+    by_project_model: list[dict] | None = None,
 ) -> None:
     """Print the report as machine-readable JSON (for scripts / pipes)."""
     payload = {
@@ -329,8 +341,11 @@ def _emit_report_json(
         "by_model": [dict(r) for r in by_model],
         "by_agent": [dict(r) for r in by_agent],
         "by_agent_model": [dict(r) for r in by_agent_model],
+        "by_provider_model": [dict(r) for r in (by_provider_model or [])],
+        "by_agent_type_model": [dict(r) for r in (by_agent_type_model or [])],
         "by_project": [dict(r) for r in by_project],
         "by_project_agent": [dict(r) for r in by_project_agent],
+        "by_project_model": [dict(r) for r in (by_project_model or [])],
         "sync_errors": sync_errors or [],
     }
     print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
@@ -409,6 +424,9 @@ def _print_report(
     *,
     full: bool = False,
     limit: int = 8,
+    by_provider_model: list[dict] | None = None,
+    by_agent_type_model: list[dict] | None = None,
+    by_project_model: list[dict] | None = None,
 ) -> None:
     tot_cost = totals.get("estimated_cost_usd") or 0.0
     tot_cost_unknown = _has_unknown_cost(totals)
@@ -468,34 +486,59 @@ def _print_report(
     agent_type_tbl = _build_dimension_table("By agent", "Agent", by_agent_type, "agent_type", max_label_width=18) if full else None
     provider_tbl = _build_dimension_table("By provider", "Provider", by_provider, "provider", max_label_width=18) if full else None
     model_tbl = _build_dimension_table("By model", "Model", by_model, "model", max_label_width=32) if full else None
-    agent_tbl = _build_by_agent_table(by_agent) if full else None
     periodic_tbl = _build_periodic_table(periodic, focus_kind) if full else None
 
+    # A × model cross tables (full only). Each gives model one extra lens:
+    # by billing channel, by agent, and by project.
+    provider_model_tbl = agent_type_model_tbl = project_model_tbl = None
+    if full:
+        provider_model_tbl = _build_cross_table(
+            "By provider × model", "Provider", by_provider_model or [],
+            lambda r: r.get("provider") or "—", a_width=_scale_width(10, 16),
+        )
+        agent_type_model_tbl = _build_cross_table(
+            "By agent × model", "Agent", by_agent_type_model or [],
+            lambda r: r.get("agent_type") or "—", a_width=_scale_width(10, 16),
+        )
+        pm_width = max(28, min(120, _console_width() - 60))
+        project_model_tbl = _build_cross_table(
+            "By project × model", "Project", by_project_model or [],
+            lambda r: _source_prefixed_path(
+                r.get("project_path") or "(unspecified)",
+                r.get("data_root") or "", max_len=pm_width,
+            ),
+            a_width=pm_width, model_width=_scale_width(14, 24),
+        )
+
     # ─── Render ───
+    # Non-full keeps the consolidated 4-D cross plus Top projects.
+    # Full drills down coarse → fine: single-dim aggregates, the model
+    # cross lenses, the project block, the full cross, and finally the
+    # time breakdown.
+    if full:
+        ordered = (
+            host_tbl,            # By host
+            agent_type_tbl,      # By agent
+            provider_tbl,        # By provider
+            model_tbl,           # By model
+            provider_model_tbl,  # By provider × model
+            agent_type_model_tbl,# By agent × model
+            project_tbl,         # Top projects
+            project_agent_tbl,   # By project × agent
+            project_model_tbl,   # By project × model
+            breakdown_tbl,       # By source × agent × provider × model
+            periodic_tbl,        # By hour / day / week
+        )
+    else:
+        ordered = (breakdown_tbl, project_tbl)
+
     console.print()
     console.print(header_panel)
     if heatmap_renderable is not None:
         console.print(heatmap_renderable)
 
-    if breakdown_tbl is not None:
-        console.print(breakdown_tbl)
-    if project_tbl is not None:
-        console.print(project_tbl)
-
-    detail_tables = [
-        t for t in (
-            host_tbl,
-            agent_type_tbl,
-            provider_tbl,
-            model_tbl,
-            project_agent_tbl,
-            agent_tbl,
-            periodic_tbl,
-        )
-        if t is not None
-    ]
-    if detail_tables:
-        for t in detail_tables:
+    for t in ordered:
+        if t is not None:
             console.print(t)
 
     unknown_note = _build_unknown_models_note(by_agent_model)
@@ -743,47 +786,6 @@ def _build_dimension_table(
     return tbl
 
 
-def _build_by_agent_table(by_agent: list[dict]) -> Table | None:
-    if not by_agent:
-        return None
-    source_width = _scale_width(16, 34)
-    agent_width = _scale_width(8, 14)
-    provider_width = _scale_width(6, 12)
-    tbl = Table(
-        show_header=True,
-        header_style=f"bold {C_SUBTEXT}",
-        box=box.SIMPLE_HEAVY,
-        pad_edge=False,
-        border_style=C_SURFACE1,
-        title="By source × provider",
-        title_style=f"bold {C_TEXT}",
-        title_justify="left",
-    )
-    tbl.add_column("Source", style=C_MUTED, overflow="ellipsis", no_wrap=True, max_width=source_width)
-    tbl.add_column("Ag", style=C_MAUVE, overflow="ellipsis", no_wrap=True, min_width=5, max_width=agent_width)
-    tbl.add_column("Prov", style=C_SKY, overflow="ellipsis", no_wrap=True, min_width=4, max_width=provider_width)
-    tbl.add_column("Sess", justify="right", style=C_TEXT, no_wrap=True)
-    tbl.add_column("Turns", justify="right", style=C_TEXT, no_wrap=True)
-    tbl.add_column("In", justify="right", style=C_TEAL, no_wrap=True)
-    tbl.add_column("Out", justify="right", style=C_TEAL, no_wrap=True)
-    tbl.add_column("Cache", justify="right", style=C_GREEN, no_wrap=True)
-    tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}", no_wrap=True, min_width=6)
-    for r in by_agent:
-        data_root = r.get("data_root") or ""
-        tbl.add_row(
-            _source_root_label(data_root, max_len=source_width),
-            r["agent_type"],
-            r.get("provider") or "—",
-            f"{r['session_count']:,}",
-            f"{r['user_turns']:,}",
-            _fmt_tokens(r.get("input_tokens") or 0),
-            _fmt_tokens(r.get("output_tokens") or 0),
-            _fmt_tokens(_cache_tokens(r)),
-            _fmt_cost(r.get("estimated_cost_usd"), unknown=_has_unknown_cost(r)),
-        )
-    return tbl
-
-
 def _build_by_agent_model_table(rows: list[dict], *, limit: int = 8) -> Table | None:
     nonzero = [r for r in rows if _has_cost_signal(r)]
     if not nonzero:
@@ -864,11 +866,63 @@ def _build_by_agent_model_table(rows: list[dict], *, limit: int = 8) -> Table | 
     return tbl
 
 
+def _build_cross_table(
+    title: str,
+    a_title: str,
+    rows: list[dict],
+    a_value,
+    *,
+    a_width: int,
+    model_width: int | None = None,
+) -> Table | None:
+    """Render a two-key A × model breakdown (one row per A × model).
+
+    ``a_value`` maps a row to its left-column display string; the model
+    column handles the ``Unknown: <raw>`` relabel. Rows arrive pre-sorted
+    by cost, so A repeats across its models instead of being grouped.
+    """
+    nonzero = [r for r in rows if _has_cost_signal(r)]
+    if not nonzero:
+        return None
+    model_width = model_width or _scale_width(14, 32)
+    tbl = Table(
+        show_header=True,
+        header_style=f"bold {C_SUBTEXT}",
+        box=box.SIMPLE_HEAVY,
+        pad_edge=False,
+        border_style=C_SURFACE1,
+        title=title,
+        title_style=f"bold {C_TEXT}",
+        title_justify="left",
+    )
+    tbl.add_column(a_title, style=C_MAUVE, overflow="ellipsis", no_wrap=True, max_width=a_width)
+    tbl.add_column("Model", style=C_SKY, overflow="ellipsis", no_wrap=True, max_width=model_width)
+    tbl.add_column("Sess", justify="right", style=C_TEXT, no_wrap=True)
+    tbl.add_column("In", justify="right", style=C_TEAL, no_wrap=True)
+    tbl.add_column("Out", justify="right", style=C_TEAL, no_wrap=True)
+    tbl.add_column("Cache", justify="right", style=C_GREEN, no_wrap=True)
+    tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}", no_wrap=True, min_width=7)
+    for r in nonzero:
+        model_display = r.get("model") or "—"
+        if model_display == "Unknown" and r.get("raw_model"):
+            model_display = f"Unknown: {r['raw_model']}"
+        tbl.add_row(
+            a_value(r),
+            model_display,
+            f"{r.get('session_count') or 0:,}",
+            _fmt_tokens(r.get("input_tokens") or 0),
+            _fmt_tokens(r.get("output_tokens") or 0),
+            _fmt_tokens(_cache_tokens(r)),
+            _fmt_cost(r.get("estimated_cost_usd"), unknown=_has_unknown_cost(r)),
+        )
+    return tbl
+
+
 def _build_top_projects_table(rows: list[dict]) -> Table | None:
     nonzero = [r for r in rows if _has_cost_signal(r)]
     if not nonzero:
         return None
-    project_width = max(72, min(140, _console_width() - 44))
+    project_width = max(32, min(140, _console_width() - 44))
     tbl = Table(
         show_header=True,
         header_style=f"bold {C_SUBTEXT}",
@@ -884,7 +938,7 @@ def _build_top_projects_table(rows: list[dict]) -> Table | None:
     tbl.add_column("Input", justify="right", style=C_TEAL, no_wrap=True)
     tbl.add_column("Output", justify="right", style=C_TEAL, no_wrap=True)
     tbl.add_column("Cache", justify="right", style=C_GREEN, no_wrap=True)
-    tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}", no_wrap=True)
+    tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}", no_wrap=True, min_width=7)
     for r in nonzero:
         path = _source_prefixed_path(
             r["project_path"] or "(unspecified)",
@@ -906,7 +960,7 @@ def _build_project_agent_table(rows: list[dict]) -> Table | None:
     nonzero = [r for r in rows if _has_cost_signal(r)]
     if not nonzero:
         return None
-    project_width = max(56, min(120, _console_width() - 56))
+    project_width = max(28, min(120, _console_width() - 56))
     agent_width = _scale_width(8, 14)
     tbl = Table(
         show_header=True,
