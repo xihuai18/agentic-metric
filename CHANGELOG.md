@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.6.3 (2026-06-05)
+
+### Changes
+
+- **Richer `report --full` drill-down**: added by-host, by-agent,
+  by-provider, by-model, and by-project × agent tables, with matching JSON
+  fields for scripted use.
+- **Wider report tables on wide terminals**: source, agent, provider, model,
+  and project columns now scale with terminal width to reduce unnecessary
+  truncation.
+- **Distinct session counts by dimension**: aggregate tables now calculate
+  sessions independently per dimension, avoiding misleading totals when one
+  session spans multiple models.
+
 ## v0.4.0 (2026-05-04)
 
 ### Changes

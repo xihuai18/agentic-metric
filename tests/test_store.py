@@ -18,7 +18,12 @@ from agentic_metric.store.aggregator import (
     get_daily_trends,
     get_heatmap,
     get_range_by_project,
+    get_range_by_project_agent,
+    get_range_by_agent_type,
     get_range_by_agent_model,
+    get_range_by_host,
+    get_range_by_model,
+    get_range_by_provider,
     get_range_daily,
     get_range_by_time_model,
     get_range_top_sessions,
@@ -537,6 +542,107 @@ def test_range_reports_split_provider_and_data_root():
     db.close()
 
 
+def test_range_dimension_breakdowns_group_without_model_session_overcount():
+    db = _make_db()
+    db.replace_session_usage(
+        "local-multi-model",
+        "codex",
+        [
+            {
+                "usage_date": "2026-04-24",
+                "usage_hour": 10,
+                "model": "gpt-5.4",
+                "message_count": 2,
+                "user_turns": 1,
+                "input_tokens": 1_000,
+            },
+            {
+                "usage_date": "2026-04-24",
+                "usage_hour": 11,
+                "model": "gpt-5.5",
+                "message_count": 2,
+                "user_turns": 1,
+                "input_tokens": 2_000,
+            },
+        ],
+        provider="openai",
+        data_root="/tmp/codex-openai",
+    )
+    db.replace_session_usage(
+        "local-other-root",
+        "claude_code",
+        [
+            {
+                "usage_date": "2026-04-24",
+                "usage_hour": 12,
+                "model": "claude-sonnet-4-6",
+                "message_count": 2,
+                "user_turns": 1,
+                "input_tokens": 3_000,
+            },
+        ],
+        provider="anthropic",
+        data_root="/tmp/claude",
+    )
+    db.replace_session_usage(
+        "remote-session",
+        "codex",
+        [
+            {
+                "usage_date": "2026-04-24",
+                "usage_hour": 13,
+                "model": "gpt-5.4",
+                "message_count": 2,
+                "user_turns": 1,
+                "input_tokens": 4_000,
+            },
+        ],
+        provider="openai",
+        data_root="ssh://devcloud/~/.codex",
+    )
+    db.commit()
+
+    by_host = get_range_by_host(db, "2026-04-24", "2026-04-24")
+    assert {
+        (row["host"], row["session_count"], row["input_tokens"])
+        for row in by_host
+    } == {
+        ("local", 2, 6_000),
+        ("devcloud", 1, 4_000),
+    }
+
+    by_agent = get_range_by_agent_type(db, "2026-04-24", "2026-04-24")
+    assert {
+        (row["agent_type"], row["session_count"], row["input_tokens"])
+        for row in by_agent
+    } == {
+        ("codex", 2, 7_000),
+        ("claude_code", 1, 3_000),
+    }
+
+    by_provider = get_range_by_provider(db, "2026-04-24", "2026-04-24")
+    assert {
+        (row["provider"], row["session_count"], row["input_tokens"])
+        for row in by_provider
+    } == {
+        ("openai", 2, 7_000),
+        ("anthropic", 1, 3_000),
+    }
+
+    by_model = get_range_by_model(db, "2026-04-24", "2026-04-24")
+    assert {
+        (row["model"], row["session_count"], row["input_tokens"])
+        for row in by_model
+    } == {
+        ("gpt-5.4", 2, 5_000),
+        ("gpt-5.5", 1, 2_000),
+        ("claude-sonnet-4-6", 1, 3_000),
+    }
+    assert sum(row["session_count"] for row in by_model) == 4
+    assert sum(row["session_count"] for row in by_agent) == 3
+    db.close()
+
+
 def test_top_projects_split_same_path_by_data_root():
     db = _make_db()
     for session_id, data_root, input_tokens in (
@@ -602,6 +708,52 @@ def test_top_projects_merge_same_path_across_local_roots():
     assert row["project_path"] == "/work/project"
     assert row["input_tokens"] == 3_000
     assert row["session_count"] == 2
+    db.close()
+
+
+def test_project_agent_breakdown_merges_local_roots_but_splits_agents():
+    db = _make_db()
+    rows = [
+        ("codex-a", "codex", "/home/u/.codex", "/work/a", 1_000),
+        ("codex-b", "codex", "/home/u/.wcx", "/work/a", 2_000),
+        ("claude-a", "claude_code", "/home/u/.wcc", "/work/a", 3_000),
+        ("remote-a", "codex", "ssh://devcloud/~/.codex", "/work/a", 4_000),
+    ]
+    for session_id, agent_type, data_root, project_path, input_tokens in rows:
+        db.replace_session_usage(
+            session_id,
+            agent_type,
+            [
+                {
+                    "usage_date": "2026-04-24",
+                    "usage_hour": 10,
+                    "project_path": project_path,
+                    "model": "gpt-5.4",
+                    "message_count": 2,
+                    "user_turns": 1,
+                    "input_tokens": input_tokens,
+                },
+            ],
+            provider="openai",
+            data_root=data_root,
+        )
+    db.commit()
+
+    result = get_range_by_project_agent(db, "2026-04-24", "2026-04-24", limit=10)
+    assert {
+        (
+            row["data_root"],
+            row["project_path"],
+            row["agent_type"],
+            row["session_count"],
+            row["input_tokens"],
+        )
+        for row in result
+    } == {
+        ("/home/u/.codex", "/work/a", "codex", 2, 3_000),
+        ("/home/u/.wcc", "/work/a", "claude_code", 1, 3_000),
+        ("ssh://devcloud/~/.codex", "/work/a", "codex", 1, 4_000),
+    }
     db.close()
 
 
@@ -1260,6 +1412,51 @@ def test_report_renders_tables_sequentially_and_highlights_cache_pct(monkeypatch
         "cache_creation_tokens": 0,
         "estimated_cost_usd": 12.0,
     }]
+    by_host = [{
+        "host": "local",
+        "session_count": 2,
+        "message_count": 10,
+        "user_turns": 4,
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "cache_read_tokens": 300,
+        "cache_creation_tokens": 0,
+        "estimated_cost_usd": 12.0,
+    }]
+    by_agent_type = [{
+        "agent_type": "codex",
+        "session_count": 2,
+        "message_count": 10,
+        "user_turns": 4,
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "cache_read_tokens": 300,
+        "cache_creation_tokens": 0,
+        "estimated_cost_usd": 12.0,
+    }]
+    by_provider = [{
+        "provider": "openai",
+        "session_count": 2,
+        "message_count": 10,
+        "user_turns": 4,
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "cache_read_tokens": 300,
+        "cache_creation_tokens": 0,
+        "estimated_cost_usd": 12.0,
+    }]
+    by_model = [{
+        "model": "gpt-5.5",
+        "raw_model": "gpt-5.5",
+        "session_count": 2,
+        "message_count": 10,
+        "user_turns": 4,
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "cache_read_tokens": 300,
+        "cache_creation_tokens": 0,
+        "estimated_cost_usd": 12.0,
+    }]
     by_agent_model = [{
         **by_agent[0],
         "model": "gpt-5.5",
@@ -1274,6 +1471,11 @@ def test_report_renders_tables_sequentially_and_highlights_cache_pct(monkeypatch
         "cache_read_tokens": 300,
         "cache_creation_tokens": 0,
         "estimated_cost_usd": 12.0,
+    }]
+    by_project_agent = [{
+        **by_project[0],
+        "agent_type": "codex",
+        "message_count": 10,
     }]
     periodic = [{
         "label": "Mon",
@@ -1291,9 +1493,14 @@ def test_report_renders_tables_sequentially_and_highlights_cache_pct(monkeypatch
         "2026-05-25",
         "2026-05-26",
         totals,
+        by_host,
+        by_agent_type,
+        by_provider,
+        by_model,
         by_agent,
         by_agent_model,
         by_project,
+        by_project_agent,
         periodic,
         "week",
         full=True,
@@ -1302,6 +1509,11 @@ def test_report_renders_tables_sequentially_and_highlights_cache_pct(monkeypatch
     rendered = console.export_text()
     assert "Cache %" in rendered
     assert "75%" in rendered
+    assert "By host" in rendered
+    assert "By agent" in rendered
+    assert "By provider" in rendered
+    assert "By model" in rendered
+    assert "By project × agent" in rendered
     assert not any("By provider" in line and "By day" in line for line in rendered.splitlines())
 
 

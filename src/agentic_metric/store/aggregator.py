@@ -603,6 +603,114 @@ def get_range_by_agent(db: Database, from_date: str, to_date: str) -> list[dict]
     return [dict(r) for r in rows]
 
 
+def _range_group_rows(
+    db: Database,
+    from_date: str,
+    to_date: str,
+    *,
+    select_expr: str,
+    group_expr: str,
+    label_column: str,
+) -> list[dict]:
+    usage = _usage_source(db)
+    rows = db.conn.execute(
+        f"""SELECT {select_expr} AS {label_column},
+                  {_session_count_expr()} AS session_count,
+                  COALESCE(SUM(user_turns), 0) AS user_turns,
+                  COALESCE(SUM(message_count), 0) AS message_count,
+                  COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                  COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                  COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+                  COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
+                  COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd,
+                  {_unknown_cost_expr()} AS unknown_cost_count
+           FROM {usage}
+           WHERE usage_date BETWEEN ? AND ?
+           GROUP BY {group_expr}
+           ORDER BY estimated_cost_usd DESC, unknown_cost_count DESC
+        """,
+        (from_date, to_date),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_range_by_host(db: Database, from_date: str, to_date: str) -> list[dict]:
+    """Return per-host/source aggregates within the range."""
+    rows = _range_group_rows(
+        db,
+        from_date,
+        to_date,
+        select_expr="data_root",
+        group_expr="data_root",
+        label_column="data_root",
+    )
+    sum_fields = (
+        "session_count", "user_turns", "message_count", "input_tokens",
+        "output_tokens", "cache_read_tokens", "cache_creation_tokens",
+        "estimated_cost_usd", "unknown_cost_count",
+    )
+    merged: dict[str, dict] = {}
+    for row in rows:
+        host = source_label(row.get("data_root") or "")
+        existing = merged.get(host)
+        if existing is None:
+            row["host"] = host
+            merged[host] = row
+            continue
+        for field in sum_fields:
+            existing[field] = (existing.get(field) or 0) + (row.get(field) or 0)
+
+    return sorted(
+        merged.values(),
+        key=lambda r: (r.get("estimated_cost_usd") or 0, r.get("unknown_cost_count") or 0),
+        reverse=True,
+    )
+
+
+def get_range_by_agent_type(db: Database, from_date: str, to_date: str) -> list[dict]:
+    """Return per-agent aggregates within the range."""
+    return _range_group_rows(
+        db,
+        from_date,
+        to_date,
+        select_expr="agent_type",
+        group_expr="agent_type",
+        label_column="agent_type",
+    )
+
+
+def get_range_by_provider(db: Database, from_date: str, to_date: str) -> list[dict]:
+    """Return per-provider aggregates within the range."""
+    return _range_group_rows(
+        db,
+        from_date,
+        to_date,
+        select_expr="CASE WHEN provider = '' THEN '—' ELSE provider END",
+        group_expr="provider",
+        label_column="provider",
+    )
+
+
+def get_range_by_model(db: Database, from_date: str, to_date: str) -> list[dict]:
+    """Return per-model aggregates within the range."""
+    rows = _range_group_rows(
+        db,
+        from_date,
+        to_date,
+        select_expr="model",
+        group_expr="model",
+        label_column="raw_model",
+    )
+    out = []
+    for r in rows:
+        row = dict(r)
+        raw = row.pop("raw_model") or ""
+        row["raw_model"] = raw
+        row["model"] = _model_label(raw)
+        out.append(row)
+    return out
+
+
 def get_range_by_agent_model(db: Database, from_date: str, to_date: str) -> list[dict]:
     """Return per-(agent, provider, data_root, model) aggregates within the range.
 
@@ -680,6 +788,63 @@ def get_range_by_project(db: Database, from_date: str, to_date: str, limit: int 
         # source_label is invariant within a merge group, so keeping the
         # first-seen data_root preserves the rendered source prefix.
         key = (source_label(row.get("data_root") or ""), row["project_path"])
+        existing = merged.get(key)
+        if existing is None:
+            merged[key] = row
+            continue
+        for field in sum_fields:
+            existing[field] = (existing.get(field) or 0) + (row.get(field) or 0)
+
+    out = sorted(
+        merged.values(),
+        key=lambda r: (r.get("estimated_cost_usd") or 0, r.get("unknown_cost_count") or 0),
+        reverse=True,
+    )
+    return out[:limit]
+
+
+def get_range_by_project_agent(
+    db: Database,
+    from_date: str,
+    to_date: str,
+    limit: int = 10,
+) -> list[dict]:
+    """Return top project/source rows split by agent within the range."""
+    usage = _usage_source(db)
+    rows = db.conn.execute(
+        f"""SELECT data_root,
+                  agent_type,
+                  CASE WHEN project_path = '' THEN '(unspecified)'
+                       ELSE project_path END AS project_path,
+                  {_session_count_expr()} AS session_count,
+                  COALESCE(SUM(message_count), 0) AS message_count,
+                  COALESCE(SUM(user_turns), 0) AS user_turns,
+                  COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                  COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                  COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+                  COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
+                  COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd,
+                  {_unknown_cost_expr()} AS unknown_cost_count
+           FROM {usage}
+           WHERE usage_date BETWEEN ? AND ?
+           GROUP BY data_root, project_path, agent_type
+        """,
+        (from_date, to_date),
+    ).fetchall()
+
+    sum_fields = (
+        "session_count", "message_count", "user_turns", "input_tokens",
+        "output_tokens", "cache_read_tokens", "cache_creation_tokens",
+        "estimated_cost_usd", "unknown_cost_count",
+    )
+    merged: dict[tuple[str, str, str], dict] = {}
+    for r in rows:
+        row = dict(r)
+        key = (
+            source_label(row.get("data_root") or ""),
+            row["project_path"],
+            row["agent_type"],
+        )
         existing = merged.get(key)
         if existing is None:
             merged[key] = row

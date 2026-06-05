@@ -82,6 +82,20 @@ def _panel_width() -> int:
         return MAX_PANEL_WIDTH
 
 
+def _console_width(default: int = MAX_PANEL_WIDTH) -> int:
+    try:
+        return console.size.width
+    except Exception:
+        return default
+
+
+def _scale_width(base: int, wide: int, *, threshold: int = 120) -> int:
+    width = _console_width()
+    if width <= threshold:
+        return base
+    return min(wide, base + (width - threshold) // 4)
+
+
 def _version_callback(value: bool) -> None:
     if value:
         console.print(f"agentic-metric {_pkg_version('agentic-metric-x')}")
@@ -184,11 +198,11 @@ def report(
         False, "--no-sync", help="Skip syncing collectors before querying."
     ),
     full: bool = typer.Option(
-        False, "--full", help="Show the full drill-down with per-provider and per-time tables."
+        False, "--full", help="Show the full drill-down with host, agent, provider, model, and time tables."
     ),
     limit: int = typer.Option(
         8, "--limit", "-n", min=1, max=25,
-        help="Rows shown in Top projects and per-provider model breakdown.",
+        help="Rows shown in Top projects and model drill-downs.",
     ),
     json_: bool = typer.Option(
         False, "--json", help="Output machine-readable JSON instead of tables."
@@ -241,9 +255,14 @@ def report(
             db.commit()
 
         totals = aggregator.get_range_totals(db, frm, to)
+        by_host = aggregator.get_range_by_host(db, frm, to)
+        by_agent_type = aggregator.get_range_by_agent_type(db, frm, to)
+        by_provider = aggregator.get_range_by_provider(db, frm, to)
+        by_model = aggregator.get_range_by_model(db, frm, to)
         by_agent = aggregator.get_range_by_agent(db, frm, to)
         by_agent_model = aggregator.get_range_by_agent_model(db, frm, to)
         by_project = aggregator.get_range_by_project(db, frm, to, limit=limit)
+        by_project_agent = aggregator.get_range_by_project_agent(db, frm, to, limit=limit)
         # Periodic breakdown (hourly/daily/weekly) — only when the range
         # corresponds to a named focus.
         focus_kind = None
@@ -261,7 +280,9 @@ def report(
 
         if json_:
             _emit_report_json(
-                label, frm, to, totals, by_agent, by_agent_model, by_project,
+                label, frm, to, totals,
+                by_host, by_agent_type, by_provider, by_model,
+                by_agent, by_agent_model, by_project, by_project_agent,
                 sync_errors=sync_errors,
             )
         else:
@@ -269,7 +290,9 @@ def report(
                 for err in sync_errors:
                     console.print(f"[{C_YELLOW}]remote sync skipped: {err}[/]")
             _print_report(
-                label, frm, to, totals, by_agent, by_agent_model, by_project,
+                label, frm, to, totals,
+                by_host, by_agent_type, by_provider, by_model,
+                by_agent, by_agent_model, by_project, by_project_agent,
                 periodic, focus_kind, prev_totals, full=full, limit=limit,
             )
 
@@ -288,8 +311,10 @@ def report(
 
 def _emit_report_json(
     label: str, frm: str, to: str,
-    totals: dict, by_agent: list[dict],
-    by_agent_model: list[dict], by_project: list[dict],
+    totals: dict,
+    by_host: list[dict], by_agent_type: list[dict],
+    by_provider: list[dict], by_model: list[dict], by_agent: list[dict],
+    by_agent_model: list[dict], by_project: list[dict], by_project_agent: list[dict],
     sync_errors: list[str] | None = None,
 ) -> None:
     """Print the report as machine-readable JSON (for scripts / pipes)."""
@@ -298,9 +323,14 @@ def _emit_report_json(
         "from": frm,
         "to": to,
         "totals": dict(totals),
+        "by_host": [dict(r) for r in by_host],
+        "by_agent_type": [dict(r) for r in by_agent_type],
+        "by_provider": [dict(r) for r in by_provider],
+        "by_model": [dict(r) for r in by_model],
         "by_agent": [dict(r) for r in by_agent],
         "by_agent_model": [dict(r) for r in by_agent_model],
         "by_project": [dict(r) for r in by_project],
+        "by_project_agent": [dict(r) for r in by_project_agent],
         "sync_errors": sync_errors or [],
     }
     print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
@@ -309,7 +339,7 @@ def _emit_report_json(
 @app.command("today")
 def today_cmd(
     no_sync: bool = typer.Option(False, "--no-sync", help="Skip syncing collectors before querying."),
-    full: bool = typer.Option(False, "--full", help="Show the full drill-down with per-provider and per-time tables."),
+    full: bool = typer.Option(False, "--full", help="Show the full drill-down with host, agent, provider, model, and time tables."),
     limit: int = typer.Option(8, "--limit", "-n", min=1, max=25, help="Rows shown in Top projects and model breakdown."),
     json_: bool = typer.Option(False, "--json", help="Output machine-readable JSON instead of tables."),
     watch: float = typer.Option(0, "--watch", "-w", min=0, help="Refresh every N seconds (0 disables)."),
@@ -321,7 +351,7 @@ def today_cmd(
 @app.command("week")
 def week_cmd(
     no_sync: bool = typer.Option(False, "--no-sync", help="Skip syncing collectors before querying."),
-    full: bool = typer.Option(False, "--full", help="Show the full drill-down with per-provider and per-time tables."),
+    full: bool = typer.Option(False, "--full", help="Show the full drill-down with host, agent, provider, model, and time tables."),
     limit: int = typer.Option(8, "--limit", "-n", min=1, max=25, help="Rows shown in Top projects and model breakdown."),
     json_: bool = typer.Option(False, "--json", help="Output machine-readable JSON instead of tables."),
     watch: float = typer.Option(0, "--watch", "-w", min=0, help="Refresh every N seconds (0 disables)."),
@@ -333,7 +363,7 @@ def week_cmd(
 @app.command("month")
 def month_cmd(
     no_sync: bool = typer.Option(False, "--no-sync", help="Skip syncing collectors before querying."),
-    full: bool = typer.Option(False, "--full", help="Show the full drill-down with per-provider and per-time tables."),
+    full: bool = typer.Option(False, "--full", help="Show the full drill-down with host, agent, provider, model, and time tables."),
     limit: int = typer.Option(8, "--limit", "-n", min=1, max=25, help="Rows shown in Top projects and model breakdown."),
     json_: bool = typer.Option(False, "--json", help="Output machine-readable JSON instead of tables."),
     watch: float = typer.Option(0, "--watch", "-w", min=0, help="Refresh every N seconds (0 disables)."),
@@ -346,7 +376,7 @@ def month_cmd(
 def history_cmd(
     days: int = typer.Option(14, "--days", "-d", min=1, max=365, help="Number of days to include."),
     no_sync: bool = typer.Option(False, "--no-sync", help="Skip syncing collectors before querying."),
-    full: bool = typer.Option(False, "--full", help="Show the full drill-down with per-provider and per-time tables."),
+    full: bool = typer.Option(False, "--full", help="Show the full drill-down with host, agent, provider, model, and time tables."),
     limit: int = typer.Option(8, "--limit", "-n", min=1, max=25, help="Rows shown in Top projects and model breakdown."),
     json_: bool = typer.Option(False, "--json", help="Output machine-readable JSON instead of tables."),
     watch: float = typer.Option(0, "--watch", "-w", min=0, help="Refresh every N seconds (0 disables)."),
@@ -369,8 +399,10 @@ def history_cmd(
 
 def _print_report(
     label: str, frm: str, to: str,
-    totals: dict, by_agent: list[dict],
-    by_agent_model: list[dict], by_project: list[dict],
+    totals: dict,
+    by_host: list[dict], by_agent_type: list[dict],
+    by_provider: list[dict], by_model: list[dict], by_agent: list[dict],
+    by_agent_model: list[dict], by_project: list[dict], by_project_agent: list[dict],
     periodic: list[dict],
     focus_kind: str | None,
     prev_totals: dict | None = None,
@@ -431,6 +463,11 @@ def _print_report(
     # ─── Table renderables ───
     breakdown_tbl = _build_by_agent_model_table(by_agent_model, limit=limit)
     project_tbl = _build_top_projects_table(by_project)
+    project_agent_tbl = _build_project_agent_table(by_project_agent) if full else None
+    host_tbl = _build_dimension_table("By host", "Host", by_host, "host", max_label_width=18) if full else None
+    agent_type_tbl = _build_dimension_table("By agent", "Agent", by_agent_type, "agent_type", max_label_width=18) if full else None
+    provider_tbl = _build_dimension_table("By provider", "Provider", by_provider, "provider", max_label_width=18) if full else None
+    model_tbl = _build_dimension_table("By model", "Model", by_model, "model", max_label_width=32) if full else None
     agent_tbl = _build_by_agent_table(by_agent) if full else None
     periodic_tbl = _build_periodic_table(periodic, focus_kind) if full else None
 
@@ -445,7 +482,18 @@ def _print_report(
     if project_tbl is not None:
         console.print(project_tbl)
 
-    detail_tables = [t for t in (agent_tbl, periodic_tbl) if t is not None]
+    detail_tables = [
+        t for t in (
+            host_tbl,
+            agent_type_tbl,
+            provider_tbl,
+            model_tbl,
+            project_agent_tbl,
+            agent_tbl,
+            periodic_tbl,
+        )
+        if t is not None
+    ]
     if detail_tables:
         for t in detail_tables:
             console.print(t)
@@ -519,7 +567,7 @@ def _build_heatmap_panel(
         cell_w, label_every = 12, 1
     try:
         outer = width if width is not None else console.size.width
-        available = max(24, outer - 4)
+        available = max(24, outer - 8)
         cell_w = min(cell_w, max(2, available // max(n, 1)))
     except Exception:
         pass
@@ -646,9 +694,61 @@ def _top_projects_block(
     return Group(*lines)
 
 
+def _build_dimension_table(
+    title: str,
+    label: str,
+    rows: list[dict],
+    label_key: str,
+    *,
+    max_label_width: int,
+) -> Table | None:
+    nonzero = [r for r in rows if _has_cost_signal(r)]
+    if not nonzero:
+        return None
+    tbl = Table(
+        show_header=True,
+        header_style=f"bold {C_SUBTEXT}",
+        box=box.SIMPLE_HEAVY,
+        pad_edge=False,
+        border_style=C_SURFACE1,
+        title=title,
+        title_style=f"bold {C_TEXT}",
+        title_justify="left",
+    )
+    tbl.add_column(label, style=C_SKY, overflow="ellipsis", no_wrap=True, max_width=max_label_width)
+    tbl.add_column("Sess", justify="right", style=C_TEXT, no_wrap=True)
+    tbl.add_column("Req", justify="right", style=C_TEXT, no_wrap=True)
+    tbl.add_column("Turns", justify="right", style=C_TEXT, no_wrap=True)
+    tbl.add_column("In", justify="right", style=C_TEAL, no_wrap=True)
+    tbl.add_column("Out", justify="right", style=C_TEAL, no_wrap=True)
+    tbl.add_column("Cache", justify="right", style=C_GREEN, no_wrap=True)
+    tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}", no_wrap=True, min_width=6)
+
+    for r in nonzero:
+        display = r.get(label_key) or "—"
+        if label_key == "model" and display == "Unknown" and r.get("raw_model"):
+            display = f"Unknown: {r['raw_model']}"
+        turns = r.get("user_turns") or 0
+        messages = r.get("message_count") or 0
+        tbl.add_row(
+            display,
+            f"{r.get('session_count') or 0:,}",
+            f"{max(0, messages - turns):,}",
+            f"{turns:,}",
+            _fmt_tokens(r.get("input_tokens") or 0),
+            _fmt_tokens(r.get("output_tokens") or 0),
+            _fmt_tokens(_cache_tokens(r)),
+            _fmt_cost(r.get("estimated_cost_usd"), unknown=_has_unknown_cost(r)),
+        )
+    return tbl
+
+
 def _build_by_agent_table(by_agent: list[dict]) -> Table | None:
     if not by_agent:
         return None
+    source_width = _scale_width(16, 34)
+    agent_width = _scale_width(8, 14)
+    provider_width = _scale_width(6, 12)
     tbl = Table(
         show_header=True,
         header_style=f"bold {C_SUBTEXT}",
@@ -659,9 +759,9 @@ def _build_by_agent_table(by_agent: list[dict]) -> Table | None:
         title_style=f"bold {C_TEXT}",
         title_justify="left",
     )
-    tbl.add_column("Source", style=C_MUTED, overflow="ellipsis", no_wrap=True, max_width=16)
-    tbl.add_column("Ag", style=C_MAUVE, overflow="ellipsis", no_wrap=True, min_width=5, max_width=8)
-    tbl.add_column("Prov", style=C_SKY, overflow="ellipsis", no_wrap=True, min_width=4, max_width=6)
+    tbl.add_column("Source", style=C_MUTED, overflow="ellipsis", no_wrap=True, max_width=source_width)
+    tbl.add_column("Ag", style=C_MAUVE, overflow="ellipsis", no_wrap=True, min_width=5, max_width=agent_width)
+    tbl.add_column("Prov", style=C_SKY, overflow="ellipsis", no_wrap=True, min_width=4, max_width=provider_width)
     tbl.add_column("Sess", justify="right", style=C_TEXT, no_wrap=True)
     tbl.add_column("Turns", justify="right", style=C_TEXT, no_wrap=True)
     tbl.add_column("In", justify="right", style=C_TEAL, no_wrap=True)
@@ -671,7 +771,7 @@ def _build_by_agent_table(by_agent: list[dict]) -> Table | None:
     for r in by_agent:
         data_root = r.get("data_root") or ""
         tbl.add_row(
-            _source_root_label(data_root, max_len=16),
+            _source_root_label(data_root, max_len=source_width),
             r["agent_type"],
             r.get("provider") or "—",
             f"{r['session_count']:,}",
@@ -688,6 +788,10 @@ def _build_by_agent_model_table(rows: list[dict], *, limit: int = 8) -> Table | 
     nonzero = [r for r in rows if _has_cost_signal(r)]
     if not nonzero:
         return None
+    source_width = _scale_width(16, 34)
+    agent_width = _scale_width(8, 14)
+    provider_width = _scale_width(6, 12)
+    model_width = _scale_width(14, 32)
     tbl = Table(
         show_header=True,
         header_style=f"bold {C_SUBTEXT}",
@@ -698,10 +802,10 @@ def _build_by_agent_model_table(rows: list[dict], *, limit: int = 8) -> Table | 
         title_style=f"bold {C_TEXT}",
         title_justify="left",
     )
-    tbl.add_column("Source", style=C_MUTED, overflow="ellipsis", no_wrap=True, max_width=16)
-    tbl.add_column("Ag", style=C_MAUVE, overflow="ellipsis", no_wrap=True, min_width=5, max_width=8)
-    tbl.add_column("Prov", style=C_SKY, overflow="ellipsis", no_wrap=True, min_width=4, max_width=6)
-    tbl.add_column("Model", style=C_SKY, overflow="ellipsis", no_wrap=True, max_width=14)
+    tbl.add_column("Source", style=C_MUTED, overflow="ellipsis", no_wrap=True, max_width=source_width)
+    tbl.add_column("Ag", style=C_MAUVE, overflow="ellipsis", no_wrap=True, min_width=5, max_width=agent_width)
+    tbl.add_column("Prov", style=C_SKY, overflow="ellipsis", no_wrap=True, min_width=4, max_width=provider_width)
+    tbl.add_column("Model", style=C_SKY, overflow="ellipsis", no_wrap=True, max_width=model_width)
     tbl.add_column("In", justify="right", style=C_TEAL, no_wrap=True)
     tbl.add_column("Out", justify="right", style=C_TEAL, no_wrap=True)
     tbl.add_column("Cache", justify="right", style=C_GREEN, no_wrap=True)
@@ -724,7 +828,7 @@ def _build_by_agent_model_table(rows: list[dict], *, limit: int = 8) -> Table | 
             model_display = f"Unknown: {r['raw_model']}"
         data_root = r.get("data_root") or ""
         tbl.add_row(
-            _source_root_label(data_root, max_len=16) if show_group else "",
+            _source_root_label(data_root, max_len=source_width) if show_group else "",
             r["agent_type"] if show_group else "",
             (r.get("provider") or "—") if show_group else "",
             model_display,
@@ -764,6 +868,7 @@ def _build_top_projects_table(rows: list[dict]) -> Table | None:
     nonzero = [r for r in rows if _has_cost_signal(r)]
     if not nonzero:
         return None
+    project_width = max(72, min(140, _console_width() - 44))
     tbl = Table(
         show_header=True,
         header_style=f"bold {C_SUBTEXT}",
@@ -774,7 +879,7 @@ def _build_top_projects_table(rows: list[dict]) -> Table | None:
         title_style=f"bold {C_TEXT}",
         title_justify="left",
     )
-    tbl.add_column("Project", style=C_BLUE, overflow="ellipsis", no_wrap=True, max_width=72)
+    tbl.add_column("Project", style=C_BLUE, overflow="ellipsis", no_wrap=True, max_width=project_width)
     tbl.add_column("Sessions", justify="right", style=C_TEXT, no_wrap=True)
     tbl.add_column("Input", justify="right", style=C_TEAL, no_wrap=True)
     tbl.add_column("Output", justify="right", style=C_TEAL, no_wrap=True)
@@ -784,11 +889,58 @@ def _build_top_projects_table(rows: list[dict]) -> Table | None:
         path = _source_prefixed_path(
             r["project_path"] or "(unspecified)",
             r.get("data_root") or "",
-            max_len=72,
+            max_len=project_width,
         )
         tbl.add_row(
             path,
             f"{r['session_count']:,}",
+            _fmt_tokens(r.get("input_tokens") or 0),
+            _fmt_tokens(r.get("output_tokens") or 0),
+            _fmt_tokens(_cache_tokens(r)),
+            _fmt_cost(r.get("estimated_cost_usd"), unknown=_has_unknown_cost(r)),
+        )
+    return tbl
+
+
+def _build_project_agent_table(rows: list[dict]) -> Table | None:
+    nonzero = [r for r in rows if _has_cost_signal(r)]
+    if not nonzero:
+        return None
+    project_width = max(56, min(120, _console_width() - 56))
+    agent_width = _scale_width(8, 14)
+    tbl = Table(
+        show_header=True,
+        header_style=f"bold {C_SUBTEXT}",
+        box=box.SIMPLE_HEAVY,
+        pad_edge=False,
+        border_style=C_SURFACE1,
+        title="By project × agent",
+        title_style=f"bold {C_TEXT}",
+        title_justify="left",
+    )
+    tbl.add_column("Project", style=C_BLUE, overflow="ellipsis", no_wrap=True, max_width=project_width)
+    tbl.add_column("Agent", style=C_MAUVE, overflow="ellipsis", no_wrap=True, min_width=5, max_width=agent_width)
+    tbl.add_column("Sess", justify="right", style=C_TEXT, no_wrap=True)
+    tbl.add_column("Req", justify="right", style=C_TEXT, no_wrap=True)
+    tbl.add_column("Turns", justify="right", style=C_TEXT, no_wrap=True)
+    tbl.add_column("In", justify="right", style=C_TEAL, no_wrap=True)
+    tbl.add_column("Out", justify="right", style=C_TEAL, no_wrap=True)
+    tbl.add_column("Cache", justify="right", style=C_GREEN, no_wrap=True)
+    tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}", no_wrap=True, min_width=6)
+    for r in nonzero:
+        turns = r.get("user_turns") or 0
+        messages = r.get("message_count") or 0
+        path = _source_prefixed_path(
+            r["project_path"] or "(unspecified)",
+            r.get("data_root") or "",
+            max_len=project_width,
+        )
+        tbl.add_row(
+            path,
+            r.get("agent_type") or "—",
+            f"{r.get('session_count') or 0:,}",
+            f"{max(0, messages - turns):,}",
+            f"{turns:,}",
             _fmt_tokens(r.get("input_tokens") or 0),
             _fmt_tokens(r.get("output_tokens") or 0),
             _fmt_tokens(_cache_tokens(r)),
