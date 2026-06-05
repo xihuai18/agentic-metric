@@ -213,8 +213,8 @@ def get_remote_specs() -> list[RemoteSpec]:
     {
       "remotes": [
         {
-          "name": "devcloud",
-          "host": "devcloud",
+          "name": "remote-dev",
+          "host": "remote-dev",
           "collectors": {
             "codex": {"roots": [{"path": "~/.codex", "provider": "openai"}]},
             "claude_code": {"roots": [{"path": "~/.claude"}]}

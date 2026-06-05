@@ -132,6 +132,8 @@ class AgenticMetricApp(App):
         Binding("down,j", "forward_in_time", "Range", show=False),
         Binding("pageup", "scroll_breakdown_up", show=False),
         Binding("pagedown", "scroll_breakdown_down", show=False),
+        Binding("ctrl+b", "scroll_breakdown_up", show=False),
+        Binding("ctrl+f", "scroll_breakdown_down", show=False),
         Binding("period,0", "reset_offset", "Now", key_display="."),
         Binding("t", "focus('today')", "Today", show=False),
         Binding("w", "focus('week')", "Week", show=False),

@@ -598,7 +598,7 @@ def test_range_dimension_breakdowns_group_without_model_session_overcount():
             },
         ],
         provider="openai",
-        data_root="ssh://devcloud/~/.codex",
+        data_root="ssh://remote-a/~/.agent-data",
     )
     db.commit()
 
@@ -608,7 +608,7 @@ def test_range_dimension_breakdowns_group_without_model_session_overcount():
         for row in by_host
     } == {
         ("local", 2, 6_000),
-        ("devcloud", 1, 4_000),
+        ("remote-a", 1, 4_000),
     }
 
     by_agent = get_range_by_agent_type(db, "2026-04-24", "2026-04-24")
@@ -680,8 +680,8 @@ def test_top_projects_split_same_path_by_data_root():
 def test_top_projects_merge_same_path_across_local_roots():
     db = _make_db()
     for session_id, data_root, input_tokens in (
-        ("wcx-sid", "/home/u/.wcx", 1_000),
-        ("codex-sid", "/home/u/.codex", 2_000),
+        ("root-a-sid", "/tmp/root-a", 1_000),
+        ("root-b-sid", "/tmp/root-b", 2_000),
     ):
         db.replace_session_usage(
             session_id,
@@ -714,10 +714,10 @@ def test_top_projects_merge_same_path_across_local_roots():
 def test_project_agent_breakdown_merges_local_roots_but_splits_agents():
     db = _make_db()
     rows = [
-        ("codex-a", "codex", "/home/u/.codex", "/work/a", 1_000),
-        ("codex-b", "codex", "/home/u/.wcx", "/work/a", 2_000),
-        ("claude-a", "claude_code", "/home/u/.wcc", "/work/a", 3_000),
-        ("remote-a", "codex", "ssh://devcloud/~/.codex", "/work/a", 4_000),
+        ("codex-a", "codex", "/tmp/root-a", "/work/a", 1_000),
+        ("codex-b", "codex", "/tmp/root-b", "/work/a", 2_000),
+        ("claude-a", "claude_code", "/tmp/root-c", "/work/a", 3_000),
+        ("remote-a", "codex", "ssh://remote-a/~/.agent-data", "/work/a", 4_000),
     ]
     for session_id, agent_type, data_root, project_path, input_tokens in rows:
         db.replace_session_usage(
@@ -750,9 +750,9 @@ def test_project_agent_breakdown_merges_local_roots_but_splits_agents():
         )
         for row in result
     } == {
-        ("/home/u/.codex", "/work/a", "codex", 2, 3_000),
-        ("/home/u/.wcc", "/work/a", "claude_code", 1, 3_000),
-        ("ssh://devcloud/~/.codex", "/work/a", "codex", 1, 4_000),
+        ("/tmp/root-a", "/work/a", "codex", 2, 3_000),
+        ("/tmp/root-c", "/work/a", "claude_code", 1, 3_000),
+        ("ssh://remote-a/~/.agent-data", "/work/a", "codex", 1, 4_000),
     }
     db.close()
 
@@ -762,10 +762,10 @@ def test_top_projects_limit_applies_after_merge():
     # Project A is split across two local roots; each split alone would rank
     # below B and C, but the merged total must outrank them and survive limit=2.
     splits = [
-        ("a1", "/home/u/.wcx", "/work/a", 3_000),
-        ("a2", "/home/u/.codex", "/work/a", 3_000),
-        ("b1", "/home/u/.codex", "/work/b", 4_000),
-        ("c1", "/home/u/.codex", "/work/c", 3_500),
+        ("a1", "/tmp/root-a", "/work/a", 3_000),
+        ("a2", "/tmp/root-b", "/work/a", 3_000),
+        ("b1", "/tmp/root-b", "/work/b", 4_000),
+        ("c1", "/tmp/root-b", "/work/c", 3_500),
     ]
     for session_id, data_root, project_path, input_tokens in splits:
         db.replace_session_usage(
@@ -1680,7 +1680,7 @@ def test_tui_summary_follows_focused_time_offset(monkeypatch, tmp_path):
 
     async def run() -> None:
         app = AgenticMetricApp()
-        async with app.run_test(headless=True, size=(120, 36)):
+        async with app.run_test(headless=True, size=(120, 36)) as pilot:
             def labels() -> list[str]:
                 return [
                     app.query_one(sel, SummaryCell).label
@@ -1688,7 +1688,54 @@ def test_tui_summary_follows_focused_time_offset(monkeypatch, tmp_path):
                 ]
 
             assert labels() == ["TODAY", "WEEK", "MONTH"]
+            breakdown = app.query_one("#breakdown-body", Breakdown)
+            breakdown.update_data(
+                [{
+                    "host": "local",
+                    "cost": 100.0,
+                    "unknown_cost_count": 0,
+                    "input": 100,
+                    "output": 100,
+                    "cache": 100,
+                    "agents": [{
+                        "agent": "codex",
+                        "cost": 100.0,
+                        "unknown_cost_count": 0,
+                        "input": 100,
+                        "output": 100,
+                        "cache": 100,
+                        "providers": [{
+                            "provider": "openai",
+                            "data_root": "/tmp/root",
+                            "cost": 100.0,
+                            "unknown_cost_count": 0,
+                            "input": 100,
+                            "output": 100,
+                            "cache": 100,
+                            "models": [
+                                {
+                                    "model": f"model-{i:02d}",
+                                    "cost": 1.0,
+                                    "unknown_cost_count": 0,
+                                    "input": 1,
+                                    "output": 1,
+                                    "cache": 1,
+                                }
+                                for i in range(40)
+                            ],
+                        }],
+                    }],
+                }],
+                100.0,
+            )
+            app.query_one("#breakdown-scroll").refresh(layout=True)
+            app.query_one("#breakdown-body").refresh(layout=True)
+            await pilot.pause()
+            scroller = app.query_one("#breakdown-scroll")
+            assert scroller.max_scroll_y > 0
             app.action_scroll_breakdown_down()
+            await pilot.pause()
+            assert scroller.scroll_y > 0
             app.action_scroll_breakdown_up()
 
             app.action_focus("week")

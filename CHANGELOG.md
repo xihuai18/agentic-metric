@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.6.4 (2026-06-06)
+
+### Fixes
+
+- **TUI breakdown scrolling**: the breakdown widget now reports its rendered
+  content height to Textual, so the scroll container can scroll long
+  host → agent → provider → model trees.
+- **Extra breakdown scroll keys**: `Ctrl+F` and `Ctrl+B` now scroll the
+  breakdown panel in addition to `PageDown` and `PageUp`.
+- **Generic remote examples**: README, config examples, and tests now use
+  generic remote host/root names instead of environment-flavored examples.
+
 ## v0.6.3 (2026-06-05)
 
 ### Changes

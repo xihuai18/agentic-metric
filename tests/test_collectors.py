@@ -108,7 +108,7 @@ def test_remote_specs_default_to_local_collector_roots(tmp_path):
             "codex": {"roots": [{"path": "~/.codex-openai", "provider": "openai"}]},
             "claude_code": {"roots": [{"path": "~/.claude-main"}]},
         },
-        "remotes": [{"name": "dev", "host": "devcloud", "timeout": 7}],
+        "remotes": [{"name": "dev", "host": "remote-dev", "timeout": 7}],
     }))
 
     with patch("agentic_metric.config.CONFIG_FILE", config_file):
@@ -116,7 +116,7 @@ def test_remote_specs_default_to_local_collector_roots(tmp_path):
 
     assert len(remotes) == 1
     assert remotes[0].name == "dev"
-    assert remotes[0].host == "devcloud"
+    assert remotes[0].host == "remote-dev"
     assert remotes[0].timeout == 7
     assert remotes[0].collectors == {
         "codex": [RemoteCollectorRoot(path="~/.codex-openai", provider="openai")],
@@ -130,7 +130,7 @@ def test_default_registry_includes_remote_collectors(tmp_path):
         "remotes": [
             {
                 "name": "dev",
-                "host": "devcloud",
+                "host": "remote-dev",
                 "collectors": {
                     "codex": {"roots": [{"path": "~/.codex-remote/sessions", "provider": "openai"}]},
                     "claude_code": {"roots": [{"path": "~/.claude-remote/projects"}]},
@@ -153,18 +153,18 @@ def test_default_registry_includes_remote_collectors(tmp_path):
 
 
 def test_remote_ssh_command_expands_tilde_on_remote_host():
-    remote = RemoteSpec(host="devcloud", user="leo", port=2222)
+    remote = RemoteSpec(host="remote-dev", user="leo", port=2222)
     target = RemoteSyncTarget(remote, "codex", "~/.codex", "openai", 0)
     cmd = _ssh_command(remote, _manifest_command(target))
 
-    assert cmd[:4] == ["ssh", "-p", "2222", "leo@devcloud"]
+    assert cmd[:4] == ["ssh", "-p", "2222", "leo@remote-dev"]
     assert "root='~/.codex'" in cmd[-1]
     assert 'case "$root"' in cmd[-1]
     assert 'root="$HOME/${root#\\~/}"' in cmd[-1]
 
 
 def test_remote_manifest_command_supports_gnu_and_bsd_stat():
-    remote = RemoteSpec(host="devcloud")
+    remote = RemoteSpec(host="remote-dev")
     target = RemoteSyncTarget(remote, "codex", "~/.codex", "openai", 0)
     cmd = _manifest_command(target)
 
@@ -406,7 +406,7 @@ def test_remote_codex_collector_syncs_tarball_into_history(tmp_path):
         Mock(returncode=0, stdout=manifest, stderr=b""),
         Mock(returncode=0, stdout=tar_bytes.getvalue(), stderr=b""),
     ])
-    remote = RemoteSpec(host="devcloud", name="dev", timeout=9)
+    remote = RemoteSpec(host="remote-dev", name="dev", timeout=9)
     target = RemoteSyncTarget(
         remote=remote,
         agent_type="codex",
@@ -436,7 +436,7 @@ def test_remote_codex_collector_syncs_tarball_into_history(tmp_path):
 
 
 def test_remote_missing_path_does_not_parse_stale_cache(tmp_path):
-    remote = RemoteSpec(host="devcloud", name="dev")
+    remote = RemoteSpec(host="remote-dev", name="dev")
     target = RemoteSyncTarget(
         remote=remote,
         agent_type="codex",
@@ -491,7 +491,7 @@ def test_remote_missing_path_does_not_parse_stale_cache(tmp_path):
 
 
 def test_remote_unchanged_manifest_skips_download(tmp_path):
-    remote = RemoteSpec(host="devcloud", name="dev")
+    remote = RemoteSpec(host="remote-dev", name="dev")
     target = RemoteSyncTarget(
         remote=remote,
         agent_type="codex",
@@ -523,7 +523,7 @@ def test_remote_unchanged_manifest_skips_download(tmp_path):
 
 
 def test_remote_removed_file_is_archived_not_reparsed(tmp_path):
-    remote = RemoteSpec(host="devcloud", name="dev")
+    remote = RemoteSpec(host="remote-dev", name="dev")
     target = RemoteSyncTarget(
         remote=remote,
         agent_type="codex",

@@ -6,6 +6,7 @@ from datetime import datetime
 
 from rich.console import Group
 from rich.text import Text
+from textual.geometry import Size
 from textual.widgets import Static
 
 from ..formatting import cache_hit_rate as _cache_hit_rate
@@ -663,7 +664,7 @@ class Breakdown(Static):
     def update_data(self, groups: list[dict], total_cost: float) -> None:
         self._groups = groups
         self._total_cost = total_cost
-        self.refresh()
+        self.refresh(layout=True)
 
     # Fixed-width value columns to the right of every tree row:
     #   cost · share% · in · out · cached · cache%
@@ -844,16 +845,13 @@ class Breakdown(Static):
                     cost_style="bright_yellow",
                 )
 
-    def render(self) -> Text:
+    def _render_for_width(self, width: int) -> Text:
         if not self._groups:
             return Text("  No activity in the selected range.", style="white")
 
         total = max(self._total_cost, 1e-9)
         total_unknown = any(_has_unknown_cost(h) for h in self._groups)
-        try:
-            width = self.content_size.width
-        except Exception:
-            width = 120
+        width = width or 120
         # Right-align the value block to the panel edge (labels left, values
         # right — justified across the full width) and truncate labels so the
         # value columns never wrap onto a second line.
@@ -899,6 +897,19 @@ class Breakdown(Static):
                 )
 
         return t
+
+    def render(self) -> Text:
+        try:
+            width = self.content_size.width
+        except Exception:
+            width = 120
+        return self._render_for_width(width)
+
+    def get_content_height(self, container: Size, viewport: Size, width: int) -> int:
+        return len(self._render_for_width(width).plain.splitlines()) or 1
+
+    def get_content_width(self, container: Size, viewport: Size) -> int:
+        return max(container.width, self._VALUE_W + 24)
 
 
 def _has_unknown_cost(row: dict | None) -> bool:

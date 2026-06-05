@@ -292,8 +292,8 @@ SSH remotes, create this tool's own config file:
   },
   "remotes": [
     {
-      "name": "devcloud",
-      "host": "devcloud",
+      "name": "remote-dev",
+      "host": "remote-dev",
       "collectors": {
         "codex": {
           "roots": [{"path": "~/.codex", "provider": "openai"}]
@@ -330,8 +330,8 @@ retain the host/source dimension.
 
 Reports keep the headline totals merged across local and remote data. Detail
 tables use a compact `Source` label: local rows show the root (`~/.codex`), and
-remote rows show `host:root` (`devcloud:~/.codex`). Top projects use the same
-prefix for remote paths (`devcloud:/data/workspace/project`) so matching local
+remote rows show `host:root` (`remote-dev:~/.codex`). Top projects use the same
+prefix for remote paths (`remote-dev:/workspace/project`) so matching local
 and remote project paths are never silently merged. Multiple *local* roots that
 share a project path collapse into one row (they would render identically), so
 the same project worked on through two local agent homes is not double-listed.

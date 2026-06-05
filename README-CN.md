@@ -278,8 +278,8 @@ collector 会读取这些环境变量。需要同时扫描多个目录、手动�
   },
   "remotes": [
     {
-      "name": "devcloud",
-      "host": "devcloud",
+      "name": "remote-dev",
+      "host": "remote-dev",
       "collectors": {
         "codex": {
           "roots": [{"path": "~/.codex", "provider": "openai"}]
@@ -310,9 +310,9 @@ collector 目录,它会复用本机的 collector roots;本机也没有配置时,
 总量保持合并,明细和 Top projects 会保留 host/source 维度。
 
 报告顶部的总量会合并本机和远程数据。明细表使用紧凑的 `Source` 标签:本机行显示
-root,例如 `~/.codex`;远程行显示 `host:root`,例如 `devcloud:~/.codex`。
+root,例如 `~/.codex`;远程行显示 `host:root`,例如 `remote-dev:~/.codex`。
 Top projects 也会给远程路径加同样的前缀,例如
-`devcloud:/data/workspace/project`,避免本机和远程相同项目路径被静默合并。
+`remote-dev:/workspace/project`,避免本机和远程相同项目路径被静默合并。
 而同名项目若来自多个**本机** root,会合并为一行(否则显示完全相同),不会重复列出。
 `--full` 会额外展示按 source 汇总的 provider 表;默认报告保留
 source × agent × provider × model 明细和 Top projects。
