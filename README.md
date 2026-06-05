@@ -317,7 +317,8 @@ and `~/.codex` on the remote. Remote sync expands `~` on the remote host, reads
 `$DATA/agentic_metric/remote-cache/`, and aggregates those rows with local usage.
 It also keeps a remote file manifest in the cache, so repeated syncs only
 download changed session/index files instead of transferring full agent
-directories again.
+directories again. Cached files that disappear from the remote manifest are
+moved under `.stale/` and no longer parsed.
 If a remote path is missing, that collector is skipped rather than reusing old
 cache contents. CLI/TUI totals stay merged, while breakdowns and top projects
 retain the host/source dimension.

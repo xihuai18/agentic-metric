@@ -300,7 +300,8 @@ collector 目录,它会复用本机的 collector roots;本机也没有配置时,
 `~/.claude` 和 `~/.codex`。远程同步会在远程主机上展开 `~`,通过 SSH 读取
 `projects/` 和 `sessions/`,缓存到 `$DATA/agentic_metric/remote-cache/`,再和本机用量一起汇总。
 缓存里也会保存远程文件 manifest,所以重复 sync 只会下载变化过的 session/index
-文件,不会每次重新传完整 agent 目录。
+文件,不会每次重新传完整 agent 目录。已经从远程 manifest 消失的缓存文件会被移到
+`.stale/`,不再参与解析。
 如果远程目录不存在,这个 collector 会被跳过,不会拿旧缓存继续入库。CLI/TUI
 总量保持合并,明细和 Top projects 会保留 host/source 维度。
 

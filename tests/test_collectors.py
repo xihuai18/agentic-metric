@@ -510,6 +510,72 @@ def test_remote_unchanged_manifest_skips_download(tmp_path):
     assert run_mock.call_count == 1
 
 
+def test_remote_removed_file_is_archived_not_reparsed(tmp_path):
+    remote = RemoteSpec(host="devcloud", name="dev")
+    target = RemoteSyncTarget(
+        remote=remote,
+        agent_type="codex",
+        remote_root="~/.codex",
+        provider="openai",
+        index=0,
+    )
+    stale_lines = [
+        {
+            "timestamp": "2026-04-23T10:00:00Z",
+            "type": "session_meta",
+            "payload": {"id": "removed-sid", "cwd": "/work/project", "model_provider": "openai"},
+        },
+        {
+            "timestamp": "2026-04-23T10:00:01Z",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "removed"},
+        },
+        {
+            "timestamp": "2026-04-23T10:00:02Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {"total_token_usage": {"input_tokens": 100, "output_tokens": 20}},
+            },
+        },
+    ]
+    manifest = b"OK\0"
+
+    with patch("agentic_metric.collectors.remote.DATA_DIR", tmp_path / "data"), \
+         patch(
+             "agentic_metric.collectors.remote.subprocess.run",
+             return_value=Mock(returncode=0, stdout=manifest, stderr=b""),
+         ):
+        cache_file = (
+            _cache_root_for(target)
+            / "sessions"
+            / "2026"
+            / "04"
+            / "23"
+            / "rollout-removed.jsonl"
+        )
+        cache_file.parent.mkdir(parents=True)
+        cache_file.write_text("".join(json.dumps(line) + "\n" for line in stale_lines))
+
+        db = Database(db_path=str(tmp_path / "data.db"))
+        RemoteHistoryCollector(target).sync_history(db)
+
+        assert not cache_file.exists()
+        assert (
+            _cache_root_for(target)
+            / ".stale"
+            / "sessions"
+            / "2026"
+            / "04"
+            / "23"
+            / "rollout-removed.jsonl"
+        ).exists()
+        assert db.conn.execute(
+            "SELECT COUNT(*) AS n FROM sessions WHERE session_id = 'removed-sid'"
+        ).fetchone()["n"] == 0
+        db.close()
+
+
 def test_codex_provider_mismatch_removes_only_same_provider_stale_rows(tmp_path):
     sessions_dir = tmp_path / "codex" / "sessions"
     data_root = str(tmp_path / "codex")

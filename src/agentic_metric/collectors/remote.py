@@ -191,6 +191,7 @@ def _sync_target_to_cache(target: RemoteSyncTarget) -> bool:
         proc = _run_ssh(target.remote, _download_command(target), input_bytes=payload)
         if proc.stdout:
             _extract_tarball(proc.stdout, cache_root / target.source_child)
+    _archive_stale_cache_files(cache_root, target, manifest)
     _save_manifest(cache_root, manifest)
     return True
 
@@ -259,6 +260,40 @@ def _save_manifest(cache_root: Path, manifest: dict[str, dict[str, str]]) -> Non
         json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
         encoding="utf-8",
     )
+
+
+def _archive_stale_cache_files(
+    cache_root: Path,
+    target: RemoteSyncTarget,
+    manifest: dict[str, dict[str, str]],
+) -> None:
+    active_root = cache_root / target.source_child
+    if not active_root.exists():
+        return
+
+    patterns = ["rollout-*.jsonl"] if target.agent_type == "codex" else ["*.jsonl", "sessions-index.json"]
+    manifest_paths = set(manifest)
+    stale_root = cache_root / ".stale" / target.source_child
+    for pattern in patterns:
+        for path in active_root.rglob(pattern):
+            if not path.is_file():
+                continue
+            rel = str(PurePosixPath(*path.relative_to(active_root).parts))
+            if rel in manifest_paths:
+                continue
+            archive_path = _next_archive_path(stale_root / rel)
+            archive_path.parent.mkdir(parents=True, exist_ok=True)
+            path.replace(archive_path)
+
+
+def _next_archive_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    for idx in range(1, 10_000):
+        candidate = path.with_name(f"{path.name}.stale-{idx}")
+        if not candidate.exists():
+            return candidate
+    return path.with_name(f"{path.name}.stale")
 
 
 def _extract_tarball(payload: bytes, dest: Path) -> None:

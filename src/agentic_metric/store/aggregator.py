@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
+from ..formatting import source_label
 from ..models import DailyTrend, LiveSession, TodayOverview
 from ..pricing import estimate_cost, is_model_priced
 from .database import Database
@@ -638,7 +639,16 @@ def get_range_by_agent_model(db: Database, from_date: str, to_date: str) -> list
 
 
 def get_range_by_project(db: Database, from_date: str, to_date: str, limit: int = 10) -> list[dict]:
-    """Return per-project aggregates within the given date range, sorted by cost desc."""
+    """Return per-project aggregates within the given date range, sorted by cost desc.
+
+    Rows are collapsed by ``(source, project_path)`` rather than full
+    ``data_root``: multiple *local* roots that share a project path merge into
+    one row, while local-vs-remote and distinct remote hosts stay separate.
+    This matches how the source prefix is rendered (local shows no prefix,
+    remote shows ``host:``), so two local roots never produce two visually
+    identical rows. The ``LIMIT`` is applied after merging so it never drops a
+    project that only ranks high once its roots are combined.
+    """
     usage = _usage_source(db)
     rows = db.conn.execute(
         f"""SELECT data_root,
@@ -655,12 +665,34 @@ def get_range_by_project(db: Database, from_date: str, to_date: str, limit: int 
            FROM {usage}
            WHERE usage_date BETWEEN ? AND ?
            GROUP BY data_root, project_path
-           ORDER BY estimated_cost_usd DESC, unknown_cost_count DESC
-           LIMIT ?
         """,
-        (from_date, to_date, limit),
+        (from_date, to_date),
     ).fetchall()
-    return [dict(r) for r in rows]
+
+    sum_fields = (
+        "session_count", "user_turns", "input_tokens", "output_tokens",
+        "cache_read_tokens", "cache_creation_tokens", "estimated_cost_usd",
+        "unknown_cost_count",
+    )
+    merged: dict[tuple[str, str], dict] = {}
+    for r in rows:
+        row = dict(r)
+        # source_label is invariant within a merge group, so keeping the
+        # first-seen data_root preserves the rendered source prefix.
+        key = (source_label(row.get("data_root") or ""), row["project_path"])
+        existing = merged.get(key)
+        if existing is None:
+            merged[key] = row
+            continue
+        for field in sum_fields:
+            existing[field] = (existing.get(field) or 0) + (row.get(field) or 0)
+
+    out = sorted(
+        merged.values(),
+        key=lambda r: (r.get("estimated_cost_usd") or 0, r.get("unknown_cost_count") or 0),
+        reverse=True,
+    )
+    return out[:limit]
 
 
 def get_range_by_time_model(db: Database, from_date: str, to_date: str, limit: int = 10) -> list[dict]:
