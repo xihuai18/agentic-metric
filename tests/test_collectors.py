@@ -163,6 +163,18 @@ def test_remote_ssh_command_expands_tilde_on_remote_host():
     assert 'root="$HOME/${root#\\~/}"' in cmd[-1]
 
 
+def test_remote_manifest_command_supports_gnu_and_bsd_stat():
+    remote = RemoteSpec(host="devcloud")
+    target = RemoteSyncTarget(remote, "codex", "~/.codex", "openai", 0)
+    cmd = _manifest_command(target)
+
+    assert "stat --printf" in cmd
+    assert "stat -f" in cmd
+    assert "printf" in cmd
+    assert "%s\\0" in cmd
+    assert "stat -c" not in cmd
+
+
 def test_live_session_total_tokens():
     s = LiveSession(
         session_id="x",

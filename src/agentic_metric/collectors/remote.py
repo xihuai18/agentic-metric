@@ -162,8 +162,22 @@ def _manifest_command(target: RemoteSyncTarget) -> str:
         _remote_base_script(target.source_root, target.source_child)
         + 'if [ ! -d "$base" ]; then printf "MISSING\\0"; exit 0; fi; '
         + 'printf "OK\\0"; cd "$base"; '
-        + f"find . -type f {find_expr} -exec stat -c '%s\\t%Y\\t%n\\0' {{}} +"
+        + f"find . -type f {find_expr} {_manifest_stat_exec()}"
     )
+
+
+def _manifest_stat_exec() -> str:
+    stat_script = (
+        "for path do "
+        "if stat --printf '%s\\t%Y\\t%n\\0' \"$path\" 2>/dev/null; then "
+        ":; "
+        "elif out=$(stat -f '%z\\t%m\\t%N' \"$path\" 2>/dev/null); then "
+        "printf '%s\\0' \"$out\"; "
+        "else exit 1; "
+        "fi; "
+        "done"
+    )
+    return f"-exec sh -c {shlex.quote(stat_script)} sh {{}} +"
 
 
 def _download_command(target: RemoteSyncTarget) -> str:
