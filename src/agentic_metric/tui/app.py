@@ -9,17 +9,15 @@ from pathlib import Path
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.timer import Timer
 from textual.widgets import Footer, Header, Static
 from textual.widgets._footer import FooterKey
-from textual_plotext import PlotextPlot
 
 from ..collectors import CollectorRegistry, create_default_registry
 from ..config import AUTO_REFRESH_INTERVAL, DATA_SYNC_INTERVAL, LIVE_REFRESH_INTERVAL
 from ..formatting import cache_hit_rate as _cache_hit_rate
 from ..formatting import source_label as _source_label
-from ..formatting import source_prefixed_path as _source_prefixed_path
 from ..models import LiveSession
 from ..store.aggregator import (
     get_heatmap,
@@ -31,8 +29,9 @@ from ..store.aggregator import (
     resolve_range,
 )
 from ..store.database import Database
-from .widgets import Breakdown, PeriodicHeatmap, SummaryCell, fmt_cost, fmt_tokens
+from .widgets import Breakdown, PeriodicHeatmap, SummaryCell, TrendBlocks
 from .pricing_screen import PricingScreen
+from .help_screen import HelpScreen
 
 
 def _total_tokens(d: dict) -> int:
@@ -68,7 +67,7 @@ def _summary_label(kind: str, range_label: str, offset: int) -> str:
 # Trend configuration per focused view (long-range chart only; the
 # today hour heatmap is rendered separately).
 _TREND_CONFIG = {
-    "today": ("day",   30, "last 30 days"),
+    "today": ("day",   14, "last 14 days"),
     "week":  ("week",  12, "last 12 weeks"),
     "month": ("month", 12, "last 12 months"),
 }
@@ -131,21 +130,22 @@ class AgenticMetricApp(App):
         Binding("right,l", "next_view", "View", show=False),
         Binding("up,k", "back_in_time", "Range", key_display="↑↓"),
         Binding("down,j", "forward_in_time", "Range", show=False),
+        Binding("pageup", "scroll_breakdown_up", show=False),
+        Binding("pagedown", "scroll_breakdown_down", show=False),
         Binding("period,0", "reset_offset", "Now", key_display="."),
         Binding("t", "focus('today')", "Today", show=False),
         Binding("w", "focus('week')", "Week", show=False),
         Binding("m", "focus('month')", "Month", show=False),
-        # ── Data ── r = sync now; R = fast "live" sync (auto-sync already
-        # runs every 5 min by default, so this just speeds it up). Two
+        # ── Data ── R = fast "live" sync (auto-sync already runs every
+        # 5 min by default, so this just speeds it up). Two
         # bindings share R; `check_action` shows whichever matches state,
         # and the active one is highlighted via `-auto-on` in styles.tcss.
-        Binding("r", "refresh_all", "Sync"),
-        Binding("R", "auto_refresh_on", "Live", key_display="R"),
-        Binding("R", "auto_refresh_off", "Live", key_display="R"),
+        Binding("R", "auto_refresh_on", "Auto", key_display="R"),
+        Binding("R", "auto_refresh_off", "Auto", key_display="R"),
         # ── Other ──
         Binding("p", "show_pricing", "Pricing"),
-        Binding("alt+c,ctrl+y", "copy_view", "Copy", key_display="Alt+C", priority=True, show=False),
-        # Keep Ctrl+C from quitting; some terminals also use it while copying.
+        Binding("question_mark,?", "show_help", "Help", key_display="?"),
+        # Keep Ctrl+C from quitting so a stray copy shortcut doesn't kill the app.
         Binding("ctrl+c", "noop", show=False, priority=True),
         Binding("q", "quit", "Quit"),
     ]
@@ -174,10 +174,11 @@ class AgenticMetricApp(App):
             yield PeriodicHeatmap(id="heatmap")
         with Vertical(id="chart-panel"):
             yield Static("Trend", id="chart-title")
-            yield PlotextPlot(id="chart")
+            yield TrendBlocks(id="chart")
         with Vertical(id="breakdown-panel"):
             yield Static("By agent → provider → model", id="breakdown-title")
-            yield Breakdown(id="breakdown-body")
+            with VerticalScroll(id="breakdown-scroll"):
+                yield Breakdown(id="breakdown-body")
         yield _AutoAwareFooter()
 
     def on_mount(self) -> None:
@@ -304,33 +305,11 @@ class AgenticMetricApp(App):
 
     def _populate_chart(self) -> None:
         unit, count, span_label = _TREND_CONFIG[self._focus]
-        plot_widget = self.query_one("#chart", PlotextPlot)
-        plt = plot_widget.plt
-        plt.clear_figure()
-
         data = get_trend(self._db, unit, count)
-        if not data or all(c == 0 for _, c in data):
-            plt.title(f"No activity in the {span_label}")
-            plot_widget.refresh()
-            return
+        self.query_one("#chart", TrendBlocks).update_data(data, span_label)
 
-        labels = [d[0] for d in data]
-        ys = [d[1] for d in data]
-        xs = list(range(len(data)))
-        max_y = max(ys) or 1
-
-        plt.plot(xs, ys, marker="braille", color="yellow+")
-        # show ~6 ticks to avoid crowding
-        step = max(1, len(xs) // 6)
-        plt.xticks(xs[::step], labels[::step])
-
-        # Pad a tiny bit so the top of the curve isn't flush with the frame.
-        plt.ylim(0, max_y * 1.08)
-
-        plot_widget.refresh()
-
-        # "USD" sits above the y-axis in the external title row, alongside
-        # the trend span, instead of appearing as a rotated axis label.
+        # Keep the unit and span in the panel title so the block strip can
+        # stay three lines tall.
         title = self.query_one("#chart-title", Static)
         title.update(Text.from_markup(
             f"[bold]USD[/]   [bold]Trend[/] — [bright_white]{span_label}[/]"
@@ -341,16 +320,31 @@ class AgenticMetricApp(App):
         rows = get_range_by_agent_model(self._db, frm, to)
         rows = [r for r in rows if (r["estimated_cost_usd"] or 0) > 0 or _has_unknown_cost(r)]
 
-        agents_by_name: dict[tuple[str, str], dict] = {}
+        # host (machine / source) is the top level so remote SSH aggregation
+        # reads as "which machine spent what"; agent → provider → model nest
+        # below it. A single host is folded away by the renderer.
+        hosts_by_name: dict[str, dict] = {}
         for r in rows:
             at = r["agent_type"]
             provider = r.get("provider") or ""
             data_root = r.get("data_root") or ""
             source = _source_label(data_root)
-            agent_key = (source, at)
 
-            agent = agents_by_name.setdefault(agent_key, {
-                "agent": f"{source} · {at}",
+            host = hosts_by_name.setdefault(source, {
+                "host": source,
+                "cost": 0.0,
+                "tokens": 0,
+                "input": 0,
+                "output": 0,
+                "cache": 0,
+                "cache_read": 0,
+                "cache_write": 0,
+                "unknown_cost_count": 0,
+                "agents": {},
+            })
+
+            agent = host["agents"].setdefault(at, {
+                "agent": at,
                 "cost": 0.0,
                 "tokens": 0,
                 "input": 0,
@@ -386,7 +380,7 @@ class AgenticMetricApp(App):
             output_tokens = r.get("output_tokens") or 0
             unknown_count = r.get("unknown_cost_count") or 0
 
-            for bucket in (agent, g):
+            for bucket in (host, agent, g):
                 bucket["cost"] += cost
                 bucket["tokens"] += model_tokens
                 bucket["input"] += input_tokens
@@ -410,21 +404,26 @@ class AgenticMetricApp(App):
             })
 
         groups = []
-        for agent in agents_by_name.values():
-            providers = sorted(agent.pop("providers").values(), key=lambda g: -g["cost"])
-            for provider_group in providers:
-                provider_group["models"].sort(
-                    key=lambda m: (
-                        1 if _has_unknown_cost(m) else 0,
-                        m.get("cost") or 0,
-                    ),
-                    reverse=True,
-                )
-            agent["providers"] = providers
-            groups.append(agent)
-        groups.sort(key=lambda g: -g["cost"])
+        for host in hosts_by_name.values():
+            agents = []
+            for agent in host["agents"].values():
+                providers = sorted(agent.pop("providers").values(), key=lambda g: -g["cost"])
+                for provider_group in providers:
+                    provider_group["models"].sort(
+                        key=lambda m: (
+                            1 if _has_unknown_cost(m) else 0,
+                            m.get("cost") or 0,
+                        ),
+                        reverse=True,
+                    )
+                agent["providers"] = providers
+                agents.append(agent)
+            agents.sort(key=lambda a: -a["cost"])
+            host["agents"] = agents
+            groups.append(host)
+        groups.sort(key=lambda h: -h["cost"])
 
-        total_cost = sum(g["cost"] for g in groups)
+        total_cost = sum(h["cost"] for h in groups)
 
         title_widget = self.query_one("#breakdown-title", Static)
         title_widget.update(Text.from_markup(
@@ -529,9 +528,11 @@ class AgenticMetricApp(App):
             self._offset = 0
             self._populate_all()
 
-    def action_refresh_all(self) -> None:
-        self.notify("Syncing…")
-        self.run_worker(self._sync_worker, thread=True, exclusive=True, group="sync")
+    def action_scroll_breakdown_up(self) -> None:
+        self.query_one("#breakdown-scroll", VerticalScroll).scroll_page_up(animate=False)
+
+    def action_scroll_breakdown_down(self) -> None:
+        self.query_one("#breakdown-scroll", VerticalScroll).scroll_page_down(animate=False)
 
     def action_show_pricing(self) -> None:
         """Open the read-only pricing view, flagging unknown models in range."""
@@ -545,6 +546,10 @@ class AgenticMetricApp(App):
             if name and name not in unknown:
                 unknown.append(name)
         self.push_screen(PricingScreen(unknown))
+
+    def action_show_help(self) -> None:
+        """Open the keybinding cheatsheet."""
+        self.push_screen(HelpScreen())
 
     def action_auto_refresh_on(self) -> None:
         """Enable fast auto-sync and pause the slow periodic one (single loop)."""
@@ -579,62 +584,8 @@ class AgenticMetricApp(App):
         return True
 
     def action_noop(self) -> None:
-        """Keep Ctrl+C from quitting; point people at the TUI copy key."""
+        """Swallow Ctrl+C so it doesn't quit; point people at the quit key."""
         self.notify("Press [bold]q[/] to quit", severity="information")
-
-    def action_copy_view(self) -> None:
-        """Copy selected text, or fall back to a compact snapshot of the current view."""
-        selected = self.screen.get_selected_text()
-        if selected:
-            self.copy_to_clipboard(selected)
-            self.notify("Copied selected text", severity="information")
-            return
-
-        label, frm, to = resolve_range(self._focus, offset=self._offset)
-        totals = get_range_totals(self._db, frm, to)
-        project_rows = get_range_by_project(self._db, frm, to, limit=3)
-
-        lines = [f"{label}  {frm} -> {to}"]
-        _ut = totals.get('user_turns') or 0
-        _mc = totals.get('message_count') or 0
-        stats = [
-            f"Cost {fmt_cost(totals.get('estimated_cost_usd'), unknown=_has_unknown_cost(totals))}",
-            f"Sessions {totals.get('session_count') or 0:,}",
-            f"Requests {max(0, _mc - _ut):,}",
-            f"Turns {_ut:,}",
-            f"Tokens {fmt_tokens(_total_tokens(totals))}",
-        ]
-        cache_hit = _cache_hit_pct(totals)
-        if cache_hit is not None:
-            stats.append(f"Cache % {cache_hit}%")
-        lines.append(" | ".join(stats))
-
-        token_parts = [
-            f"Token input {fmt_tokens(totals.get('input_tokens') or 0)}",
-            f"output {fmt_tokens(totals.get('output_tokens') or 0)}",
-            f"cache read {fmt_tokens(totals.get('cache_read_tokens') or 0)}",
-        ]
-        cache_write = totals.get("cache_creation_tokens") or 0
-        if cache_write:
-            token_parts.append(f"cache write {fmt_tokens(cache_write)}")
-        lines.append(" | ".join(token_parts))
-
-        nonzero_projects = [
-            p for p in project_rows
-            if (p.get("estimated_cost_usd") or 0) > 0 or _has_unknown_cost(p)
-        ]
-        if nonzero_projects:
-            lines.append("Top projects:")
-            for p in nonzero_projects:
-                cost_str = fmt_cost(p.get("estimated_cost_usd"), unknown=_has_unknown_cost(p))
-                path = _source_prefixed_path(
-                    p["project_path"],
-                    p.get("data_root") or "",
-                )
-                lines.append(f"  {path}  {cost_str}")
-
-        self.copy_to_clipboard("\n".join(lines))
-        self.notify("Copied current view summary", severity="information")
 
 
 def _has_unknown_cost(row: dict | None) -> bool:

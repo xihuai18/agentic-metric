@@ -89,12 +89,12 @@ SummaryCell.-focused {
     min-height: 4;
 }
 
-/* ─── Chart ─── */
+/* ─── Compact trend strip ─── */
 
 #chart-panel {
-    height: 1fr;
-    min-height: 7;
-    max-height: 15;
+    height: 6;
+    min-height: 5;
+    max-height: 6;
     margin: 0 1;
     padding: 0 1;
     border: round white;
@@ -107,7 +107,8 @@ SummaryCell.-focused {
 }
 
 #chart {
-    height: 1fr;
+    height: auto;
+    min-height: 3;
 }
 
 /* ─── Breakdown ─── */
@@ -126,8 +127,13 @@ SummaryCell.-focused {
     text-style: bold;
 }
 
-#breakdown-body {
+#breakdown-scroll {
     height: 1fr;
+}
+
+#breakdown-body {
+    height: auto;
+    min-height: 1;
 }
 
 /* ─── Pricing modal (press p) ─── */
@@ -146,6 +152,27 @@ PricingScreen {
 }
 
 #pricing-content {
+    width: auto;
+    height: auto;
+}
+
+/* ─── Help modal (press ?) ─── */
+
+HelpScreen {
+    align: center middle;
+}
+
+#help-box {
+    width: 70%;
+    max-width: 80;
+    height: auto;
+    max-height: 85%;
+    background: $surface;
+    border: round $accent;
+    padding: 1 2;
+}
+
+#help-content {
     width: auto;
     height: auto;
 }

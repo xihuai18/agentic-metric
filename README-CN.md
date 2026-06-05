@@ -142,7 +142,7 @@ agentic-metric pricing cache reset claude-sonnet-4                # 删除覆盖
 
 ### TUI 快捷键
 
-底栏显示为:`←→ View · ↑↓ Range · . Now · r Sync · R Live · p Pricing · q Quit`。
+底栏显示为:`←→ View · ↑↓ Range · . Now · R Auto · p Pricing · ? Help · q Quit`。
 
 | 键 | 底栏 | 功能 |
 |----|------|------|
@@ -150,10 +150,14 @@ agentic-metric pricing cache reset claude-sonnet-4                # 删除覆盖
 | `↑` / `↓`(或 `k` / `j`) | Range | 时间范围往前 / 往后 |
 | `.` | Now | 回到"现在"(清空 offset) |
 | `t` / `w` / `m` | — | 直接聚焦 Today / Week / Month |
-| `r` | Sync | 立即同步(默认已每 5 分钟自动同步) |
-| `R` | Live | 切换快速"实时"同步;开启时暂停慢速周期 sync |
+| `PageUp` / `PageDown` | — | 滚动明细面板 |
+| `R` | Auto | 切换快速自动刷新("实时"同步);开启时暂停慢速周期 sync |
 | `p` | Pricing | 打开只读价格视图(高亮当前范围内的未知模型) |
+| `?` | Help | 显示快捷键速查表 |
 | `q` | Quit | 退出 |
+
+默认每 5 分钟自动同步,没有手动一次性同步键。
+如需把数据从面板里导出,请使用 CLI(`agentic-metric report` / `today` / `week` / `month`)。
 
 刷新间隔可在配置文件(`$DATA/agentic_metric/config.json`)覆盖:
 

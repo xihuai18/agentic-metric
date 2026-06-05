@@ -155,7 +155,7 @@ database and rebuilds it from the original Claude Code and Codex session files;
 
 ### TUI Keybindings
 
-Shown in the footer as: `←→ View · ↑↓ Range · . Now · r Sync · R Live · p Pricing · q Quit`.
+Shown in the footer as: `←→ View · ↑↓ Range · . Now · R Auto · p Pricing · ? Help · q Quit`.
 
 | Key | Footer | Action |
 |-----|--------|--------|
@@ -163,10 +163,14 @@ Shown in the footer as: `←→ View · ↑↓ Range · . Now · r Sync · R Liv
 | `↑` / `↓` (or `k` / `j`) | Range | Move time range earlier / later |
 | `.` | Now | Jump back to "now" (reset offset) |
 | `t` / `w` / `m` | — | Focus Today / Week / Month directly |
-| `r` | Sync | Sync now (data already auto-syncs every 5 min by default) |
-| `R` | Live | Toggle fast "live" sync; pauses the slow periodic sync while active |
+| `PageUp` / `PageDown` | — | Scroll the breakdown panel |
+| `R` | Auto | Toggle fast auto-refresh ("live" sync); pauses the slow periodic sync while active |
 | `p` | Pricing | Open the read-only pricing view (flags unknown models in range) |
+| `?` | Help | Show the keybinding cheatsheet |
 | `q` | Quit | Quit |
+
+Data auto-syncs every 5 min by default; there is no manual one-shot sync key.
+To copy data out of the dashboard, use the CLI (`agentic-metric report` / `today` / `week` / `month`).
 
 Refresh intervals can be overridden in the config file (`$DATA/agentic_metric/config.json`):
 

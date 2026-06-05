@@ -377,8 +377,158 @@ class PeriodicHeatmap(Static):
         return Group(*body)
 
 
-# Keep the old name as an alias for backwards compatibility
-HourHeatmap = PeriodicHeatmap
+class TrendBlocks(Static):
+    """Compact cost trend rendered as colored blocks."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._data: list[tuple[str, float]] = []
+        self._span_label = ""
+
+    def update_data(self, data: list[tuple[str, float]], span_label: str) -> None:
+        self._data = data
+        self._span_label = span_label
+        self.refresh()
+
+    @staticmethod
+    def _truncate(text: str, width: int) -> str:
+        if width <= 0:
+            return ""
+        if len(text) <= width:
+            return text
+        if width <= 1:
+            return text[:width]
+        return text[: width - 1] + "…"
+
+    @staticmethod
+    def _fit_points(data: list[tuple[str, float]], max_points: int) -> list[tuple[str, float]]:
+        """Collapse older buckets only when the terminal is too narrow."""
+        if max_points <= 0:
+            return []
+        if len(data) <= max_points:
+            return data
+
+        bucket_w = len(data) / max_points
+        fitted: list[tuple[str, float]] = []
+        for i in range(max_points):
+            start = int(i * bucket_w)
+            end = int((i + 1) * bucket_w)
+            if i == max_points - 1:
+                end = len(data)
+            chunk = data[start:max(end, start + 1)]
+            label = chunk[-1][0]
+            fitted.append((label, sum(v for _label, v in chunk)))
+        return fitted
+
+    def _axis(self, width: int, labels: list[str]) -> str:
+        if width <= 0 or not labels:
+            return ""
+        left = self._truncate(labels[0], max(1, width))
+        right = self._truncate(labels[-1], max(1, width))
+        mid = self._truncate(labels[len(labels) // 2], max(1, width))
+
+        chars = [" "] * width
+        right_start = max(0, width - len(right))
+        for i, ch in enumerate(left[:width]):
+            chars[i] = ch
+        if right_start >= len(left) + 2:
+            for i, ch in enumerate(right):
+                chars[right_start + i] = ch
+
+        mid_start = max(0, width // 2 - len(mid) // 2)
+        mid_end = mid_start + len(mid)
+        if mid_start >= len(left) + 2 and mid_end <= right_start - 2:
+            for i, ch in enumerate(mid):
+                chars[mid_start + i] = ch
+        return "".join(chars).rstrip()
+
+    def render(self) -> Group | Text:
+        if not self._data:
+            return Text(f"  No activity in the {self._span_label}.", style="white")
+
+        values = [cost for _label, cost in self._data]
+        if all(v <= 0 for v in values):
+            return Text(f"  No activity in the {self._span_label}.", style="white")
+
+        try:
+            width = self.content_size.width
+        except Exception:
+            width = 0
+        # An unmounted / not-yet-laid-out widget reports width 0; fall back to
+        # a sensible default instead of collapsing everything to one column.
+        available = max(1, width - 2) if width > 0 else 80
+
+        points = self._fit_points(self._data, available)
+        if not points:
+            return Text(f"  No activity in the {self._span_label}.", style="white")
+
+        n = len(points)
+        preferred_cell_w = 2 if n >= 20 else 4 if n >= 10 else 6
+        cell_w = max(1, min(preferred_cell_w, available // max(n, 1)))
+        strip_width = n * cell_w
+
+        blocks = ["·", "▁", "▂", "▃", "▄", "▅", "▆", "█"]
+        colors = [
+            "grey35",
+            "dim yellow",
+            "yellow",
+            "yellow",
+            "bright_yellow",
+            "bright_yellow",
+            "bold bright_yellow",
+            "bold bright_yellow",
+        ]
+        max_v = max(cost for _label, cost in points) or 1.0
+
+        strip = Text("  ")
+        for _label, cost in points:
+            if cost <= 0:
+                level = 0
+            else:
+                level = max(1, int(round((cost / max_v) * (len(blocks) - 1))))
+            level = min(level, len(blocks) - 1)
+            strip.append(blocks[level] * cell_w, style=colors[level])
+
+        axis = Text("  ")
+        axis.append(self._axis(strip_width, [label for label, _cost in points]), style="white")
+
+        summary = self._summary(available)
+
+        return Group(strip, axis, summary)
+
+    def _summary(self, available: int) -> Text:
+        """Build the one-line summary, dropping segments that don't fit.
+
+        The chart panel is a fixed three rows (strip / axis / summary), so a
+        wrapped summary would overflow it. Lower-priority segments (total,
+        then peak) drop off first on narrow terminals; "latest" is always
+        shown.
+        """
+        peak_label, peak_cost = max(self._data, key=lambda item: item[1])
+        latest_label, latest_cost = self._data[-1]
+        total_cost = sum(cost for _label, cost in self._data)
+
+        segments: list[list[tuple[str, str]]] = [
+            [("latest ", "white"), (latest_label, "bold"),
+             (f" {fmt_cost(latest_cost)}", "bright_yellow")],
+            [("peak ", "white"), (peak_label, "bold"),
+             (f" {fmt_cost(peak_cost)}", "bright_yellow")],
+            [("total ", "white"), (fmt_cost(total_cost), "bright_yellow")],
+        ]
+        sep = "  ·  "
+        summary = Text("  ")
+        used = 0
+        for seg in segments:
+            seg_len = sum(len(text) for text, _style in seg)
+            if used and used + len(sep) + seg_len > available:
+                break
+            if used:
+                summary.append(sep, style="white")
+                used += len(sep)
+            for text, style in seg:
+                summary.append(text, style=style)
+            used += seg_len
+        return summary
 
 
 def _token_summary_block(totals: dict) -> Group | None:
@@ -475,31 +625,35 @@ def _top_projects_block(
 
 
 class Breakdown(Static):
-    """Agent → provider → model nested breakdown with cost bars.
+    """Host → agent → provider → model nested breakdown.
 
-    Data shape::
+    A single host is folded away (its agents render at the top level) so
+    local-only setups stay compact. Data shape::
 
         [
             {
-                "agent": "claude_code",
+                "host": "local",
                 "cost": 1234.56,
-                "tokens": ...,
-                "providers": [
+                "agents": [
                     {
-                        "provider": "anthropic",
-                        "data_root": "~/.claude-alt",
-                        "models": [
-                            {"model": "claude-opus-4-7", "cost": 800.00, "tokens": ...},
-                            ...
+                        "agent": "claude_code",
+                        "cost": 1234.56,
+                        "providers": [
+                            {
+                                "provider": "anthropic",
+                                "data_root": "~/.claude-alt",
+                                "models": [
+                                    {"model": "claude-opus-4-7", "cost": 800.00},
+                                    ...
+                                ],
+                            },
                         ],
                     },
-                ]
+                ],
             },
             ...
         ]
     """
-
-    _MIN_MODEL_LIMIT = 3
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
@@ -510,14 +664,6 @@ class Breakdown(Static):
         self._groups = groups
         self._total_cost = total_cost
         self.refresh()
-
-    def _bar(self, ratio: float, width: int = 18) -> Text:
-        filled = int(round(ratio * width))
-        filled = max(0, min(width, filled))
-        bar = Text()
-        bar.append("█" * filled, style="bold bright_cyan")
-        bar.append("░" * (width - filled), style="white")
-        return bar
 
     # Fixed-width value columns to the right of every tree row:
     #   cost · share% · in · out · cached · cache%
@@ -593,22 +739,117 @@ class Breakdown(Static):
         t.append(f" {pct_str:>{self._W_PCT}}", style="bright_green")
         t.append("\n")
 
+    @staticmethod
+    def _share(cost: float, unknown: bool, total: float, total_unknown: bool) -> str:
+        if unknown or total_unknown:
+            return "—"
+        return f"{(cost / total) * 100:.1f}%"
+
+    def _emit_agent(
+        self,
+        t: Text,
+        agent: dict,
+        *,
+        label_width: int,
+        total: float,
+        total_unknown: bool,
+        base_bar: str,
+        agent_last: bool,
+        top_level: bool,
+    ) -> None:
+        """Render one agent subtree (agent → provider → model)."""
+        if top_level:
+            # No host above it: agent sits at column 0, like a plain list.
+            agent_parts = [(self._truncate(agent["agent"], label_width), "bold bright_magenta")]
+            provider_base = "  "
+        else:
+            connector = "└ " if agent_last else "├ "
+            agent_prefix = base_bar + connector
+            agent_parts = [
+                (agent_prefix, "white"),
+                (self._truncate(agent["agent"], label_width - len(agent_prefix)), "bold bright_magenta"),
+            ]
+            provider_base = base_bar + ("  " if agent_last else "│ ")
+
+        agent_cost = agent.get("cost") or 0.0
+        agent_unknown = _has_unknown_cost(agent)
+        self._append_label(t, agent_parts, label_width)
+        self._append_value_columns(
+            t,
+            agent,
+            cost=agent_cost,
+            cost_unknown=agent_unknown,
+            share=self._share(agent_cost, agent_unknown, total, total_unknown),
+            cost_style="bold bright_yellow",
+        )
+
+        providers = agent.get("providers") or [agent]
+        for p_index, provider_group in enumerate(providers):
+            provider_last = p_index == len(providers) - 1
+            provider_connector = "└ " if provider_last else "├ "
+            provider = provider_group.get("provider") or "—"
+            provider_prefix = provider_base + provider_connector
+            provider_width = 9
+            path_width = max(6, label_width - len(provider_prefix) - provider_width - 1)
+            data_root = _root_label(provider_group.get("data_root") or "", max_len=path_width)
+            provider_cost = provider_group.get("cost") or 0.0
+            provider_unknown = _has_unknown_cost(provider_group)
+
+            self._append_label(
+                t,
+                [
+                    (provider_prefix, "white"),
+                    (self._truncate(provider, provider_width).ljust(provider_width), "bright_cyan"),
+                    (" ", "white"),
+                    (data_root, "white"),
+                ],
+                label_width,
+            )
+            self._append_value_columns(
+                t,
+                provider_group,
+                cost=provider_cost,
+                cost_unknown=provider_unknown,
+                share=self._share(provider_cost, provider_unknown, total, total_unknown),
+                cost_style="bold bright_yellow",
+            )
+
+            # The enclosing panel scrolls, so model rows can stay complete.
+            model_base = provider_base + ("  " if provider_last else "│ ")
+            raw_models = provider_group.get("models", []) or []
+            visible = sorted(
+                [m for m in raw_models if (m.get("cost") or 0) > 0 or _has_unknown_cost(m)],
+                key=lambda m: -(m.get("cost") or 0),
+            )
+            for j, m in enumerate(visible):
+                last = j == len(visible) - 1
+                model_prefix = model_base + ("└ " if last else "├ ")
+                model_name = m.get("model") or "(unknown)"
+                if model_name == "Unknown" and m.get("raw_model"):
+                    model_name = f"Unknown: {m['raw_model']}"
+                self._append_label(
+                    t,
+                    [
+                        (model_prefix, "white"),
+                        (self._truncate(model_name, label_width - len(model_prefix)), "bright_cyan"),
+                    ],
+                    label_width,
+                )
+                self._append_value_columns(
+                    t,
+                    m,
+                    cost=m.get("cost"),
+                    cost_unknown=_has_unknown_cost(m),
+                    share="",
+                    cost_style="bright_yellow",
+                )
+
     def render(self) -> Text:
         if not self._groups:
             return Text("  No activity in the selected range.", style="white")
 
         total = max(self._total_cost, 1e-9)
-        total_unknown = any(_has_unknown_cost(g) for g in self._groups)
-        # Each provider uses one line plus model rows; each agent uses one
-        # summary line. Compute a per-provider model budget from the visible
-        # height so wide ranges stay readable.
-        provider_count = sum(len(g.get("providers") or [g]) for g in self._groups)
-        provider_count = max(provider_count, 1)
-        # Compute how many model lines we can afford from the available height.
-        avail = self.size.height
-        overhead = len(self._groups) + provider_count
-        model_budget = max(avail - overhead, provider_count * self._MIN_MODEL_LIMIT)
-        model_limit = max(self._MIN_MODEL_LIMIT, model_budget // provider_count)
+        total_unknown = any(_has_unknown_cost(h) for h in self._groups)
         try:
             width = self.content_size.width
         except Exception:
@@ -619,131 +860,43 @@ class Breakdown(Static):
         label_width = max(24, width - self._VALUE_W)
         t = Text()
         self._append_header(t, label_width)
-        for g in self._groups:
-            agent = g["agent"]
-            cost = g["cost"]
-            unknown = _has_unknown_cost(g)
-            ratio = cost / total
-            pct = ratio * 100
 
-            # Agent summary line. Provider and model detail are nested below it.
+        # Fold the host level away when there is only one machine, so the
+        # common local-only case stays a flat agent → provider → model tree.
+        single_host = len(self._groups) == 1
+
+        for host in self._groups:
+            agents = host.get("agents") or []
+            if single_host:
+                for a_index, agent in enumerate(agents):
+                    self._emit_agent(
+                        t, agent,
+                        label_width=label_width, total=total, total_unknown=total_unknown,
+                        base_bar="", agent_last=(a_index == len(agents) - 1), top_level=True,
+                    )
+                continue
+
+            host_cost = host.get("cost") or 0.0
+            host_unknown = _has_unknown_cost(host)
             self._append_label(
                 t,
-                [(self._truncate(agent, label_width), "bold bright_magenta")],
+                [(self._truncate(host.get("host") or "—", label_width), "bold white")],
                 label_width,
             )
             self._append_value_columns(
                 t,
-                g,
-                cost=cost,
-                cost_unknown=unknown,
-                share="—" if unknown or total_unknown else f"{pct:.1f}%",
+                host,
+                cost=host_cost,
+                cost_unknown=host_unknown,
+                share=self._share(host_cost, host_unknown, total, total_unknown),
                 cost_style="bold bright_yellow",
             )
-
-            providers = g.get("providers") or [g]
-            for p_index, provider_group in enumerate(providers):
-                provider_last = p_index == len(providers) - 1
-                provider_connector = "└ " if provider_last else "├ "
-                provider = provider_group.get("provider") or "—"
-                provider_prefix = f"  {provider_connector}"
-                provider_width = 9
-                path_width = max(6, label_width - len(provider_prefix) - provider_width - 1)
-                data_root = _root_label(provider_group.get("data_root") or "", max_len=path_width)
-                provider_cost = provider_group.get("cost") or 0.0
-                provider_unknown = _has_unknown_cost(provider_group)
-                provider_ratio = provider_cost / total
-                provider_pct = provider_ratio * 100
-
-                self._append_label(
-                    t,
-                    [
-                        (provider_prefix, "white"),
-                        (self._truncate(provider, provider_width).ljust(provider_width), "bright_cyan"),
-                        (" ", "white"),
-                        (data_root, "white"),
-                    ],
-                    label_width,
+            for a_index, agent in enumerate(agents):
+                self._emit_agent(
+                    t, agent,
+                    label_width=label_width, total=total, total_unknown=total_unknown,
+                    base_bar="", agent_last=(a_index == len(agents) - 1), top_level=False,
                 )
-                self._append_value_columns(
-                    t,
-                    provider_group,
-                    cost=provider_cost,
-                    cost_unknown=provider_unknown,
-                    share="—" if provider_unknown or total_unknown else f"{provider_pct:.1f}%",
-                    cost_style="bold bright_yellow",
-                )
-
-                # Model rows: keep the panel readable, then roll up the tail.
-                # Unknown models are always visible, never hidden.
-                raw_models = provider_group.get("models", []) or []
-                nonzero = [
-                    m for m in raw_models
-                    if (m.get("cost") or 0) > 0 or _has_unknown_cost(m)
-                ]
-                known = sorted(
-                    [m for m in nonzero if not _has_unknown_cost(m)],
-                    key=lambda m: -(m.get("cost") or 0),
-                )
-                unknown_models = sorted(
-                    [m for m in nonzero if _has_unknown_cost(m)],
-                    key=lambda m: -(m.get("cost") or 0),
-                )
-                visible = known[: model_limit] + unknown_models
-                hidden = known[model_limit :]
-                child_bar = "  " if provider_last else "│ "
-
-                for j, m in enumerate(visible):
-                    last = (j == len(visible) - 1 and not hidden)
-                    connector = "└ " if last else "├ "
-                    model_prefix = f"  {child_bar}{connector}"
-                    model_name = m.get("model") or "(unknown)"
-                    if model_name == "Unknown" and m.get("raw_model"):
-                        model_name = f"Unknown: {m['raw_model']}"
-                    self._append_label(
-                        t,
-                        [
-                            (model_prefix, "white"),
-                            (self._truncate(model_name, label_width - len(model_prefix)), "bright_cyan"),
-                        ],
-                        label_width,
-                    )
-                    self._append_value_columns(
-                        t,
-                        m,
-                        cost=m.get("cost"),
-                        cost_unknown=_has_unknown_cost(m),
-                        share="",
-                        cost_style="bright_yellow",
-                    )
-                if hidden:
-                    hidden_cost = sum(m.get("cost") or 0 for m in hidden)
-                    hidden_unknown = any(_has_unknown_cost(m) for m in hidden)
-                    hidden_row = {
-                        "input": sum(m.get("input") or 0 for m in hidden),
-                        "output": sum(m.get("output") or 0 for m in hidden),
-                        "cache": sum(m.get("cache") or 0 for m in hidden),
-                        "cache_read": sum(m.get("cache_read") or 0 for m in hidden),
-                        "cache_write": sum(m.get("cache_write") or 0 for m in hidden),
-                    }
-                    model_prefix = f"  {child_bar}└ "
-                    label = f"+{len(hidden)} more models"
-                    self._append_label(
-                        t,
-                        [
-                            (model_prefix, "white"),
-                            (self._truncate(label, label_width - len(model_prefix)), "white"),
-                        ],
-                        label_width,
-                    )
-                    self._append_value_columns(
-                        t,
-                        hidden_row,
-                        cost=hidden_cost,
-                        cost_unknown=hidden_unknown,
-                        share="",
-                        cost_style="bright_yellow",
-                    )
 
         return t
 

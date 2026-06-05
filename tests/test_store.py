@@ -30,7 +30,8 @@ from agentic_metric.store.aggregator import (
 )
 from agentic_metric.formatting import fmt_cost as cli_fmt_cost
 from agentic_metric.tui.app import _summary_label
-from agentic_metric.tui.widgets import Breakdown, SummaryCell, fmt_cost as tui_fmt_cost
+from agentic_metric.tui.widgets import Breakdown, SummaryCell, TrendBlocks, fmt_cost as tui_fmt_cost
+from agentic_metric.tui.help_screen import HelpScreen, _SECTIONS
 from agentic_metric.cli import app as cli_app
 
 
@@ -1044,37 +1045,193 @@ def test_today_sessions_prefer_real_usage_model_over_synthetic_session_model():
     db.close()
 
 
-def test_tui_breakdown_keeps_unknown_visible_before_model_limit():
+def test_tui_breakdown_renders_all_models_for_scrollable_panel():
     widget = Breakdown()
     widget._total_cost = 10.0
     widget._groups = [
         {
-            "agent": "codex",
+            "host": "local",
             "cost": 10.0,
             "unknown_cost_count": 1,
             "input": 0,
             "output": 0,
             "cache": 0,
-            "models": [
-                {"model": "known-1", "cost": 4.0, "input": 1, "output": 0, "cache": 0},
-                {"model": "known-2", "cost": 3.0, "input": 1, "output": 0, "cache": 0},
-                {"model": "known-3", "cost": 2.0, "input": 1, "output": 0, "cache": 0},
-                {"model": "known-4", "cost": 1.0, "input": 1, "output": 0, "cache": 0},
+            "agents": [
                 {
-                    "model": "Unknown",
-                    "cost": 0.0,
+                    "agent": "codex",
+                    "cost": 10.0,
                     "unknown_cost_count": 1,
-                    "input": 1,
+                    "input": 0,
                     "output": 0,
                     "cache": 0,
-                },
+                    "models": [
+                        {"model": "known-1", "cost": 4.0, "input": 1, "output": 0, "cache": 0},
+                        {"model": "known-2", "cost": 3.0, "input": 1, "output": 0, "cache": 0},
+                        {"model": "known-3", "cost": 2.0, "input": 1, "output": 0, "cache": 0},
+                        {"model": "known-4", "cost": 1.0, "input": 1, "output": 0, "cache": 0},
+                        {
+                            "model": "Unknown",
+                            "cost": 0.0,
+                            "unknown_cost_count": 1,
+                            "input": 1,
+                            "output": 0,
+                            "cache": 0,
+                        },
+                    ],
+                }
             ],
         }
     ]
 
-    rendered = widget.render().plain
+    console = Console(record=True, width=120, color_system=None)
+    console.print(widget.render())
+    rendered = console.export_text()
+    assert "known-4" in rendered
     assert "Unknown" in rendered
     assert "?" in rendered
+    assert "more models" not in rendered
+
+
+def test_tui_breakdown_shows_host_level_only_for_multiple_hosts():
+    def _host(name, cost):
+        return {
+            "host": name,
+            "cost": cost,
+            "unknown_cost_count": 0,
+            "input": 0, "output": 0, "cache": 0,
+            "agents": [{
+                "agent": "claude-code",
+                "cost": cost,
+                "unknown_cost_count": 0,
+                "input": 0, "output": 0, "cache": 0,
+                "providers": [{
+                    "provider": "anthropic",
+                    "data_root": f"~/{name}",
+                    "cost": cost,
+                    "unknown_cost_count": 0,
+                    "input": 0, "output": 0, "cache": 0,
+                    "models": [{"model": "opus", "cost": cost, "input": 1, "output": 0, "cache": 0}],
+                }],
+            }],
+        }
+
+    # Multiple hosts: each host name is rendered as a top-level row.
+    multi = Breakdown()
+    multi._total_cost = 10.0
+    multi._groups = [_host("myserver", 7.0), _host("local", 3.0)]
+    console = Console(record=True, width=120, color_system=None)
+    console.print(multi.render())
+    rendered = console.export_text()
+    assert "myserver" in rendered
+    assert "local" in rendered
+    assert "opus" in rendered
+
+    # Single host: the host level is folded away (agent sits at the top).
+    single = Breakdown()
+    single._total_cost = 3.0
+    single._groups = [_host("local", 3.0)]
+    console = Console(record=True, width=120, color_system=None)
+    console.print(single.render())
+    lines = [ln for ln in console.export_text().splitlines() if ln.strip()]
+    # First non-empty row after the header is the agent, not a "local" host row.
+    assert not lines[1].startswith("local")
+    assert "claude-code" in lines[1]
+
+
+def test_tui_trend_blocks_render_compact_summary():
+    widget = TrendBlocks()
+    widget.update_data(
+        [("05-23", 1.0), ("05-24", 0.0), ("05-25", 3.0)],
+        "last 14 days",
+    )
+
+    console = Console(record=True, width=120, color_system=None)
+    console.print(widget.render())
+    rendered = console.export_text()
+    assert "latest 05-25 $3.00" in rendered
+    assert "peak 05-25 $3.00" in rendered
+    assert "total $4.00" in rendered
+
+
+def test_tui_trend_blocks_summary_adapts_to_width():
+    """Narrow terminals drop peak/total so the summary stays one line.
+
+    The chart panel is a fixed three rows, so a wrapped summary would
+    overflow it; only "latest" is guaranteed to render.
+    """
+    widget = TrendBlocks()
+    widget.update_data(
+        [("05-23", 1.0), ("05-24", 0.0), ("05-25", 3.0)],
+        "last 14 days",
+    )
+
+    wide = widget._summary(80).plain
+    assert "latest 05-25 $3.00" in wide
+    assert "peak 05-25 $3.00" in wide
+    assert "total $4.00" in wide
+
+    narrow = widget._summary(24).plain
+    assert "latest 05-25 $3.00" in narrow
+    assert "peak" not in narrow
+    assert "total" not in narrow
+    # Single line: no embedded newline regardless of width.
+    assert "\n" not in narrow
+
+
+def test_tui_breakdown_multi_host_tree_structure():
+    """Lock the header columns and tree connectors for a multi-host render."""
+    def _host(name, cost):
+        return {
+            "host": name,
+            "cost": cost,
+            "unknown_cost_count": 0,
+            "input": 0, "output": 0, "cache": 0,
+            "agents": [{
+                "agent": "codex",
+                "cost": cost,
+                "unknown_cost_count": 0,
+                "input": 0, "output": 0, "cache": 0,
+                "providers": [{
+                    "provider": "openai",
+                    "data_root": f"~/{name}",
+                    "cost": cost,
+                    "unknown_cost_count": 0,
+                    "input": 0, "output": 0, "cache": 0,
+                    "models": [{"model": "gpt-5.5", "cost": cost, "input": 1, "output": 0, "cache": 0}],
+                }],
+            }],
+        }
+
+    widget = Breakdown()
+    widget._total_cost = 10.0
+    widget._groups = [_host("myserver", 7.0), _host("local", 3.0)]
+    console = Console(record=True, width=120, color_system=None)
+    console.print(widget.render())
+    rendered = console.export_text()
+
+    # Header columns are present and labeled once.
+    assert "Cost" in rendered and "Cache%" in rendered
+    # Host rows sit at column 0; their agents/providers/models nest with
+    # box-drawing connectors below them.
+    assert "myserver" in rendered
+    assert "├ codex" in rendered or "└ codex" in rendered
+    assert "openai" in rendered
+    assert "gpt-5.5" in rendered
+
+
+def test_help_screen_renders_grouped_sections():
+    section_titles = [name for name, _keys in _SECTIONS]
+    assert section_titles == ["Navigation", "Data", "Other"]
+
+    console = Console(record=True, width=80, color_system=None)
+    console.print(HelpScreen()._build_content())
+    rendered = console.export_text()
+    for title in section_titles:
+        assert title in rendered
+    # The removed copy feature now points users at the CLI.
+    assert "use the CLI" in rendered
+    # No stale references to deleted keys.
+    assert "Sync now" not in rendered
 
 
 def test_report_renders_tables_sequentially_and_highlights_cache_pct(monkeypatch):
@@ -1268,7 +1425,7 @@ def test_tui_summary_and_breakdown_render_cache_pct():
     widget = Breakdown()
     widget._total_cost = 12.0
     widget._groups = [{
-        "agent": "codex",
+        "host": "local",
         "cost": 12.0,
         "unknown_cost_count": 0,
         "input": 100,
@@ -1276,7 +1433,17 @@ def test_tui_summary_and_breakdown_render_cache_pct():
         "cache": 300,
         "cache_read": 300,
         "cache_write": 0,
-        "providers": [],
+        "agents": [{
+            "agent": "codex",
+            "cost": 12.0,
+            "unknown_cost_count": 0,
+            "input": 100,
+            "output": 20,
+            "cache": 300,
+            "cache_read": 300,
+            "cache_write": 0,
+            "providers": [],
+        }],
     }]
 
     rendered = widget.render().plain
@@ -1309,6 +1476,8 @@ def test_tui_summary_follows_focused_time_offset(monkeypatch, tmp_path):
                 ]
 
             assert labels() == ["TODAY", "WEEK", "MONTH"]
+            app.action_scroll_breakdown_down()
+            app.action_scroll_breakdown_up()
 
             app.action_focus("week")
             app.action_back_in_time()
