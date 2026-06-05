@@ -9,7 +9,9 @@
 
 **支持平台:Linux、macOS 和 Windows。**
 
-**所有数据完全存储在本地,使用过程不会联网。** 工具仅读取本机的 agent 数据文件(`~/.claude/`、`~/.codex/`)和进程信息,不发送任何数据到外部服务器。
+**所有数据都在你的控制范围内,不会发送遥测。** 默认情况下工具仅读取本机的
+agent 数据文件(`~/.claude/`、`~/.codex/`)和进程信息;如果配置了 SSH
+远程,会通过 SSH 读取远程 agent 数据文件,并缓存到本机后参与汇总。
 
 ![Agentic Metric TUI](agentic-metric-screenshot.png)
 
@@ -250,8 +252,8 @@ src/agentic_metric/
 | Codex | 进程检测 | 运行状态、工作目录 |
 
 默认情况下,Claude Code 支持 `CLAUDE_CONFIG_DIR`,Codex 支持 `CODEX_HOME`,
-collector 会读取这些环境变量。需要同时扫描多个目录或手动指定 provider 时,
-可以创建本工具自己的配置文件:
+collector 会读取这些环境变量。需要同时扫描多个目录、手动指定 provider,
+或加入 SSH 远程机器时,可以创建本工具自己的配置文件:
 
 ```json
 {
@@ -269,14 +271,43 @@ collector 会读取这些环境变量。需要同时扫描多个目录或手动�
         {"path": "~/.claude-provider-b", "provider": "provider-b"}
       ]
     }
-  }
+  },
+  "remotes": [
+    {
+      "name": "devcloud",
+      "host": "devcloud",
+      "collectors": {
+        "codex": {
+          "roots": [{"path": "~/.codex", "provider": "openai"}]
+        },
+        "claude_code": {
+          "roots": [{"path": "~/.claude"}]
+        }
+      }
+    }
+  ]
 }
 ```
 
 默认配置路径是 `$DATA/agentic_metric/config.json`,也可以用
 `AGENTIC_METRIC_CONFIG` 指向其他 JSON 文件。Claude Code 目录没有 provider
 时不会被强行推断;Codex 未配置 provider 时会尝试读取 JSONL 里的
-`model_provider`。CLI/TUI 会把 `agent`、`provider`、`root` 分列展示。
+`model_provider`。
+
+远程配置会使用已有的 `ssh` 配置。`host` 可以是 SSH alias 或主机名;可选字段有
+`name`、`user`、`port`、`timeout`、`ssh_options`。如果某个远程没有配置
+collector 目录,它会复用本机的 collector roots;本机也没有配置时,等价于远程的
+`~/.claude` 和 `~/.codex`。远程同步会在远程主机上展开 `~`,通过 SSH 读取
+`projects/` 和 `sessions/`,缓存到 `$DATA/agentic_metric/remote-cache/`,再和本机用量一起汇总。
+如果远程目录不存在,这个 collector 会被跳过,不会拿旧缓存继续入库。CLI/TUI
+总量保持合并,明细和 Top projects 会保留 host/source 维度。
+
+报告顶部的总量会合并本机和远程数据。明细表使用紧凑的 `Source` 标签:本机行显示
+root,例如 `~/.codex`;远程行显示 `host:root`,例如 `devcloud:~/.codex`。
+Top projects 也会给远程路径加同样的前缀,例如
+`devcloud:/data/workspace/project`,避免本机和远程相同项目路径被静默合并。
+`--full` 会额外展示按 source 汇总的 provider 表;默认报告保留
+source × agent × provider × model 明细和 Top projects。
 
 所有数据汇总存储在 `$DATA/agentic_metric/data.db`(SQLite)。
 
@@ -289,7 +320,7 @@ collector 会读取这些环境变量。需要同时扫描多个目录或手动�
 
 ## 隐私
 
-- 不联网,不发送任何数据
+- 默认本地运行;不配置 SSH 远程时不发网络请求
 - 不修改 agent 的配置或数据文件(只读)
 - 所有统计数据存储在本地 SQLite 数据库
 - 可随时删除数据目录清除所有数据(Linux: `~/.local/share/agentic_metric/`,macOS: `~/Library/Application Support/agentic_metric/`,Windows: `%LOCALAPPDATA%\agentic_metric\`)

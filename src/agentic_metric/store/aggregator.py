@@ -641,7 +641,8 @@ def get_range_by_project(db: Database, from_date: str, to_date: str, limit: int 
     """Return per-project aggregates within the given date range, sorted by cost desc."""
     usage = _usage_source(db)
     rows = db.conn.execute(
-        f"""SELECT CASE WHEN project_path = '' THEN '(unspecified)'
+        f"""SELECT data_root,
+                  CASE WHEN project_path = '' THEN '(unspecified)'
                        ELSE project_path END AS project_path,
                   {_session_count_expr()} AS session_count,
                   COALESCE(SUM(user_turns), 0) AS user_turns,
@@ -653,7 +654,7 @@ def get_range_by_project(db: Database, from_date: str, to_date: str, limit: int 
                   {_unknown_cost_expr()} AS unknown_cost_count
            FROM {usage}
            WHERE usage_date BETWEEN ? AND ?
-           GROUP BY project_path
+           GROUP BY data_root, project_path
            ORDER BY estimated_cost_usd DESC, unknown_cost_count DESC
            LIMIT ?
         """,

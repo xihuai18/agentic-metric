@@ -22,8 +22,9 @@ from .formatting import (
     has_cost_signal as _has_cost_signal,
     has_unknown_cost as _has_unknown_cost,
     share_suffix as _share_suffix,
-    short_path as _short_path,
     shorten_home as _shorten_home,
+    source_prefixed_path as _source_prefixed_path,
+    source_root_label as _source_root_label,
 )
 
 app = typer.Typer(
@@ -156,12 +157,15 @@ def sync(
     for c in registry.get_all():
         provider = getattr(c, "provider", "") or "—"
         data_root = _shorten_home(getattr(c, "data_root", "") or "") or "—"
+        last_error = getattr(c, "last_error", "")
         console.print(
             f"  [{C_MUTED}]•[/] "
             f"[{C_MAUVE}]{c.agent_type}[/]  "
             f"[{C_SKY}]{provider}[/]  "
             f"[{C_MUTED}]{data_root}[/]"
         )
+        if last_error:
+            console.print(f"    [{C_YELLOW}]remote sync skipped: {last_error}[/]")
 
 
 # ── report ─────────────────────────────────────────────────────────
@@ -227,11 +231,13 @@ def report(
 
     def _once() -> None:
         db = Database()
+        sync_errors: list[str] = []
         if db.pricing_changed and no_sync:
             console.print(f"[{C_YELLOW}]Pricing changed; syncing history to refresh event-level costs.[/]")
         if db.pricing_changed or not no_sync:
             registry = create_default_registry()
             registry.sync_all(db)
+            sync_errors = registry.get_sync_errors()
             db.commit()
 
         totals = aggregator.get_range_totals(db, frm, to)
@@ -254,8 +260,14 @@ def report(
         db.close()
 
         if json_:
-            _emit_report_json(label, frm, to, totals, by_agent, by_agent_model, by_project)
+            _emit_report_json(
+                label, frm, to, totals, by_agent, by_agent_model, by_project,
+                sync_errors=sync_errors,
+            )
         else:
+            if sync_errors:
+                for err in sync_errors:
+                    console.print(f"[{C_YELLOW}]remote sync skipped: {err}[/]")
             _print_report(
                 label, frm, to, totals, by_agent, by_agent_model, by_project,
                 periodic, focus_kind, prev_totals, full=full, limit=limit,
@@ -278,6 +290,7 @@ def _emit_report_json(
     label: str, frm: str, to: str,
     totals: dict, by_agent: list[dict],
     by_agent_model: list[dict], by_project: list[dict],
+    sync_errors: list[str] | None = None,
 ) -> None:
     """Print the report as machine-readable JSON (for scripts / pipes)."""
     payload = {
@@ -288,6 +301,7 @@ def _emit_report_json(
         "by_agent": [dict(r) for r in by_agent],
         "by_agent_model": [dict(r) for r in by_agent_model],
         "by_project": [dict(r) for r in by_project],
+        "sync_errors": sync_errors or [],
     }
     print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
 
@@ -609,7 +623,14 @@ def _top_projects_block(
             path_len = 22 if console.size.width < 100 else 44
         except Exception:
             path_len = 44
-        line.append(_short_path(p["project_path"], max_len=path_len), style=C_BLUE)
+        line.append(
+            _source_prefixed_path(
+                p["project_path"],
+                p.get("data_root") or "",
+                max_len=path_len,
+            ),
+            style=C_BLUE,
+        )
         line.append(
             f" · {_fmt_cost(p['estimated_cost_usd'], unknown=unknown)}",
             style=f"bold {C_YELLOW}" if i == 0 else C_YELLOW,
@@ -634,29 +655,27 @@ def _build_by_agent_table(by_agent: list[dict]) -> Table | None:
         box=box.SIMPLE_HEAVY,
         pad_edge=False,
         border_style=C_SURFACE1,
-        title="By provider",
+        title="By source × provider",
         title_style=f"bold {C_TEXT}",
         title_justify="left",
     )
-    tbl.add_column("Agent", style=C_MAUVE, no_wrap=True)
-    tbl.add_column("Provider", style=C_SKY, no_wrap=True)
-    tbl.add_column("Root", style=C_MUTED, overflow="ellipsis", no_wrap=True, max_width=42)
-    tbl.add_column("Sessions", justify="right", style=C_TEXT, no_wrap=True)
+    tbl.add_column("Source", style=C_MUTED, overflow="ellipsis", no_wrap=True, max_width=16)
+    tbl.add_column("Ag", style=C_MAUVE, overflow="ellipsis", no_wrap=True, min_width=5, max_width=8)
+    tbl.add_column("Prov", style=C_SKY, overflow="ellipsis", no_wrap=True, min_width=4, max_width=6)
+    tbl.add_column("Sess", justify="right", style=C_TEXT, no_wrap=True)
     tbl.add_column("Turns", justify="right", style=C_TEXT, no_wrap=True)
-    tbl.add_column("Cache %", justify="right", style=f"bold {C_GREEN}", no_wrap=True, min_width=7)
-    tbl.add_column("Input", justify="right", style=C_TEAL, no_wrap=True)
-    tbl.add_column("Output", justify="right", style=C_TEAL, no_wrap=True)
+    tbl.add_column("In", justify="right", style=C_TEAL, no_wrap=True)
+    tbl.add_column("Out", justify="right", style=C_TEAL, no_wrap=True)
     tbl.add_column("Cache", justify="right", style=C_GREEN, no_wrap=True)
-    tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}", no_wrap=True)
+    tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}", no_wrap=True, min_width=6)
     for r in by_agent:
-        cp = _cache_hit_rate(r)
+        data_root = r.get("data_root") or ""
         tbl.add_row(
+            _source_root_label(data_root, max_len=16),
             r["agent_type"],
             r.get("provider") or "—",
-            _short_path(r.get("data_root") or "—", max_len=34),
             f"{r['session_count']:,}",
             f"{r['user_turns']:,}",
-            f"{cp:.0f}%" if cp >= 0 else "—",
             _fmt_tokens(r.get("input_tokens") or 0),
             _fmt_tokens(r.get("output_tokens") or 0),
             _fmt_tokens(_cache_tokens(r)),
@@ -675,20 +694,18 @@ def _build_by_agent_model_table(rows: list[dict], *, limit: int = 8) -> Table | 
         box=box.SIMPLE_HEAVY,
         pad_edge=False,
         border_style=C_SURFACE1,
-        title="By agent × provider × model",
+        title="By source × agent × provider × model",
         title_style=f"bold {C_TEXT}",
         title_justify="left",
     )
-    tbl.add_column("Agent", style=C_MAUVE, no_wrap=True)
-    tbl.add_column("Provider", style=C_SKY, no_wrap=True)
-    tbl.add_column("Root", style=C_MUTED, overflow="ellipsis", no_wrap=True, max_width=12)
-    tbl.add_column("Model", style=C_SKY, overflow="ellipsis", no_wrap=True, max_width=20)
-    tbl.add_column("Sessions", justify="right", style=C_TEXT, no_wrap=True)
-    tbl.add_column("Cache %", justify="right", style=f"bold {C_GREEN}", no_wrap=True, min_width=7)
-    tbl.add_column("Input", justify="right", style=C_TEAL, no_wrap=True)
-    tbl.add_column("Output", justify="right", style=C_TEAL, no_wrap=True)
+    tbl.add_column("Source", style=C_MUTED, overflow="ellipsis", no_wrap=True, max_width=16)
+    tbl.add_column("Ag", style=C_MAUVE, overflow="ellipsis", no_wrap=True, min_width=5, max_width=8)
+    tbl.add_column("Prov", style=C_SKY, overflow="ellipsis", no_wrap=True, min_width=4, max_width=6)
+    tbl.add_column("Model", style=C_SKY, overflow="ellipsis", no_wrap=True, max_width=14)
+    tbl.add_column("In", justify="right", style=C_TEAL, no_wrap=True)
+    tbl.add_column("Out", justify="right", style=C_TEAL, no_wrap=True)
     tbl.add_column("Cache", justify="right", style=C_GREEN, no_wrap=True)
-    tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}", no_wrap=True)
+    tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}", no_wrap=True, min_width=6)
 
     # Group consecutive rows by (agent, provider, root) and cap the model
     # rows per group at ``limit``; the tail rolls up into "+N more models".
@@ -705,14 +722,12 @@ def _build_by_agent_model_table(rows: list[dict], *, limit: int = 8) -> Table | 
         model_display = r["model"]
         if model_display == "Unknown" and r.get("raw_model"):
             model_display = f"Unknown: {r['raw_model']}"
-        cp = _cache_hit_rate(r)
+        data_root = r.get("data_root") or ""
         tbl.add_row(
+            _source_root_label(data_root, max_len=16) if show_group else "",
             r["agent_type"] if show_group else "",
             (r.get("provider") or "—") if show_group else "",
-            _short_path(r.get("data_root") or "—", max_len=28) if show_group else "",
             model_display,
-            f"{r['session_count']:,}",
-            f"{cp:.0f}%" if cp >= 0 else "—",
             _fmt_tokens(r.get("input_tokens") or 0),
             _fmt_tokens(r.get("output_tokens") or 0),
             _fmt_tokens(_cache_tokens(r)),
@@ -734,12 +749,9 @@ def _build_by_agent_model_table(rows: list[dict], *, limit: int = 8) -> Table | 
                 "estimated_cost_usd": sum(m.get("estimated_cost_usd") or 0 for m in hidden),
                 "unknown_cost_count": sum(m.get("unknown_cost_count") or 0 for m in hidden),
             }
-            cp = _cache_hit_rate(agg)
             tbl.add_row(
                 "", "", "",
                 f"+{len(hidden)} more models",
-                "",
-                f"{cp:.0f}%" if cp >= 0 else "—",
                 _fmt_tokens(agg["input_tokens"]),
                 _fmt_tokens(agg["output_tokens"]),
                 _fmt_tokens(_cache_tokens(agg)),
@@ -769,7 +781,11 @@ def _build_top_projects_table(rows: list[dict]) -> Table | None:
     tbl.add_column("Cache", justify="right", style=C_GREEN, no_wrap=True)
     tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}", no_wrap=True)
     for r in nonzero:
-        path = _shorten_home(r["project_path"] or "(unspecified)")
+        path = _source_prefixed_path(
+            r["project_path"] or "(unspecified)",
+            r.get("data_root") or "",
+            max_len=72,
+        )
         tbl.add_row(
             path,
             f"{r['session_count']:,}",

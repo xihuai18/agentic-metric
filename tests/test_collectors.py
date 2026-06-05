@@ -4,7 +4,7 @@ import json
 import os
 from datetime import date, datetime
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from agentic_metric.collectors import CollectorRegistry, BaseCollector, create_default_registry
 from agentic_metric.collectors.claude_code import (
@@ -17,6 +17,13 @@ from agentic_metric.collectors.codex import (
     _LiveMonitor as CodexLiveMonitor,
     _SessionAccum as CodexSessionAccum,
 )
+from agentic_metric.collectors.remote import (
+    RemoteHistoryCollector,
+    RemoteSyncTarget,
+    _cache_root_for,
+    _ssh_command,
+)
+from agentic_metric.config import RemoteCollectorRoot, RemoteSpec, get_remote_specs
 from agentic_metric.collectors._process import find_pids, get_pid_cwd, normalize_cwd_key
 from agentic_metric.models import LiveSession
 from agentic_metric.pricing import estimate_cost
@@ -91,6 +98,67 @@ def test_default_registry_uses_configured_roots(tmp_path):
     ]
     assert collectors[0].projects_dir == tmp_path / "claude-alt" / "projects"
     assert collectors[2].sessions_dir == tmp_path / "codex-openai" / "sessions"
+
+
+def test_remote_specs_default_to_local_collector_roots(tmp_path):
+    config_file = tmp_path / "config.json"
+    config_file.write_text(json.dumps({
+        "collectors": {
+            "codex": {"roots": [{"path": "~/.codex-openai", "provider": "openai"}]},
+            "claude_code": {"roots": [{"path": "~/.claude-main"}]},
+        },
+        "remotes": [{"name": "dev", "host": "devcloud", "timeout": 7}],
+    }))
+
+    with patch("agentic_metric.config.CONFIG_FILE", config_file):
+        remotes = get_remote_specs()
+
+    assert len(remotes) == 1
+    assert remotes[0].name == "dev"
+    assert remotes[0].host == "devcloud"
+    assert remotes[0].timeout == 7
+    assert remotes[0].collectors == {
+        "codex": [RemoteCollectorRoot(path="~/.codex-openai", provider="openai")],
+        "claude_code": [RemoteCollectorRoot(path="~/.claude-main", provider="")],
+    }
+
+
+def test_default_registry_includes_remote_collectors(tmp_path):
+    config_file = tmp_path / "config.json"
+    config_file.write_text(json.dumps({
+        "remotes": [
+            {
+                "name": "dev",
+                "host": "devcloud",
+                "collectors": {
+                    "codex": {"roots": [{"path": "~/.codex-remote/sessions", "provider": "openai"}]},
+                    "claude_code": {"roots": [{"path": "~/.claude-remote/projects"}]},
+                },
+            }
+        ],
+    }))
+
+    with patch("agentic_metric.config.CONFIG_FILE", config_file):
+        registry = create_default_registry()
+
+    remote_collectors = [
+        c for c in registry.get_all()
+        if getattr(c, "data_root", "").startswith("ssh://dev/")
+    ]
+    assert [(c.agent_type, c.provider, c.data_root) for c in remote_collectors] == [
+        ("claude_code", "", "ssh://dev/~/.claude-remote"),
+        ("codex", "openai", "ssh://dev/~/.codex-remote"),
+    ]
+
+
+def test_remote_ssh_command_expands_tilde_on_remote_host():
+    remote = RemoteSpec(host="devcloud", user="leo", port=2222)
+    cmd = _ssh_command(remote, "~/.codex", "sessions")
+
+    assert cmd[:4] == ["ssh", "-p", "2222", "leo@devcloud"]
+    assert "root='~/.codex'" in cmd[-1]
+    assert 'case "$root"' in cmd[-1]
+    assert 'root="$HOME/${root#~/}"' in cmd[-1]
 
 
 def test_live_session_total_tokens():
@@ -281,6 +349,122 @@ def test_codex_history_sync_supports_same_root_provider_filters(tmp_path):
     assert db.conn.execute(
         "SELECT COUNT(*) AS n FROM sync_state WHERE key LIKE 'codex_jsonl:v7:%'"
     ).fetchone()["n"] == 4
+    db.close()
+
+
+def test_remote_codex_collector_syncs_tarball_into_history(tmp_path):
+    import io
+    import tarfile
+
+    lines = [
+        {
+            "timestamp": "2026-04-23T10:00:00Z",
+            "type": "session_meta",
+            "payload": {"id": "remote-sid", "cwd": "/work/project", "model_provider": "openai"},
+        },
+        {
+            "timestamp": "2026-04-23T10:00:01Z",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "hello"},
+        },
+        {
+            "timestamp": "2026-04-23T10:00:02Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {"total_token_usage": {"input_tokens": 100, "output_tokens": 20}},
+            },
+        },
+    ]
+    payload = "".join(json.dumps(line) + "\n" for line in lines).encode()
+    tar_bytes = io.BytesIO()
+    with tarfile.open(fileobj=tar_bytes, mode="w:gz") as tar:
+        info = tarfile.TarInfo("sessions/2026/04/23/rollout-remote.jsonl")
+        info.size = len(payload)
+        tar.addfile(info, io.BytesIO(payload))
+
+    completed = Mock(returncode=0, stdout=tar_bytes.getvalue(), stderr=b"")
+    run_mock = Mock(return_value=completed)
+    remote = RemoteSpec(host="devcloud", name="dev", timeout=9)
+    target = RemoteSyncTarget(
+        remote=remote,
+        agent_type="codex",
+        remote_root="~/.codex",
+        provider="openai",
+        index=0,
+    )
+    db = Database(db_path=str(tmp_path / "data.db"))
+    with patch("agentic_metric.collectors.remote.DATA_DIR", tmp_path / "data"), \
+         patch("agentic_metric.collectors.remote.subprocess.run", run_mock):
+        RemoteHistoryCollector(target).sync_history(db)
+
+    assert run_mock.call_args.kwargs["timeout"] == 9
+    row = db.conn.execute(
+        "SELECT provider, data_root, project_path, input_tokens, output_tokens "
+        "FROM sessions WHERE session_id = 'remote-sid'"
+    ).fetchone()
+    assert dict(row) == {
+        "provider": "openai",
+        "data_root": "ssh://dev/~/.codex",
+        "project_path": "/work/project",
+        "input_tokens": 100,
+        "output_tokens": 20,
+    }
+    db.close()
+
+
+def test_remote_missing_path_does_not_parse_stale_cache(tmp_path):
+    remote = RemoteSpec(host="devcloud", name="dev")
+    target = RemoteSyncTarget(
+        remote=remote,
+        agent_type="codex",
+        remote_root="~/.codex",
+        provider="openai",
+        index=0,
+    )
+    stale_lines = [
+        {
+            "timestamp": "2026-04-23T10:00:00Z",
+            "type": "session_meta",
+            "payload": {"id": "stale-sid", "cwd": "/work/project", "model_provider": "openai"},
+        },
+        {
+            "timestamp": "2026-04-23T10:00:01Z",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "stale"},
+        },
+        {
+            "timestamp": "2026-04-23T10:00:02Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {"total_token_usage": {"input_tokens": 100, "output_tokens": 20}},
+            },
+        },
+    ]
+    completed = Mock(returncode=0, stdout=b"", stderr=b"")
+    db = Database(db_path=str(tmp_path / "data.db"))
+
+    with patch("agentic_metric.collectors.remote.DATA_DIR", tmp_path / "data"), \
+         patch("agentic_metric.collectors.remote.subprocess.run", return_value=completed):
+        cache_file = (
+            _cache_root_for(target)
+            / "sessions"
+            / "2026"
+            / "04"
+            / "23"
+            / "rollout-stale.jsonl"
+        )
+        cache_file.parent.mkdir(parents=True)
+        cache_file.write_text("".join(json.dumps(line) + "\n" for line in stale_lines))
+
+        collector = RemoteHistoryCollector(target)
+        collector.sync_history(db)
+
+    assert "remote path not found" in collector.last_error
+    assert db.conn.execute(
+        "SELECT COUNT(*) AS n FROM sessions WHERE session_id = 'stale-sid'"
+    ).fetchone()["n"] == 0
     db.close()
 
 

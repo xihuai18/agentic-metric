@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 from rich.text import Text
@@ -18,6 +18,8 @@ from textual_plotext import PlotextPlot
 from ..collectors import CollectorRegistry, create_default_registry
 from ..config import AUTO_REFRESH_INTERVAL, DATA_SYNC_INTERVAL, LIVE_REFRESH_INTERVAL
 from ..formatting import cache_hit_rate as _cache_hit_rate
+from ..formatting import source_label as _source_label
+from ..formatting import source_prefixed_path as _source_prefixed_path
 from ..models import LiveSession
 from ..store.aggregator import (
     get_heatmap,
@@ -339,14 +341,16 @@ class AgenticMetricApp(App):
         rows = get_range_by_agent_model(self._db, frm, to)
         rows = [r for r in rows if (r["estimated_cost_usd"] or 0) > 0 or _has_unknown_cost(r)]
 
-        agents_by_name: dict[str, dict] = {}
+        agents_by_name: dict[tuple[str, str], dict] = {}
         for r in rows:
             at = r["agent_type"]
             provider = r.get("provider") or ""
             data_root = r.get("data_root") or ""
+            source = _source_label(data_root)
+            agent_key = (source, at)
 
-            agent = agents_by_name.setdefault(at, {
-                "agent": at,
+            agent = agents_by_name.setdefault(agent_key, {
+                "agent": f"{source} · {at}",
                 "cost": 0.0,
                 "tokens": 0,
                 "input": 0,
@@ -424,7 +428,7 @@ class AgenticMetricApp(App):
 
         title_widget = self.query_one("#breakdown-title", Static)
         title_widget.update(Text.from_markup(
-            f"[bold]By agent → provider → model[/] — [bright_cyan]{label}[/] [white]({frm} → {to})[/]"
+            f"[bold]By host → agent → provider → model[/] — [bright_cyan]{label}[/] [white]({frm} → {to})[/]"
         ))
         self.query_one("#breakdown-body", Breakdown).update_data(groups, total_cost)
 
@@ -482,7 +486,9 @@ class AgenticMetricApp(App):
 
     def _on_sync_done(self) -> None:
         self._today_sessions = get_today_sessions(self._db)
-        self.sub_title = f"synced {datetime.now().strftime('%H:%M:%S')}"
+        sync_errors = self._collectors.get_sync_errors()
+        suffix = f" · {len(sync_errors)} remote skipped" if sync_errors else ""
+        self.sub_title = f"synced {datetime.now().strftime('%H:%M:%S')}{suffix}"
         self._populate_all()
 
     # ── Actions ───────────────────────────────────────────────────────
@@ -621,7 +627,11 @@ class AgenticMetricApp(App):
             lines.append("Top projects:")
             for p in nonzero_projects:
                 cost_str = fmt_cost(p.get("estimated_cost_usd"), unknown=_has_unknown_cost(p))
-                lines.append(f"  {_short_path(p['project_path'])}  {cost_str}")
+                path = _source_prefixed_path(
+                    p["project_path"],
+                    p.get("data_root") or "",
+                )
+                lines.append(f"  {path}  {cost_str}")
 
         self.copy_to_clipboard("\n".join(lines))
         self.notify("Copied current view summary", severity="information")

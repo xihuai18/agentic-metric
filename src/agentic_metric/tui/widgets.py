@@ -9,7 +9,8 @@ from rich.text import Text
 from textual.widgets import Static
 
 from ..formatting import cache_hit_rate as _cache_hit_rate
-from ..formatting import short_path as _short_path
+from ..formatting import root_label as _root_label
+from ..formatting import source_prefixed_path as _source_prefixed_path
 
 
 # ── Formatting helpers ────────────────────────────────────────────────
@@ -453,8 +454,14 @@ def _top_projects_block(
         else:
             line.append(" " * len(label_text), style="default")
         line.append("  ")
-        line.append(_short_path(p["project_path"] or "", max_len=44),
-                    style="bright_blue")
+        line.append(
+            _source_prefixed_path(
+                p["project_path"] or "",
+                p.get("data_root") or "",
+                max_len=44,
+            ),
+            style="bright_blue",
+        )
         line.append(
             f" · {fmt_cost(p.get('estimated_cost_usd'), unknown=unknown)}",
             style="bold bright_yellow" if i == 0 else "bright_yellow",
@@ -642,7 +649,7 @@ class Breakdown(Static):
                 provider_prefix = f"  {provider_connector}"
                 provider_width = 9
                 path_width = max(6, label_width - len(provider_prefix) - provider_width - 1)
-                data_root = _short_path(provider_group.get("data_root") or "—", max_len=path_width)
+                data_root = _root_label(provider_group.get("data_root") or "", max_len=path_width)
                 provider_cost = provider_group.get("cost") or 0.0
                 provider_unknown = _has_unknown_cost(provider_group)
                 provider_ratio = provider_cost / total

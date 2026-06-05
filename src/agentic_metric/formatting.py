@@ -52,6 +52,42 @@ def short_path(path: str, max_len: int = 42) -> str:
     return clip(path, max_len)
 
 
+def split_data_root(data_root: str) -> tuple[str, str]:
+    """Return ``(source, root)`` for local or SSH-backed data roots."""
+    data_root = data_root or ""
+    if data_root.startswith("ssh://"):
+        rest = data_root[len("ssh://"):]
+        source, sep, root = rest.partition("/")
+        return source or "remote", root if sep else ""
+    return "local", data_root
+
+
+def source_label(data_root: str) -> str:
+    return split_data_root(data_root)[0]
+
+
+def root_label(data_root: str, max_len: int = 42) -> str:
+    _, root = split_data_root(data_root)
+    return short_path(root or "(unspecified)", max_len=max_len)
+
+
+def source_root_label(data_root: str, max_len: int = 42) -> str:
+    source, root = split_data_root(data_root)
+    root_text = short_path(root or "(unspecified)", max_len=max_len)
+    if source == "local":
+        return root_text
+    return clip(f"{source}:{root_text}", max_len)
+
+
+def source_prefixed_path(project_path: str, data_root: str, max_len: int = 72) -> str:
+    source = source_label(data_root)
+    path = short_path(project_path or "(unspecified)", max_len=max_len)
+    if source == "local":
+        return path
+    prefix = f"{source}:"
+    return clip(f"{prefix}{path}", max_len)
+
+
 def shorten_home(path: str) -> str:
     if not path:
         return path

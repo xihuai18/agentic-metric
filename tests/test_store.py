@@ -536,6 +536,40 @@ def test_range_reports_split_provider_and_data_root():
     db.close()
 
 
+def test_top_projects_split_same_path_by_data_root():
+    db = _make_db()
+    for session_id, data_root, input_tokens in (
+        ("local-sid", "/tmp/codex", 1_000),
+        ("remote-sid", "ssh://dev/~/.codex", 2_000),
+    ):
+        db.replace_session_usage(
+            session_id,
+            "codex",
+            [
+                {
+                    "usage_date": "2026-04-24",
+                    "usage_hour": 10,
+                    "project_path": "/work/project",
+                    "model": "gpt-5.4",
+                    "input_tokens": input_tokens,
+                },
+            ],
+            provider="openai",
+            data_root=data_root,
+        )
+    db.commit()
+
+    rows = get_range_by_project(db, "2026-04-24", "2026-04-24", limit=10)
+    assert {
+        (row["data_root"], row["project_path"], row["input_tokens"])
+        for row in rows
+    } == {
+        ("/tmp/codex", "/work/project", 1_000),
+        ("ssh://dev/~/.codex", "/work/project", 2_000),
+    }
+    db.close()
+
+
 def test_replace_session_usage_prices_known_model():
     db = _make_db()
     db.replace_session_usage(
@@ -1080,6 +1114,50 @@ def test_breakdown_table_rolls_up_models_past_limit():
     assert "+3 more models" in text
 
 
+def test_cli_breakdown_table_shows_remote_host():
+    rows = [{
+        "agent_type": "codex",
+        "provider": "openai",
+        "data_root": "ssh://dev/~/.codex",
+        "model": "gpt-5.4",
+        "raw_model": "gpt-5.4",
+        "session_count": 1,
+        "input_tokens": 1_000,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
+        "estimated_cost_usd": 0.001,
+        "unknown_cost_count": 0,
+    }]
+    tbl = cli_module._build_by_agent_model_table(rows, limit=2)
+    from rich.console import Console as _C
+    import io as _io
+    buf = _io.StringIO()
+    _C(file=buf, width=140, no_color=True).print(tbl)
+    text = buf.getvalue()
+    assert "Source" in text
+    assert "dev:~/.codex" in text
+
+
+def test_cli_top_projects_prefixes_remote_host():
+    tbl = cli_module._build_top_projects_table([{
+        "data_root": "ssh://dev/~/.codex",
+        "project_path": "/work/project",
+        "session_count": 1,
+        "input_tokens": 1_000,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
+        "estimated_cost_usd": 0.001,
+        "unknown_cost_count": 0,
+    }])
+    from rich.console import Console as _C
+    import io as _io
+    buf = _io.StringIO()
+    _C(file=buf, width=140, no_color=True).print(tbl)
+    assert "dev:/work/project" in buf.getvalue()
+
+
 
 def test_heatmap_buckets_carry_cache_fields_for_cache_pct():
     db = _make_db()
@@ -1153,10 +1231,11 @@ def test_tui_summary_follows_focused_time_offset(monkeypatch, tmp_path):
     async def run() -> None:
         app = AgenticMetricApp()
         async with app.run_test(headless=True, size=(120, 36)):
-            labels = lambda: [
-                app.query_one(sel, SummaryCell).label
-                for sel in ("#cell-today", "#cell-week", "#cell-month")
-            ]
+            def labels() -> list[str]:
+                return [
+                    app.query_one(sel, SummaryCell).label
+                    for sel in ("#cell-today", "#cell-week", "#cell-month")
+                ]
 
             assert labels() == ["TODAY", "WEEK", "MONTH"]
 

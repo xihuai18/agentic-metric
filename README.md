@@ -9,7 +9,10 @@ A local-only monitoring tool for AI coding agents — like `top`, but for your c
 
 **Supported platforms: Linux, macOS, and Windows.**
 
-**All data stays on your machine. No network requests, no telemetry, no data leaves your computer.** The tool only reads local agent data files (`~/.claude/`, `~/.codex/`) and process info.
+**All data stays under your control. No telemetry is sent anywhere.** By default
+the tool only reads local agent data files (`~/.claude/`, `~/.codex/`) and
+process info. If SSH remotes are configured, it reads those remote agent data
+files over SSH and caches a local copy for aggregation.
 
 ![Agentic Metric TUI](agentic-metric-screenshot.png)
 
@@ -263,8 +266,8 @@ Paths differ by platform. `$DATA` refers to:
 | Codex | Process detection | Running status, working directory |
 
 By default, Claude Code honors `CLAUDE_CONFIG_DIR` and Codex honors
-`CODEX_HOME`. To scan multiple roots or assign a provider explicitly, create
-this tool's own config file:
+`CODEX_HOME`. To scan multiple roots, assign a provider explicitly, or include
+SSH remotes, create this tool's own config file:
 
 ```json
 {
@@ -282,15 +285,47 @@ this tool's own config file:
         {"path": "~/.claude-provider-b", "provider": "provider-b"}
       ]
     }
-  }
+  },
+  "remotes": [
+    {
+      "name": "devcloud",
+      "host": "devcloud",
+      "collectors": {
+        "codex": {
+          "roots": [{"path": "~/.codex", "provider": "openai"}]
+        },
+        "claude_code": {
+          "roots": [{"path": "~/.claude"}]
+        }
+      }
+    }
+  ]
 }
 ```
 
 The default config path is `$DATA/agentic_metric/config.json`; set
 `AGENTIC_METRIC_CONFIG` to point at another JSON file. Claude Code roots
 without a provider are not guessed; Codex roots without a provider can still
-fall back to the JSONL `model_provider`. CLI/TUI reports display `agent`,
-`provider`, and `root` as separate fields.
+fall back to the JSONL `model_provider`.
+
+Remote entries use your existing `ssh` config. `host` may be an SSH alias or a
+hostname; optional fields are `name`, `user`, `port`, `timeout`, and
+`ssh_options`. If a remote does not configure collector roots, it reuses the
+local collector root configuration; with no local config that means `~/.claude`
+and `~/.codex` on the remote. Remote sync expands `~` on the remote host, reads
+`projects/` and `sessions/` over SSH, stores a cache under
+`$DATA/agentic_metric/remote-cache/`, and aggregates those rows with local usage.
+If a remote path is missing, that collector is skipped rather than reusing old
+cache contents. CLI/TUI totals stay merged, while breakdowns and top projects
+retain the host/source dimension.
+
+Reports keep the headline totals merged across local and remote data. Detail
+tables use a compact `Source` label: local rows show the root (`~/.codex`), and
+remote rows show `host:root` (`devcloud:~/.codex`). Top projects use the same
+prefix for remote paths (`devcloud:/data/workspace/project`) so matching local
+and remote project paths are never silently merged. `--full` adds a provider
+rollup by source; the default report keeps the source × agent × provider × model
+breakdown plus top projects.
 
 All aggregated data is stored locally in `$DATA/agentic_metric/data.db` (SQLite).
 
@@ -304,7 +339,7 @@ All aggregated data is stored locally in `$DATA/agentic_metric/data.db` (SQLite)
 
 ## Privacy
 
-- **Fully offline** — no network requests, no data sent anywhere
+- **Local by default** — no network requests unless SSH remotes are configured
 - **Read-only** — never modifies agent config or data files
 - All stats stored in a local SQLite database
 - Delete the data directory at any time to remove all data (`~/.local/share/agentic_metric/` on Linux, `~/Library/Application Support/agentic_metric/` on macOS, `%LOCALAPPDATA%\agentic_metric\` on Windows)
