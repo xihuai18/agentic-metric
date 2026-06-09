@@ -765,6 +765,7 @@ def _build_dimension_table(
     tbl.add_column("In", justify="right", style=C_TEAL, no_wrap=True)
     tbl.add_column("Out", justify="right", style=C_TEAL, no_wrap=True)
     tbl.add_column("Cache", justify="right", style=C_GREEN, no_wrap=True)
+    tbl.add_column("C%", justify="right", style=C_GREEN, no_wrap=True)
     tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}", no_wrap=True, min_width=6)
 
     for r in nonzero:
@@ -773,6 +774,7 @@ def _build_dimension_table(
             display = f"Unknown: {r['raw_model']}"
         turns = r.get("user_turns") or 0
         messages = r.get("message_count") or 0
+        cp = _cache_hit_rate(r)
         tbl.add_row(
             display,
             f"{r.get('session_count') or 0:,}",
@@ -781,6 +783,7 @@ def _build_dimension_table(
             _fmt_tokens(r.get("input_tokens") or 0),
             _fmt_tokens(r.get("output_tokens") or 0),
             _fmt_tokens(_cache_tokens(r)),
+            f"{cp:.0f}%" if cp >= 0 else "—",
             _fmt_cost(r.get("estimated_cost_usd"), unknown=_has_unknown_cost(r)),
         )
     return tbl
@@ -811,6 +814,7 @@ def _build_by_agent_model_table(rows: list[dict], *, limit: int = 8) -> Table | 
     tbl.add_column("In", justify="right", style=C_TEAL, no_wrap=True)
     tbl.add_column("Out", justify="right", style=C_TEAL, no_wrap=True)
     tbl.add_column("Cache", justify="right", style=C_GREEN, no_wrap=True)
+    tbl.add_column("C%", justify="right", style=C_GREEN, no_wrap=True)
     tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}", no_wrap=True, min_width=6)
 
     # Group consecutive rows by (agent, provider, root) and cap the model
@@ -829,6 +833,7 @@ def _build_by_agent_model_table(rows: list[dict], *, limit: int = 8) -> Table | 
         if model_display == "Unknown" and r.get("raw_model"):
             model_display = f"Unknown: {r['raw_model']}"
         data_root = r.get("data_root") or ""
+        cp = _cache_hit_rate(r)
         tbl.add_row(
             _source_root_label(data_root, max_len=source_width) if show_group else "",
             r["agent_type"] if show_group else "",
@@ -837,6 +842,7 @@ def _build_by_agent_model_table(rows: list[dict], *, limit: int = 8) -> Table | 
             _fmt_tokens(r.get("input_tokens") or 0),
             _fmt_tokens(r.get("output_tokens") or 0),
             _fmt_tokens(_cache_tokens(r)),
+            f"{cp:.0f}%" if cp >= 0 else "—",
             _fmt_cost(r.get("estimated_cost_usd"), unknown=_has_unknown_cost(r)),
         )
 
@@ -855,12 +861,14 @@ def _build_by_agent_model_table(rows: list[dict], *, limit: int = 8) -> Table | 
                 "estimated_cost_usd": sum(m.get("estimated_cost_usd") or 0 for m in hidden),
                 "unknown_cost_count": sum(m.get("unknown_cost_count") or 0 for m in hidden),
             }
+            agg_cp = _cache_hit_rate(agg)
             tbl.add_row(
                 "", "", "",
                 f"+{len(hidden)} more models",
                 _fmt_tokens(agg["input_tokens"]),
                 _fmt_tokens(agg["output_tokens"]),
                 _fmt_tokens(_cache_tokens(agg)),
+                f"{agg_cp:.0f}%" if agg_cp >= 0 else "—",
                 _fmt_cost(agg["estimated_cost_usd"], unknown=_has_unknown_cost(agg)),
             )
     return tbl
@@ -901,11 +909,13 @@ def _build_cross_table(
     tbl.add_column("In", justify="right", style=C_TEAL, no_wrap=True)
     tbl.add_column("Out", justify="right", style=C_TEAL, no_wrap=True)
     tbl.add_column("Cache", justify="right", style=C_GREEN, no_wrap=True)
+    tbl.add_column("C%", justify="right", style=C_GREEN, no_wrap=True)
     tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}", no_wrap=True, min_width=7)
     for r in nonzero:
         model_display = r.get("model") or "—"
         if model_display == "Unknown" and r.get("raw_model"):
             model_display = f"Unknown: {r['raw_model']}"
+        cp = _cache_hit_rate(r)
         tbl.add_row(
             a_value(r),
             model_display,
@@ -913,6 +923,7 @@ def _build_cross_table(
             _fmt_tokens(r.get("input_tokens") or 0),
             _fmt_tokens(r.get("output_tokens") or 0),
             _fmt_tokens(_cache_tokens(r)),
+            f"{cp:.0f}%" if cp >= 0 else "—",
             _fmt_cost(r.get("estimated_cost_usd"), unknown=_has_unknown_cost(r)),
         )
     return tbl
@@ -938,6 +949,7 @@ def _build_top_projects_table(rows: list[dict]) -> Table | None:
     tbl.add_column("Input", justify="right", style=C_TEAL, no_wrap=True)
     tbl.add_column("Output", justify="right", style=C_TEAL, no_wrap=True)
     tbl.add_column("Cache", justify="right", style=C_GREEN, no_wrap=True)
+    tbl.add_column("C%", justify="right", style=C_GREEN, no_wrap=True)
     tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}", no_wrap=True, min_width=7)
     for r in nonzero:
         path = _source_prefixed_path(
@@ -945,12 +957,14 @@ def _build_top_projects_table(rows: list[dict]) -> Table | None:
             r.get("data_root") or "",
             max_len=project_width,
         )
+        cp = _cache_hit_rate(r)
         tbl.add_row(
             path,
             f"{r['session_count']:,}",
             _fmt_tokens(r.get("input_tokens") or 0),
             _fmt_tokens(r.get("output_tokens") or 0),
             _fmt_tokens(_cache_tokens(r)),
+            f"{cp:.0f}%" if cp >= 0 else "—",
             _fmt_cost(r.get("estimated_cost_usd"), unknown=_has_unknown_cost(r)),
         )
     return tbl
@@ -980,6 +994,7 @@ def _build_project_agent_table(rows: list[dict]) -> Table | None:
     tbl.add_column("In", justify="right", style=C_TEAL, no_wrap=True)
     tbl.add_column("Out", justify="right", style=C_TEAL, no_wrap=True)
     tbl.add_column("Cache", justify="right", style=C_GREEN, no_wrap=True)
+    tbl.add_column("C%", justify="right", style=C_GREEN, no_wrap=True)
     tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}", no_wrap=True, min_width=6)
     for r in nonzero:
         turns = r.get("user_turns") or 0
@@ -989,6 +1004,7 @@ def _build_project_agent_table(rows: list[dict]) -> Table | None:
             r.get("data_root") or "",
             max_len=project_width,
         )
+        cp = _cache_hit_rate(r)
         tbl.add_row(
             path,
             r.get("agent_type") or "—",
@@ -998,6 +1014,7 @@ def _build_project_agent_table(rows: list[dict]) -> Table | None:
             _fmt_tokens(r.get("input_tokens") or 0),
             _fmt_tokens(r.get("output_tokens") or 0),
             _fmt_tokens(_cache_tokens(r)),
+            f"{cp:.0f}%" if cp >= 0 else "—",
             _fmt_cost(r.get("estimated_cost_usd"), unknown=_has_unknown_cost(r)),
         )
     return tbl
