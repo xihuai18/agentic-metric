@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.6.7 (2026-06-11)
+
+### Fixes
+
+- **Remote stale session cleanup**: remote sync now removes derived database
+  rows when the corresponding remote JSONL files disappear from the active
+  cache, so archived `.stale` files no longer keep contributing usage or cost.
+
 ## v0.6.4 (2026-06-06)
 
 ### Fixes

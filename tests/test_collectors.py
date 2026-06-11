@@ -570,6 +570,32 @@ def test_remote_removed_file_is_archived_not_reparsed(tmp_path):
         cache_file.write_text("".join(json.dumps(line) + "\n" for line in stale_lines))
 
         db = Database(db_path=str(tmp_path / "data.db"))
+        db.upsert_session(
+            "removed-sid",
+            "codex",
+            provider="openai",
+            data_root="ssh://dev/~/.codex",
+            project_path="/work/project",
+            model="gpt-5.5",
+            input_tokens=100,
+            output_tokens=20,
+            estimated_cost_usd=0.001,
+        )
+        db.replace_session_usage(
+            "removed-sid",
+            "codex",
+            [{
+                "usage_date": "2026-04-23",
+                "usage_hour": 10,
+                "model": "gpt-5.5",
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "estimated_cost_usd": 0.001,
+            }],
+            provider="openai",
+            data_root="ssh://dev/~/.codex",
+        )
+        db.commit()
         RemoteHistoryCollector(target).sync_history(db)
 
         assert not cache_file.exists()
@@ -584,6 +610,85 @@ def test_remote_removed_file_is_archived_not_reparsed(tmp_path):
         ).exists()
         assert db.conn.execute(
             "SELECT COUNT(*) AS n FROM sessions WHERE session_id = 'removed-sid'"
+        ).fetchone()["n"] == 0
+        assert db.conn.execute(
+            "SELECT COUNT(*) AS n FROM session_usage WHERE session_id = 'removed-sid'"
+        ).fetchone()["n"] == 0
+        db.close()
+
+
+def test_remote_removed_claude_file_purges_existing_db_usage(tmp_path):
+    remote = RemoteSpec(host="remote-dev", name="dev")
+    target = RemoteSyncTarget(
+        remote=remote,
+        agent_type="claude_code",
+        remote_root="~/.wcc",
+        provider="ichat",
+        index=0,
+    )
+    manifest = b"OK\0"
+
+    with patch("agentic_metric.collectors.remote.DATA_DIR", tmp_path / "data"), \
+         patch(
+             "agentic_metric.collectors.remote.subprocess.run",
+             return_value=Mock(returncode=0, stdout=manifest, stderr=b""),
+         ):
+        cache_file = (
+            _cache_root_for(target)
+            / "projects"
+            / "-work-project"
+            / "removed-claude.jsonl"
+        )
+        cache_file.parent.mkdir(parents=True)
+        cache_file.write_text(json.dumps({
+            "timestamp": "2026-04-23T10:00:00Z",
+            "type": "user",
+            "message": {"content": "removed"},
+        }) + "\n")
+
+        db = Database(db_path=str(tmp_path / "data.db"))
+        db.upsert_session(
+            "removed-claude",
+            "claude_code",
+            provider="ichat",
+            data_root="ssh://dev/~/.wcc",
+            project_path="/work/project",
+            model="claude-opus-4-8",
+            input_tokens=100,
+            output_tokens=20,
+            estimated_cost_usd=0.001,
+        )
+        db.replace_session_usage(
+            "removed-claude",
+            "claude_code",
+            [{
+                "usage_date": "2026-04-23",
+                "usage_hour": 10,
+                "model": "claude-opus-4-8",
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "estimated_cost_usd": 0.001,
+            }],
+            provider="ichat",
+            data_root="ssh://dev/~/.wcc",
+        )
+        db.commit()
+
+        RemoteHistoryCollector(target).sync_history(db)
+
+        assert not cache_file.exists()
+        assert (
+            _cache_root_for(target)
+            / ".stale"
+            / "projects"
+            / "-work-project"
+            / "removed-claude.jsonl"
+        ).exists()
+        assert db.conn.execute(
+            "SELECT COUNT(*) AS n FROM sessions WHERE session_id = 'removed-claude'"
+        ).fetchone()["n"] == 0
+        assert db.conn.execute(
+            "SELECT COUNT(*) AS n FROM session_usage WHERE session_id = 'removed-claude'"
         ).fetchone()["n"] == 0
         db.close()
 

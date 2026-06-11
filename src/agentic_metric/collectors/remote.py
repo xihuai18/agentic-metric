@@ -100,6 +100,7 @@ class RemoteHistoryCollector(BaseCollector):
                     f"{self.target.source_root}/{self.target.source_child}"
                 )
                 return
+            _purge_removed_remote_sessions(db, self.target)
             self.last_error = ""
         except Exception as exc:
             self.last_error = str(exc)
@@ -123,6 +124,106 @@ def _cache_root_for(target: RemoteSyncTarget) -> Path:
     )
     digest = sha1(raw.encode("utf-8")).hexdigest()[:16]
     return DATA_DIR / "remote-cache" / digest
+
+
+def _purge_removed_remote_sessions(db, target: RemoteSyncTarget) -> None:
+    """Drop derived DB rows whose remote JSONL no longer exists in active cache."""
+    active_ids = _active_remote_session_ids(target)
+    rows = db.conn.execute(
+        """SELECT session_id
+           FROM sessions
+           WHERE session_id != ''
+             AND agent_type = ?
+             AND provider = ?
+             AND data_root = ?""",
+        (target.agent_type, target.provider, target.data_root),
+    ).fetchall()
+    for row in rows:
+        if row["session_id"] in active_ids:
+            continue
+        db.delete_session(
+            row["session_id"],
+            target.agent_type,
+            provider=target.provider,
+            data_root=target.data_root,
+        )
+    db.commit()
+
+
+def _active_remote_session_ids(target: RemoteSyncTarget) -> set[str]:
+    cache_root = _cache_root_for(target)
+    active_root = cache_root / target.source_child
+    if not active_root.exists():
+        return set()
+    if target.agent_type == "codex":
+        return _active_codex_session_ids(active_root, target.provider)
+    if target.agent_type == "claude_code":
+        return _active_claude_session_ids(active_root)
+    return set()
+
+
+def _active_codex_session_ids(active_root: Path, provider: str) -> set[str]:
+    ids: set[str] = set()
+    for path in active_root.rglob("rollout-*.jsonl"):
+        if not path.is_file():
+            continue
+        session_id, observed_provider = _read_codex_session_identity(path)
+        if provider and observed_provider and observed_provider != provider:
+            continue
+        ids.add(session_id or path.stem)
+    return ids
+
+
+def _read_codex_session_identity(path: Path) -> tuple[str, str]:
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for idx, line in enumerate(handle):
+                if idx > 20:
+                    break
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if entry.get("type") != "session_meta":
+                    continue
+                payload = entry.get("payload", {})
+                if not isinstance(payload, dict):
+                    return ("", "")
+                return (
+                    str(payload.get("id") or ""),
+                    str(payload.get("model_provider") or "").strip(),
+                )
+    except (OSError, UnicodeDecodeError):
+        return ("", "")
+    return ("", "")
+
+
+def _active_claude_session_ids(active_root: Path) -> set[str]:
+    ids: set[str] = set()
+    try:
+        project_dirs = [path for path in active_root.iterdir() if path.is_dir()]
+    except OSError:
+        return ids
+    for project_dir in project_dirs:
+        try:
+            jsonl_files = list(project_dir.rglob("*.jsonl"))
+        except OSError:
+            continue
+        for path in jsonl_files:
+            if path.is_file():
+                ids.add(_claude_session_id_for_jsonl(project_dir, path))
+    return ids
+
+
+def _claude_session_id_for_jsonl(project_dir: Path, jsonl_file: Path) -> str:
+    try:
+        rel = jsonl_file.relative_to(project_dir)
+    except ValueError:
+        return jsonl_file.stem
+    parts = rel.parts
+    if len(parts) >= 3 and parts[-2] == "subagents":
+        return f"{parts[-3]}:{jsonl_file.stem}"
+    return jsonl_file.stem
 
 
 def _ssh_destination(remote: RemoteSpec) -> str:
