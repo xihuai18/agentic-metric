@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.6.8 (2026-06-12)
+
+### Changes
+
+- **Claude Fable 5 pricing**: added builtin pricing for `claude-fable-5`
+  using Anthropic's official API pricing.
+
 ## v0.6.7 (2026-06-11)
 
 ### Fixes

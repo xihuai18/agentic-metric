@@ -65,6 +65,12 @@ def test_claude_opus_4_8_pricing(tmp_path):
         assert get_pricing("claude-opus-4-8-20260528") == (5.0, 25.0, 0.50, 6.25)
 
 
+def test_claude_fable_5_pricing(tmp_path):
+    with _patch_empty_user_pricing(tmp_path):
+        assert get_pricing("claude-fable-5") == (10.0, 50.0, 1.00, 12.50)
+        assert get_pricing("claude-fable-5-20260609") == (10.0, 50.0, 1.00, 12.50)
+
+
 def test_unknown_model_fallback():
     p = get_pricing("unknown-model-xyz")
     assert p is None
