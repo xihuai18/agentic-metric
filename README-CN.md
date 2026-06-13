@@ -142,16 +142,15 @@ agentic-metric pricing cache reset claude-sonnet-4                # 删除覆盖
 
 ### TUI 快捷键
 
-底栏显示为:`←→ View · ↑↓ Range · . Now · R Auto · p Pricing · ? Help · q Quit`。
+底栏显示为:`PgUp/PgDn Range · ←→ View · . Now · r Auto-refresh · p Pricing · ? Help · q Quit`。
 
 | 键 | 底栏 | 功能 |
 |----|------|------|
-| `←` / `→`(或 `h` / `l`) | View | 切换视图(Today / Week / Month) |
-| `↑` / `↓`(或 `k` / `j`) | Range | 时间范围往前 / 往后 |
+| `←` / `→` | View | 切换视图(Today / Week / Month) |
+| `PageUp` / `PageDown` | Range | 时间范围往前 / 往后 |
 | `.` | Now | 回到"现在"(清空 offset) |
-| `t` / `w` / `m` | — | 直接聚焦 Today / Week / Month |
-| `PageUp` / `PageDown` | — | 滚动明细面板 |
-| `R` | Auto | 切换快速自动刷新("实时"同步);开启时暂停慢速周期 sync |
+| `↑` / `↓` | — | 滚动明细面板 |
+| `r` | Auto-refresh | 切换快速自动刷新("实时"同步);开启时暂停慢速周期 sync |
 | `p` | Pricing | 打开只读价格视图(高亮当前范围内的未知模型) |
 | `?` | Help | 显示快捷键速查表 |
 | `q` | Quit | 退出 |

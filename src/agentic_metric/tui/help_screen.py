@@ -12,20 +12,17 @@ from textual.containers import VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Static
 
-# (section, [(keys, description), ...]). The footer only shows the
-# high-traffic keys, so this is where the hidden ones (t/w/m, PageUp/Down,
-# .) are documented. Sections render with a divider between them.
+# (section, [(keys, description), ...]). Keep this to the primary keys shown
+# to users; alternate bindings remain hidden so the cheatsheet stays simple.
 _SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
     ("Navigation", [
-        ("← → / h l", "Switch view (Today / Week / Month)"),
-        ("PageUp / PageDown", "Move time range earlier / later (PgUp = previous)"),
-        (". / 0", "Jump back to now (reset offset)"),
-        ("t / w / m", "Focus Today / Week / Month directly"),
-        ("↑ ↓ / k j", "Scroll the breakdown panel"),
-        ("Ctrl+B / Ctrl+F", "Scroll the breakdown panel"),
+        ("← →", "Switch view (Today / Week / Month)"),
+        ("PgUp / PgDn", "Move time range earlier / later"),
+        (".", "Jump back to now"),
+        ("↑ ↓", "Scroll the breakdown panel"),
     ]),
     ("Data", [
-        ("R", "Toggle fast auto-refresh (live sync)"),
+        ("r", "Toggle fast auto-refresh"),
         ("p", "Pricing (read-only; flags unknown models)"),
     ]),
     ("Other", [

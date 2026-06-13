@@ -1369,6 +1369,13 @@ def test_help_screen_renders_grouped_sections():
     assert "use the CLI" in rendered
     # No stale references to deleted keys.
     assert "Sync now" not in rendered
+    assert "Ctrl+B" not in rendered
+    assert "Ctrl+F" not in rendered
+    assert "t / w / m" not in rendered
+    assert "h l" not in rendered
+    assert "k j" not in rendered
+    assert "r" in rendered
+    assert "fast auto-refresh" in rendered
 
 
 def test_report_renders_tables_sequentially_and_highlights_cache_pct(monkeypatch):

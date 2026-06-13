@@ -665,8 +665,6 @@ def get_heatmap(
     ``session_count``. Buckets with zero activity are included so the
     strip layout stays stable.
     """
-    from datetime import datetime as _dt, timedelta as _td
-
     def _sum_tokens_row(r) -> int:
         return (
             (r["input_tokens"] or 0)
@@ -683,12 +681,12 @@ def get_heatmap(
             "cache_creation_tokens": (r["cache_creation_tokens"] if r else 0),
         }
 
-    now = _dt.now()
+    now = datetime.now()
     today = now.date()
     usage = _usage_source(db)
 
     if focus == "today":
-        day = today - _td(days=offset)
+        day = today - timedelta(days=offset)
         day_s = day.strftime("%Y-%m-%d")
         rows = db.conn.execute(
             f"""SELECT printf('%02d', usage_hour) AS hr,
@@ -720,9 +718,9 @@ def get_heatmap(
         return out
 
     if focus == "week":
-        this_monday = today - _td(days=today.weekday())
-        start = this_monday - _td(weeks=offset)
-        days = [start + _td(days=i) for i in range(7)]
+        this_monday = today - timedelta(days=today.weekday())
+        start = this_monday - timedelta(weeks=offset)
+        days = [start + timedelta(days=i) for i in range(7)]
         labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
         from_d = days[0].strftime("%Y-%m-%d")
         to_d = days[-1].strftime("%Y-%m-%d")
@@ -761,23 +759,23 @@ def get_heatmap(
         while m <= 0:
             m += 12
             y -= 1
-        month_start = _dt(y, m, 1).date()
+        month_start = datetime(y, m, 1).date()
         if m == 12:
-            month_end = _dt(y + 1, 1, 1).date() - _td(days=1)
+            month_end = datetime(y + 1, 1, 1).date() - timedelta(days=1)
         else:
-            month_end = _dt(y, m + 1, 1).date() - _td(days=1)
+            month_end = datetime(y, m + 1, 1).date() - timedelta(days=1)
 
         # Walk Mondays within the month; each bucket is Mon→Sun clipped
         # to the month boundaries.
-        first_monday = month_start - _td(days=month_start.weekday())
+        first_monday = month_start - timedelta(days=month_start.weekday())
         weeks: list[tuple] = []
         cursor = first_monday
         week_num = 1
         while cursor <= month_end:
             wk_from = max(cursor, month_start)
-            wk_to = min(cursor + _td(days=6), month_end)
+            wk_to = min(cursor + timedelta(days=6), month_end)
             weeks.append((week_num, wk_from, wk_to))
-            cursor += _td(weeks=1)
+            cursor += timedelta(weeks=1)
             week_num += 1
 
         out = []

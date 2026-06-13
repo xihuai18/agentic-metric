@@ -141,12 +141,12 @@ class AgenticMetricApp(App):
         Binding("t", "focus('today')", "Today", show=False),
         Binding("w", "focus('week')", "Week", show=False),
         Binding("m", "focus('month')", "Month", show=False),
-        # ── Data ── R = fast "live" sync (auto-sync already runs every
-        # 5 min by default, so this just speeds it up). Two
-        # bindings share R; `check_action` shows whichever matches state,
+        # ── Data ── r toggles fast auto-refresh (auto-sync already runs
+        # every 5 min by default, so this just speeds it up). Two
+        # bindings share r; `check_action` shows whichever matches state,
         # and the active one is highlighted via `-auto-on` in styles.tcss.
-        Binding("R", "auto_refresh_on", "Auto", key_display="R"),
-        Binding("R", "auto_refresh_off", "Auto", key_display="R"),
+        Binding("r", "auto_refresh_on", "Auto-refresh"),
+        Binding("r", "auto_refresh_off", "Auto-refresh"),
         # ── Other ──
         Binding("p", "show_pricing", "Pricing"),
         Binding("question_mark,?", "show_help", "Help", key_display="?"),
@@ -155,10 +155,19 @@ class AgenticMetricApp(App):
         Binding("q", "quit", "Quit"),
     ]
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        db: Database | None = None,
+        collectors: CollectorRegistry | None = None,
+        sync_on_mount: bool = True,
+        show_clock: bool = True,
+    ) -> None:
         super().__init__()
-        self._db = Database()
-        self._collectors: CollectorRegistry = create_default_registry()
+        self._db = db or Database()
+        self._collectors: CollectorRegistry = collectors or create_default_registry()
+        self._sync_on_mount = sync_on_mount
+        self._show_clock = show_clock
         self._live_sessions: list[LiveSession] = []
         self._today_sessions: list[dict] = []
         self._focus: str = "today"
@@ -169,7 +178,7 @@ class AgenticMetricApp(App):
     # ── Layout ────────────────────────────────────────────────────────
 
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=True)
+        yield Header(show_clock=self._show_clock)
         with Horizontal(id="summary-row"):
             yield SummaryCell("TODAY", id="cell-today")
             yield SummaryCell("WEEK", id="cell-week")
@@ -185,11 +194,17 @@ class AgenticMetricApp(App):
 
     def on_mount(self) -> None:
         self._today_sessions = get_today_sessions(self._db)
-        self.sub_title = "syncing…"
+        self.sub_title = "syncing…" if self._sync_on_mount else "demo data"
         self._populate_all()
-        self.set_interval(LIVE_REFRESH_INTERVAL, self._tick_live)
-        self._sync_timer = self.set_interval(DATA_SYNC_INTERVAL, self._tick_sync)
-        self.run_worker(self._initial_sync_worker, thread=True, exclusive=True, group="sync")
+        if self._sync_on_mount:
+            self.set_interval(LIVE_REFRESH_INTERVAL, self._tick_live)
+            self._sync_timer = self.set_interval(DATA_SYNC_INTERVAL, self._tick_sync)
+            self.run_worker(
+                self._initial_sync_worker,
+                thread=True,
+                exclusive=True,
+                group="sync",
+            )
 
     async def _initial_sync_worker(self) -> None:
         db = Database()

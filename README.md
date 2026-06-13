@@ -156,16 +156,15 @@ database and rebuilds it from the original Claude Code and Codex session files;
 
 ### TUI Keybindings
 
-Shown in the footer as: `←→ View · ↑↓ Range · . Now · R Auto · p Pricing · ? Help · q Quit`.
+Shown in the footer as: `PgUp/PgDn Range · ←→ View · . Now · r Auto-refresh · p Pricing · ? Help · q Quit`.
 
 | Key | Footer | Action |
 |-----|--------|--------|
-| `←` / `→` (or `h` / `l`) | View | Switch view (Today / Week / Month) |
-| `↑` / `↓` (or `k` / `j`) | Range | Move time range earlier / later |
+| `←` / `→` | View | Switch view (Today / Week / Month) |
+| `PageUp` / `PageDown` | Range | Move time range earlier / later |
 | `.` | Now | Jump back to "now" (reset offset) |
-| `t` / `w` / `m` | — | Focus Today / Week / Month directly |
-| `PageUp` / `PageDown` | — | Scroll the breakdown panel |
-| `R` | Auto | Toggle fast auto-refresh ("live" sync); pauses the slow periodic sync while active |
+| `↑` / `↓` | — | Scroll the breakdown panel |
+| `r` | Auto-refresh | Toggle fast auto-refresh ("live" sync); pauses the slow periodic sync while active |
 | `p` | Pricing | Open the read-only pricing view (flags unknown models in range) |
 | `?` | Help | Show the keybinding cheatsheet |
 | `q` | Quit | Quit |

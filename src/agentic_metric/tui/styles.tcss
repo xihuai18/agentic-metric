@@ -26,8 +26,8 @@ Footer > .footer--key {
     text-style: bold;
 }
 
-/* Highlight the R binding in the footer while auto-refresh is running.
- * Both the key cell and the "Auto" label light up so the active state
+/* Highlight the r binding in the footer while auto-refresh is running.
+ * Both the key cell and the "Auto-refresh" label light up so the active state
  * is obvious at a glance. */
 FooterKey.-auto-on {
     background: $success;
