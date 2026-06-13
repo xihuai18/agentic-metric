@@ -435,6 +435,79 @@ def test_remote_codex_collector_syncs_tarball_into_history(tmp_path):
     db.close()
 
 
+def test_remote_download_tolerates_tar_file_changed_exit_1(tmp_path):
+    """A live remote session makes tar exit 1 ('file changed as we read it').
+
+    The streamed archive is still valid, so the session must still be parsed
+    into history instead of the whole download being discarded.
+    """
+    import io
+    import tarfile
+
+    lines = [
+        {
+            "timestamp": "2026-04-23T10:00:00Z",
+            "type": "session_meta",
+            "payload": {"id": "live-sid", "cwd": "/work/project", "model_provider": "openai"},
+        },
+        {
+            "timestamp": "2026-04-23T10:00:01Z",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "hello"},
+        },
+        {
+            "timestamp": "2026-04-23T10:00:02Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {"total_token_usage": {"input_tokens": 100, "output_tokens": 20}},
+            },
+        },
+    ]
+    payload = "".join(json.dumps(line) + "\n" for line in lines).encode()
+    tar_bytes = io.BytesIO()
+    with tarfile.open(fileobj=tar_bytes, mode="w:gz") as tar:
+        info = tarfile.TarInfo("2026/04/23/rollout-remote.jsonl")
+        info.size = len(payload)
+        tar.addfile(info, io.BytesIO(payload))
+
+    manifest = (
+        b"OK\0"
+        + f"{len(payload)}\t123\t./2026/04/23/rollout-remote.jsonl".encode()
+        + b"\0"
+    )
+    run_mock = Mock(side_effect=[
+        Mock(returncode=0, stdout=manifest, stderr=b""),
+        # tar streamed a valid archive but warns + exits 1 on the live file.
+        Mock(
+            returncode=1,
+            stdout=tar_bytes.getvalue(),
+            stderr=b"tar: ./2026/04/23/rollout-remote.jsonl: file changed as we read it",
+        ),
+    ])
+    remote = RemoteSpec(host="remote-dev", name="dev", timeout=9)
+    target = RemoteSyncTarget(
+        remote=remote,
+        agent_type="codex",
+        remote_root="~/.codex",
+        provider="openai",
+        index=0,
+    )
+    db = Database(db_path=str(tmp_path / "data.db"))
+    with patch("agentic_metric.collectors.remote.DATA_DIR", tmp_path / "data"), \
+         patch("agentic_metric.collectors.remote.subprocess.run", run_mock):
+        collector = RemoteHistoryCollector(target)
+        collector.sync_history(db)
+
+    assert collector.last_error == ""
+    row = db.conn.execute(
+        "SELECT input_tokens, output_tokens "
+        "FROM sessions WHERE session_id = 'live-sid'"
+    ).fetchone()
+    assert dict(row) == {"input_tokens": 100, "output_tokens": 20}
+    db.close()
+
+
 def test_remote_missing_path_does_not_parse_stale_cache(tmp_path):
     remote = RemoteSpec(host="remote-dev", name="dev")
     target = RemoteSyncTarget(

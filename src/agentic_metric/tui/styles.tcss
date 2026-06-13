@@ -89,9 +89,9 @@ SummaryCell.-focused {
 /* ─── Compact trend strip ─── */
 
 #chart-panel {
-    height: 5;
-    min-height: 5;
-    max-height: 5;
+    height: 6;
+    min-height: 6;
+    max-height: 6;
     margin: 0 1;
     padding: 0 1;
     border: round white;
@@ -102,7 +102,7 @@ SummaryCell.-focused {
 
 #chart {
     height: auto;
-    min-height: 3;
+    min-height: 4;
 }
 
 /* ─── Breakdown ─── */

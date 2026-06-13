@@ -385,10 +385,17 @@ class TrendBlocks(Static):
         super().__init__(**kwargs)
         self._data: list[tuple[str, float]] = []
         self._span_label = ""
+        self._provider_totals: list[dict] = []
 
-    def update_data(self, data: list[tuple[str, float]], span_label: str) -> None:
+    def update_data(
+        self,
+        data: list[tuple[str, float]],
+        span_label: str,
+        provider_totals: list[dict] | None = None,
+    ) -> None:
         self._data = data
         self._span_label = span_label
+        self._provider_totals = provider_totals or []
         self.refresh()
 
     @staticmethod
@@ -495,7 +502,40 @@ class TrendBlocks(Static):
 
         summary = self._summary(available)
 
-        return Group(strip, axis, summary)
+        rows = [strip, axis, summary]
+        provider_line = self._provider_line(available)
+        if provider_line is not None:
+            rows.append(provider_line)
+        return Group(*rows)
+
+    def _provider_line(self, available: int) -> Text | None:
+        """One-line per-provider cost total over the trend window.
+
+        Renders ``<name> $X · <name> $Y``. Lower-priority providers drop off
+        the right on narrow terminals so the line never wraps past the fixed
+        panel height.
+        """
+        entries = [
+            p for p in self._provider_totals
+            if (p.get("estimated_cost_usd") or 0) > 0 or _has_unknown_cost(p)
+        ]
+        if not entries:
+            return None
+        line = Text("  ")
+        used = 2
+        for i, p in enumerate(entries):
+            name = p.get("provider") or "—"
+            cost = fmt_cost(p.get("estimated_cost_usd"), unknown=_has_unknown_cost(p))
+            prefix = "" if i == 0 else " · "
+            seg = f"{prefix}{name} {cost}"
+            if used + len(seg) > available:
+                break
+            if prefix:
+                line.append(prefix, style="white")
+            line.append(name, style="bright_blue")
+            line.append(f" {cost}", style="bright_yellow")
+            used += len(seg)
+        return line
 
     def _summary(self, available: int) -> Text:
         """Build the one-line summary, dropping segments that don't fit.

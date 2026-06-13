@@ -303,7 +303,17 @@ def _sync_target_to_cache(target: RemoteSyncTarget) -> bool:
     ]
     if changed:
         payload = "\0".join(changed).encode("utf-8") + b"\0"
-        proc = _run_ssh(target.remote, _download_command(target), input_bytes=payload)
+        # tar exits 1 (not fatal) when a file changes/shrinks while it is being
+        # read — common when a remote session is live. The archive it streamed
+        # is still valid, so accept exit 1 and extract it; only exit >= 2 is a
+        # real failure. Without this, any active remote session would make every
+        # sync discard the whole download and never catch up.
+        proc = _run_ssh(
+            target.remote,
+            _download_command(target),
+            input_bytes=payload,
+            allowed_returncodes=(0, 1),
+        )
         if proc.stdout:
             _extract_tarball(proc.stdout, cache_root / target.source_child)
     _archive_stale_cache_files(cache_root, target, manifest)
@@ -316,6 +326,7 @@ def _run_ssh(
     remote_cmd: str,
     *,
     input_bytes: bytes | None = None,
+    allowed_returncodes: tuple[int, ...] = (0,),
 ) -> subprocess.CompletedProcess:
     try:
         proc = subprocess.run(
@@ -328,7 +339,7 @@ def _run_ssh(
         )
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(f"ssh timed out after {remote.timeout}s") from exc
-    if proc.returncode != 0:
+    if proc.returncode not in allowed_returncodes:
         stderr = proc.stderr.decode("utf-8", errors="replace").strip()
         raise RuntimeError(stderr or f"ssh exited with status {proc.returncode}")
     return proc

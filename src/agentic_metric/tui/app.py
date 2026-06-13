@@ -25,6 +25,7 @@ from ..store.aggregator import (
     get_range_totals,
     get_today_sessions,
     get_trend,
+    get_trend_provider_totals,
     resolve_range,
 )
 from ..store.database import Database
@@ -304,7 +305,8 @@ class AgenticMetricApp(App):
     def _populate_chart(self) -> None:
         unit, count, span_label = _TREND_CONFIG[self._focus]
         data = get_trend(self._db, unit, count)
-        self.query_one("#chart", TrendBlocks).update_data(data, span_label)
+        provider_totals = get_trend_provider_totals(self._db, unit, count)
+        self.query_one("#chart", TrendBlocks).update_data(data, span_label, provider_totals)
 
         # Title sits on the panel border; keep the unit + span there so the
         # block strip can stay three lines tall.

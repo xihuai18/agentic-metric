@@ -12,10 +12,8 @@ from rich.console import Console
 
 from agentic_metric import cli as cli_module
 from agentic_metric.formatting import cache_hit_rate
-from agentic_metric.models import DailyTrend, LiveSession, TodayOverview
 from agentic_metric.store.database import Database
 from agentic_metric.store.aggregator import (
-    get_daily_trends,
     get_heatmap,
     get_range_by_project,
     get_range_by_project_agent,
@@ -25,13 +23,8 @@ from agentic_metric.store.aggregator import (
     get_range_by_model,
     get_range_by_provider,
     get_range_daily,
-    get_range_by_time_model,
-    get_range_top_sessions,
     get_range_totals,
     get_today_sessions,
-    get_today_overview,
-    merge_live_into_overview,
-    merge_live_into_trends,
 )
 from agentic_metric.formatting import fmt_cost as cli_fmt_cost
 from agentic_metric.tui.app import _summary_label
@@ -493,16 +486,6 @@ def test_range_reports_group_by_model_only():
     assert len(model_rows) == 1
     assert model_rows[0]["model"] == "gpt-5.5"
     assert model_rows[0]["estimated_cost_usd"] == 70.0
-
-    time_rows = get_range_by_time_model(db, "2026-04-24", "2026-04-24", limit=10)
-    assert {row["usage_hour"] for row in time_rows} == {10, 11}
-    assert all(row["model"] == "gpt-5.5" for row in time_rows)
-
-    session_rows = get_range_top_sessions(db, "2026-04-24", "2026-04-24", limit=1)
-    session_models = {
-        model.strip() for model in session_rows[0]["models"].split(",") if model.strip()
-    }
-    assert session_models == {"gpt-5.5"}
     db.close()
 
 
@@ -821,9 +804,6 @@ def test_replace_session_usage_prices_known_model():
     assert model_rows[0]["model"] == "gpt-5.4"
     assert model_rows[0]["unknown_cost_count"] == 0
 
-    top_sessions = get_range_top_sessions(db, "2026-04-24", "2026-04-24", limit=1)
-    assert top_sessions[0]["models"] == "gpt-5.4"
-    assert top_sessions[0]["unknown_cost_count"] == 0
     db.close()
 
 
@@ -929,16 +909,9 @@ def test_unknown_model_cost_stays_null_and_surfaces_as_unknown(tmp_path):
         assert model_rows[0]["model"] == "Unknown"
         assert model_rows[0]["unknown_cost_count"] == 1
 
-        time_rows = get_range_by_time_model(db, "2026-04-24", "2026-04-24", limit=1)
-        assert time_rows[0]["model"] == "Unknown"
-        assert time_rows[0]["unknown_cost_count"] == 1
-
         project_rows = get_range_by_project(db, "2026-04-24", "2026-04-24", limit=1)
         assert project_rows[0]["unknown_cost_count"] == 1
 
-        top_sessions = get_range_top_sessions(db, "2026-04-24", "2026-04-24", limit=1)
-        assert top_sessions[0]["models"] == "Unknown"
-        assert top_sessions[0]["unknown_cost_count"] == 1
         db.close()
     pricing._user_cache = None
     pricing._user_cache_mtime = -1.0
@@ -976,38 +949,6 @@ def test_sync_state():
     assert db.get_sync_state("test_key") == "test_value"
     db.set_sync_state("test_key", "updated")
     assert db.get_sync_state("test_key") == "updated"
-    db.close()
-
-
-def test_today_overview_empty():
-    db = _make_db()
-    overview = get_today_overview(db)
-    assert overview.session_count == 0
-    assert overview.total_tokens == 0
-    db.close()
-
-
-def test_today_overview_from_sessions():
-    db = _make_db()
-    today = datetime.now().strftime("%Y-%m-%d")
-    db.upsert_session(
-        "s1", "claude_code",
-        started_at=f"{today}T10:00:00",
-        input_tokens=1000, output_tokens=500, message_count=10,
-    )
-    db.upsert_session(
-        "s2", "codex",
-        started_at=f"{today}T11:00:00",
-        input_tokens=2000, output_tokens=1000, message_count=20,
-    )
-    db.commit()
-
-    overview = get_today_overview(db)
-    assert overview.session_count == 2
-    assert overview.input_tokens == 3000
-    assert overview.output_tokens == 1500
-    assert overview.message_count == 30
-    assert len(overview.by_agent) == 2
     db.close()
 
 
@@ -1090,73 +1031,13 @@ def test_session_usage_splits_cross_day_range_queries():
     assert model_rows[0]["model"] == "gpt-5.4"
     assert model_rows[0]["input_tokens"] == 200
 
-    time_rows = get_range_by_time_model(db, "2026-04-23", "2026-04-24", limit=2)
-    assert time_rows[0]["usage_date"] == "2026-04-24"
-    assert time_rows[0]["usage_hour"] == 0
-    assert time_rows[0]["input_tokens"] == 200
-
-    top_sessions = get_range_top_sessions(db, "2026-04-24", "2026-04-24", limit=1)
-    assert len(top_sessions) == 1
-    assert top_sessions[0]["session_id"] == "cross"
-    assert top_sessions[0]["input_tokens"] == 200
-    assert top_sessions[0]["first_prompt"] == "cross day prompt"
-
     with patch("agentic_metric.store.aggregator.datetime", FakeDateTime):
-        overview = get_today_overview(db)
         today_sessions = get_today_sessions(db)
 
-    assert overview.session_count == 1
-    assert overview.input_tokens == 200
-    assert overview.output_tokens == 20
     assert len(today_sessions) == 1
     assert today_sessions[0]["session_id"] == "cross"
     assert today_sessions[0]["started_at"].startswith("2026-04-23")
     assert today_sessions[0]["input_tokens"] == 200
-    db.close()
-
-
-def test_top_sessions_omits_synthetic_model_markers():
-    db = _make_db()
-    db.upsert_session(
-        "s1", "claude_code",
-        project_path="/tmp/project",
-        model="<synthetic>",
-        started_at="2026-04-24T10:00:00Z",
-        first_prompt="hello",
-    )
-    db.replace_session_usage(
-        "s1",
-        "claude_code",
-        [
-            {
-                "usage_date": "2026-04-24",
-                "usage_hour": 10,
-                "project_path": "/tmp/project",
-                "model": "claude-opus-4-7",
-                "message_count": 2,
-                "user_turns": 1,
-                "input_tokens": 1_000,
-                "output_tokens": 100,
-            },
-            {
-                "usage_date": "2026-04-24",
-                "usage_hour": 10,
-                "project_path": "/tmp/project",
-                "model": "<synthetic>",
-                "message_count": 1,
-                "user_turns": 0,
-                "input_tokens": 0,
-                "output_tokens": 0,
-            },
-        ],
-    )
-    db.commit()
-
-    rows = get_range_top_sessions(db, "2026-04-24", "2026-04-24", limit=1)
-    assert len(rows) == 1
-    assert rows[0]["session_id"] == "s1"
-    assert rows[0]["model"] == "claude-opus-4-7"
-    assert rows[0]["models"] == "claude-opus-4-7"
     db.close()
 
 
@@ -1328,6 +1209,57 @@ def test_tui_trend_blocks_summary_adapts_to_width():
     assert "total" not in narrow
     # Single line: no embedded newline regardless of width.
     assert "\n" not in narrow
+
+
+def test_tui_trend_blocks_renders_provider_totals_line():
+    widget = TrendBlocks()
+    widget.update_data(
+        [("05-23", 1.0), ("05-24", 0.0), ("05-25", 3.0)],
+        "last 14 days",
+        provider_totals=[
+            {"provider": "ichat", "estimated_cost_usd": 3.0, "unknown_cost_count": 0},
+            {"provider": "openai", "estimated_cost_usd": 1.0, "unknown_cost_count": 0},
+            {"provider": "anthropic", "estimated_cost_usd": 0.0, "unknown_cost_count": 0},
+        ],
+    )
+
+    console = Console(record=True, width=120, color_system=None)
+    console.print(widget.render())
+    rendered = console.export_text()
+    # No "by provider" caption — the provider names speak for themselves.
+    assert "by provider" not in rendered
+    assert "ichat $3.00" in rendered
+    assert "openai $1.00" in rendered
+    # zero-cost provider is filtered out so the line stays informative.
+    assert "anthropic" not in rendered
+
+
+def test_tui_trend_blocks_provider_line_drops_lower_priority_when_narrow():
+    widget = TrendBlocks()
+    widget.update_data(
+        [("05-25", 3.0)],
+        "last 14 days",
+        provider_totals=[
+            {"provider": "ichat", "estimated_cost_usd": 3.0, "unknown_cost_count": 0},
+            {"provider": "openai", "estimated_cost_usd": 1.0, "unknown_cost_count": 0},
+        ],
+    )
+
+    wide = widget._provider_line(80)
+    assert wide is not None
+    assert "ichat $3.00" in wide.plain
+    assert "openai $1.00" in wide.plain
+
+    narrow = widget._provider_line(20)
+    assert narrow is not None
+    assert "ichat $3.00" in narrow.plain
+    assert "openai" not in narrow.plain
+
+
+def test_tui_trend_blocks_no_provider_line_without_data():
+    widget = TrendBlocks()
+    widget.update_data([("05-25", 3.0)], "last 14 days")
+    assert widget._provider_line(80) is None
 
 
 def test_tui_breakdown_multi_host_tree_structure():
@@ -1814,127 +1746,3 @@ def test_cost_format_shows_known_amount_plus_unknown_marker():
     assert tui_fmt_cost(0.0, unknown=True) == "?"
     assert cli_fmt_cost(None, unknown=True) == "?"
     assert tui_fmt_cost(None, unknown=True) == "?"
-
-
-def test_merge_live_overview_matches_by_session_and_agent():
-    today = datetime.now().strftime("%Y-%m-%d")
-    today_sessions = [{
-        "session_id": "same-id",
-        "agent_type": "claude_code",
-        "message_count": 4,
-        "user_turns": 2,
-        "input_tokens": 1000,
-        "output_tokens": 200,
-        "cache_read_tokens": 0,
-        "cache_creation_tokens": 0,
-        "estimated_cost_usd": 10.0,
-    }]
-    overview = TodayOverview(
-        date=today,
-        session_count=1,
-        message_count=4,
-        tool_call_count=2,
-        input_tokens=1000,
-        output_tokens=200,
-        estimated_cost_usd=10.0,
-        by_agent={
-            "claude_code": {
-                "session_count": 1,
-                "turns": 2,
-                "message_count": 4,
-                "input_tokens": 1000,
-                "output_tokens": 200,
-                "cost": 10.0,
-            }
-        },
-    )
-    live = LiveSession(
-        session_id="same-id",
-        agent_type="codex",
-        project_path="/tmp/project",
-        model="gpt-5.4",
-        message_count=2,
-        user_turns=1,
-        input_tokens=50,
-        output_tokens=5,
-    )
-
-    merge_live_into_overview(overview, [live], today_sessions)
-
-    assert overview.session_count == 2
-    assert overview.input_tokens == 1050
-    assert overview.output_tokens == 205
-    assert overview.by_agent["codex"]["session_count"] == 1
-
-
-def test_merge_live_trends_matches_by_session_and_agent():
-    today = datetime.now().strftime("%Y-%m-%d")
-    today_sessions = [{
-        "session_id": "same-id",
-        "agent_type": "claude_code",
-        "message_count": 4,
-        "user_turns": 2,
-        "input_tokens": 1000,
-        "output_tokens": 200,
-        "cache_read_tokens": 0,
-        "cache_creation_tokens": 0,
-        "estimated_cost_usd": 10.0,
-    }]
-    trends = [
-        DailyTrend(
-            date=today,
-            session_count=1,
-            user_turns=2,
-            message_count=4,
-            input_tokens=1000,
-            output_tokens=200,
-            estimated_cost_usd=10.0,
-        )
-    ]
-    live = LiveSession(
-        session_id="same-id",
-        agent_type="codex",
-        project_path="/tmp/project",
-        model="gpt-5.4",
-        message_count=2,
-        user_turns=1,
-        input_tokens=50,
-        output_tokens=5,
-    )
-
-    merge_live_into_trends(trends, [live], today_sessions)
-
-    assert trends[0].session_count == 2
-    assert trends[0].input_tokens == 1050
-    assert trends[0].output_tokens == 205
-
-
-def test_daily_trends():
-    db = _make_db()
-    db.upsert_session(
-        "s1", "claude_code",
-        started_at="2025-01-01T10:00:00",
-        input_tokens=10000, output_tokens=5000, message_count=10,
-    )
-    db.upsert_session(
-        "s2", "claude_code",
-        started_at="2025-01-02T10:00:00",
-        input_tokens=20000, output_tokens=10000, message_count=20,
-    )
-    db.upsert_session(
-        "s3", "codex",
-        started_at="2025-01-02T11:00:00",
-        input_tokens=5000, output_tokens=2000, message_count=5,
-    )
-    db.commit()
-
-    trends = get_daily_trends(db, days=365 * 10)
-    assert len(trends) == 2
-    # trends are ordered DESC (most recent first)
-    assert trends[0].date == "2025-01-02"
-    assert trends[0].session_count == 2
-    assert trends[0].input_tokens == 25000
-    assert trends[1].date == "2025-01-01"
-    assert trends[1].session_count == 1
-    assert trends[1].input_tokens == 10000
-    db.close()

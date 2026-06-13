@@ -1,12 +1,11 @@
-"""Query layer: today overview, daily trends, model breakdown."""
+"""Query layer: today sessions, range totals, breakdowns, heatmap, trend."""
 
 from __future__ import annotations
 
 from datetime import datetime, timedelta
 
 from ..formatting import source_label
-from ..models import DailyTrend, LiveSession, TodayOverview
-from ..pricing import estimate_cost, is_model_priced
+from ..pricing import is_model_priced
 from .database import Database
 
 
@@ -66,12 +65,6 @@ def _session_count_expr(column: str = "session_id") -> str:
     )
 
 
-def _group_key(agent_type: str, provider: str = "", data_root: str = "") -> str:
-    if not provider and not data_root:
-        return agent_type
-    return f"{agent_type}:{provider or '-'}:{data_root or '-'}"
-
-
 def _preferred_session_model_expr(session_alias: str = "s", usage_alias: str = "u") -> str:
     return f"""COALESCE(
         NULLIF(
@@ -100,338 +93,6 @@ def _model_label(model: str) -> str:
 
 def _unknown_cost_expr(column: str = "estimated_cost_usd") -> str:
     return f"SUM(CASE WHEN {column} IS NULL THEN 1 ELSE 0 END)"
-
-
-def get_today_overview(db: Database) -> TodayOverview:
-    """Get aggregated stats for today across all agents (local timezone)."""
-    today = datetime.now().strftime("%Y-%m-%d")
-    usage = _usage_source(db)
-    rows = db.conn.execute(
-        f"""SELECT agent_type,
-                   provider,
-                   data_root,
-                   {_session_count_expr()} AS session_count,
-                   SUM(message_count) AS message_count,
-                   SUM(user_turns) AS user_turns,
-                   SUM(input_tokens) AS input_tokens,
-                   SUM(output_tokens) AS output_tokens,
-                   SUM(cache_read_tokens) AS cache_read_tokens,
-                   SUM(cache_creation_tokens) AS cache_creation_tokens,
-                   COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd,
-                   {_unknown_cost_expr()} AS unknown_cost_count
-           FROM {usage}
-           WHERE usage_date = ?
-           GROUP BY agent_type, provider, data_root
-        """,
-        (today,),
-    ).fetchall()
-
-    overview = TodayOverview(date=today)
-    for row in rows:
-        r = dict(row)
-        at = r["agent_type"]
-        group_key = _group_key(at, r.get("provider") or "", r.get("data_root") or "")
-        overview.session_count += r["session_count"] or 0
-        overview.message_count += r["message_count"] or 0
-        overview.tool_call_count += r["user_turns"] or 0
-        overview.input_tokens += r["input_tokens"] or 0
-        overview.output_tokens += r["output_tokens"] or 0
-        overview.cache_read_tokens += r["cache_read_tokens"] or 0
-        overview.cache_creation_tokens += r["cache_creation_tokens"] or 0
-        overview.estimated_cost_usd += r["estimated_cost_usd"] or 0
-        overview.unknown_cost_count += r["unknown_cost_count"] or 0
-        overview.by_agent[group_key] = {
-            "agent_type": at,
-            "provider": r.get("provider") or "",
-            "data_root": r.get("data_root") or "",
-            "session_count": r["session_count"] or 0,
-            "turns": r["user_turns"] or 0,
-            "message_count": r["message_count"] or 0,
-            "input_tokens": r["input_tokens"] or 0,
-            "output_tokens": r["output_tokens"] or 0,
-            "cost": r["estimated_cost_usd"] or 0,
-            "unknown_cost_count": r["unknown_cost_count"] or 0,
-        }
-    return overview
-
-
-def merge_live_into_overview(
-    overview: TodayOverview,
-    live_sessions: list[LiveSession],
-    today_sessions: list[dict],
-) -> None:
-    """Merge live session data into overview so totals include active sessions.
-
-    Handles two cases:
-    - Sessions in DB today: add delta if live data is fresher.
-    - Live sessions not in today's DB rows (e.g. started yesterday but still
-      running): add full live values.
-    """
-    db_ids = {
-        (
-            s["session_id"],
-            s["agent_type"],
-            s.get("provider") or "",
-            s.get("data_root") or "",
-        )
-        for s in today_sessions
-    }
-    db_by_id = {
-        (
-            s["session_id"],
-            s["agent_type"],
-            s.get("provider") or "",
-            s.get("data_root") or "",
-        ): s
-        for s in today_sessions
-    }
-
-    for ls in live_sessions:
-        at = ls.agent_type or ""
-        provider = ls.provider or ""
-        data_root = ls.data_root or ""
-        group_key = _group_key(at, provider, data_root)
-        session_key = (ls.session_id, at, provider, data_root)
-        t_turns = ls.today_user_turns if ls.today_user_turns >= 0 else ls.user_turns
-        t_msgs = ls.today_message_count if ls.today_message_count >= 0 else ls.message_count
-        t_in = ls.today_input_tokens if ls.today_input_tokens >= 0 else ls.input_tokens
-        t_out = ls.today_output_tokens if ls.today_output_tokens >= 0 else ls.output_tokens
-        t_cr = ls.today_cache_read_tokens if ls.today_cache_read_tokens >= 0 else ls.cache_read_tokens
-        t_cw = ls.today_cache_creation_tokens if ls.today_cache_creation_tokens >= 0 else ls.cache_creation_tokens
-        t_cost = estimate_cost(
-            ls.model,
-            t_in,
-            t_out,
-            t_cr,
-            t_cw,
-            apply_long_context=False,
-        )
-        t_unknown = 1 if t_cost is None else 0
-        t_cost_value = 0.0 if t_cost is None else t_cost
-
-        if session_key in db_ids:
-            db_s = db_by_id[session_key]
-            if ls.output_tokens > 0:
-                d_msg = max(0, t_msgs - (db_s["message_count"] or 0))
-                d_turns = max(0, t_turns - (db_s["user_turns"] or 0))
-                d_in = max(0, t_in - (db_s["input_tokens"] or 0))
-                d_out = max(0, t_out - (db_s["output_tokens"] or 0))
-                d_cr = max(0, t_cr - (db_s["cache_read_tokens"] or 0))
-                d_cw = max(0, t_cw - (db_s["cache_creation_tokens"] or 0))
-                d_cost = 0.0 if t_cost is None else max(0, t_cost - (db_s["estimated_cost_usd"] or 0))
-                d_unknown = max(0, t_unknown - (db_s.get("unknown_cost_count") or 0))
-
-                overview.message_count += d_msg
-                overview.tool_call_count += d_turns
-                overview.input_tokens += d_in
-                overview.output_tokens += d_out
-                overview.cache_read_tokens += d_cr
-                overview.cache_creation_tokens += d_cw
-                overview.estimated_cost_usd += d_cost
-                overview.unknown_cost_count += d_unknown
-
-                if group_key in overview.by_agent:
-                    ba = overview.by_agent[group_key]
-                    ba["turns"] = ba.get("turns", 0) + d_turns
-                    ba["message_count"] = ba.get("message_count", 0) + d_msg
-                    ba["input_tokens"] = ba.get("input_tokens", 0) + d_in
-                    ba["output_tokens"] = ba.get("output_tokens", 0) + d_out
-                    ba["cost"] = ba.get("cost", 0) + d_cost
-                    ba["unknown_cost_count"] = ba.get("unknown_cost_count", 0) + d_unknown
-        else:
-            if ls.user_turns == 0 and ls.output_tokens == 0:
-                continue
-            overview.session_count += 1
-            overview.message_count += t_msgs
-            overview.tool_call_count += t_turns
-            overview.input_tokens += t_in
-            overview.output_tokens += t_out
-            overview.cache_read_tokens += t_cr
-            overview.cache_creation_tokens += t_cw
-            overview.estimated_cost_usd += t_cost_value
-            overview.unknown_cost_count += t_unknown
-
-            ba = overview.by_agent.get(group_key)
-            if ba:
-                ba["session_count"] = ba.get("session_count", 0) + 1
-                ba["turns"] = ba.get("turns", 0) + t_turns
-                ba["message_count"] = ba.get("message_count", 0) + t_msgs
-                ba["input_tokens"] = ba.get("input_tokens", 0) + t_in
-                ba["output_tokens"] = ba.get("output_tokens", 0) + t_out
-                ba["cost"] = ba.get("cost", 0) + t_cost_value
-                ba["unknown_cost_count"] = ba.get("unknown_cost_count", 0) + t_unknown
-            else:
-                overview.by_agent[group_key] = {
-                    "agent_type": at,
-                    "provider": provider,
-                    "data_root": data_root,
-                    "session_count": 1,
-                    "turns": t_turns,
-                    "message_count": t_msgs,
-                    "input_tokens": t_in,
-                    "output_tokens": t_out,
-                    "cost": t_cost_value,
-                    "unknown_cost_count": t_unknown,
-                }
-
-
-def merge_live_into_trends(
-    trends: list[DailyTrend],
-    live_sessions: list[LiveSession],
-    today_sessions: list[dict],
-) -> None:
-    """Merge live session data into daily trends for today's entry.
-
-    Same logic as merge_live_into_overview but operates on the trend list.
-    """
-    today = datetime.now().strftime("%Y-%m-%d")
-
-    # Find or create today's entry (trends are ordered DESC)
-    today_trend = None
-    for t in trends:
-        if t.date == today:
-            today_trend = t
-            break
-    if today_trend is None:
-        today_trend = DailyTrend(date=today)
-        trends.insert(0, today_trend)
-
-    db_ids = {
-        (
-            s["session_id"],
-            s["agent_type"],
-            s.get("provider") or "",
-            s.get("data_root") or "",
-        )
-        for s in today_sessions
-    }
-    db_by_id = {
-        (
-            s["session_id"],
-            s["agent_type"],
-            s.get("provider") or "",
-            s.get("data_root") or "",
-        ): s
-        for s in today_sessions
-    }
-
-    for ls in live_sessions:
-        session_key = (
-            ls.session_id,
-            ls.agent_type or "",
-            ls.provider or "",
-            ls.data_root or "",
-        )
-        t_turns = ls.today_user_turns if ls.today_user_turns >= 0 else ls.user_turns
-        t_msgs = ls.today_message_count if ls.today_message_count >= 0 else ls.message_count
-        t_in = ls.today_input_tokens if ls.today_input_tokens >= 0 else ls.input_tokens
-        t_out = ls.today_output_tokens if ls.today_output_tokens >= 0 else ls.output_tokens
-        t_cr = ls.today_cache_read_tokens if ls.today_cache_read_tokens >= 0 else ls.cache_read_tokens
-        t_cw = ls.today_cache_creation_tokens if ls.today_cache_creation_tokens >= 0 else ls.cache_creation_tokens
-        t_cost = estimate_cost(
-            ls.model,
-            t_in,
-            t_out,
-            t_cr,
-            t_cw,
-            apply_long_context=False,
-        )
-        t_unknown = 1 if t_cost is None else 0
-        t_cost_value = 0.0 if t_cost is None else t_cost
-        if session_key in db_ids:
-            db_s = db_by_id[session_key]
-            if ls.output_tokens > 0:
-                today_trend.user_turns += max(0, t_turns - (db_s["user_turns"] or 0))
-                today_trend.message_count += max(0, t_msgs - (db_s["message_count"] or 0))
-                today_trend.input_tokens += max(0, t_in - (db_s["input_tokens"] or 0))
-                today_trend.output_tokens += max(0, t_out - (db_s["output_tokens"] or 0))
-                today_trend.cache_read_tokens += max(0, t_cr - (db_s["cache_read_tokens"] or 0))
-                today_trend.cache_creation_tokens += max(0, t_cw - (db_s["cache_creation_tokens"] or 0))
-                d_cost = 0.0 if t_cost is None else max(0, t_cost - (db_s["estimated_cost_usd"] or 0))
-                today_trend.estimated_cost_usd += d_cost
-                today_trend.unknown_cost_count += max(0, t_unknown - (db_s.get("unknown_cost_count") or 0))
-        else:
-            if ls.user_turns == 0 and ls.output_tokens == 0:
-                continue
-
-            today_trend.session_count += 1
-            today_trend.user_turns += t_turns
-            today_trend.message_count += t_msgs
-            today_trend.input_tokens += t_in
-            today_trend.output_tokens += t_out
-            today_trend.cache_read_tokens += t_cr
-            today_trend.cache_creation_tokens += t_cw
-            today_trend.estimated_cost_usd += t_cost_value
-            today_trend.unknown_cost_count += t_unknown
-
-
-def get_daily_trends(db: Database, days: int = 30) -> list[DailyTrend]:
-    """Get daily aggregated stats for the last N days."""
-    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-    usage = _usage_source(db)
-    rows = db.conn.execute(
-        f"""SELECT usage_date AS date,
-                  {_session_count_expr()} AS session_count,
-                  SUM(user_turns) AS user_turns,
-                  SUM(message_count) AS message_count,
-                  SUM(input_tokens) AS input_tokens,
-                  SUM(output_tokens) AS output_tokens,
-                  SUM(cache_read_tokens) AS cache_read_tokens,
-                  SUM(cache_creation_tokens) AS cache_creation_tokens,
-                  COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd,
-                  {_unknown_cost_expr()} AS unknown_cost_count
-           FROM {usage}
-           WHERE usage_date >= ?
-           GROUP BY usage_date
-           ORDER BY date DESC
-        """,
-        (cutoff,),
-    ).fetchall()
-
-    return [
-        DailyTrend(
-            date=r["date"],
-            session_count=r["session_count"] or 0,
-            user_turns=r["user_turns"] or 0,
-            message_count=r["message_count"] or 0,
-            input_tokens=r["input_tokens"] or 0,
-            output_tokens=r["output_tokens"] or 0,
-            cache_read_tokens=r["cache_read_tokens"] or 0,
-            cache_creation_tokens=r["cache_creation_tokens"] or 0,
-            estimated_cost_usd=r["estimated_cost_usd"] or 0,
-            unknown_cost_count=r["unknown_cost_count"] or 0,
-        )
-        for r in rows
-    ]
-
-
-def get_model_breakdown(db: Database, days: int = 30) -> list[dict]:
-    """Get token/cost breakdown by model for the last N days."""
-    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-    usage = _usage_source(db)
-    rows = db.conn.execute(
-        f"""SELECT model AS raw_model,
-                  SUM(input_tokens) AS input_tokens,
-                  SUM(output_tokens) AS output_tokens,
-                  SUM(cache_read_tokens) AS cache_read_tokens,
-                  SUM(cache_creation_tokens) AS cache_creation_tokens,
-                  COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd,
-                  {_unknown_cost_expr()} AS unknown_cost_count
-           FROM {usage}
-           WHERE usage_date >= ? AND model != ''
-           GROUP BY model
-           ORDER BY estimated_cost_usd DESC, unknown_cost_count DESC
-        """,
-        (cutoff,),
-    ).fetchall()
-    out = []
-    for r in rows:
-        row = dict(r)
-        raw = row.pop("raw_model") or ""
-        row["raw_model"] = raw
-        row["model"] = _model_label(raw)
-        out.append(row)
-    return out
 
 
 def get_today_sessions(db: Database) -> list[dict]:
@@ -477,24 +138,6 @@ def get_today_sessions(db: Database) -> list[dict]:
         row["model"] = _model_label(raw)
         out.append(row)
     return out
-
-
-def get_top_projects(db: Database, limit: int = 10) -> list[dict]:
-    """Get top projects by message count."""
-    rows = db.conn.execute(
-        """SELECT project_path,
-                  COUNT(*) AS session_count,
-                  SUM(message_count) AS total_messages,
-                  SUM(estimated_cost_usd) AS total_cost
-           FROM sessions
-           WHERE project_path != ''
-           GROUP BY project_path
-           ORDER BY total_messages DESC
-           LIMIT ?
-        """,
-        (limit,),
-    ).fetchall()
-    return [dict(r) for r in rows]
 
 
 # ── Range-based queries (for CLI `report` and TUI) ──────────────────
@@ -985,112 +628,6 @@ def get_range_by_project_agent(
     return out[:limit]
 
 
-def get_range_by_time_model(db: Database, from_date: str, to_date: str, limit: int = 10) -> list[dict]:
-    """Return the most expensive local time buckets split by agent/model."""
-    usage = _usage_source(db)
-    rows = db.conn.execute(
-        f"""SELECT usage_date,
-                  usage_hour,
-                  agent_type,
-                  provider,
-                  data_root,
-                  model AS raw_model,
-                  {_session_count_expr()} AS session_count,
-                  COALESCE(SUM(user_turns), 0) AS user_turns,
-                  COALESCE(SUM(input_tokens), 0) AS input_tokens,
-                  COALESCE(SUM(output_tokens), 0) AS output_tokens,
-                  COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
-                  COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
-                  COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd,
-                  {_unknown_cost_expr()} AS unknown_cost_count
-           FROM {usage}
-           WHERE usage_date BETWEEN ? AND ?
-           GROUP BY usage_date, usage_hour, agent_type, provider, data_root, model
-           HAVING COALESCE(SUM(estimated_cost_usd), 0) > 0 OR {_unknown_cost_expr()} > 0
-           ORDER BY estimated_cost_usd DESC, unknown_cost_count DESC
-           LIMIT ?
-        """,
-        (from_date, to_date, limit),
-    ).fetchall()
-    out = []
-    for r in rows:
-        row = dict(r)
-        raw = row.pop("raw_model") or ""
-        row["raw_model"] = raw
-        row["model"] = _model_label(raw)
-        out.append(row)
-    # Re-sort: known rows by cost desc first, unknown (cost=0) rows at the end.
-    # This preserves unknown rows that SQL LIMIT kept while avoiding top position.
-    out.sort(key=lambda r: (1 if (r.get("unknown_cost_count") or 0) > 0 and (r.get("estimated_cost_usd") or 0) == 0 else 0, -(r.get("estimated_cost_usd") or 0)))
-    return out
-
-
-def get_range_top_sessions(db: Database, from_date: str, to_date: str, limit: int = 10) -> list[dict]:
-    """Return the most expensive sessions within the given date range."""
-    usage = _usage_source(db)
-    rows = db.conn.execute(
-        f"""SELECT u.session_id,
-                  u.agent_type,
-                  u.provider,
-                  u.data_root,
-                  COALESCE(NULLIF(s.project_path, ''), MAX(NULLIF(u.project_path, '')), '') AS project_path,
-                  COALESCE(NULLIF(s.first_prompt, ''), '') AS first_prompt,
-                  COALESCE(NULLIF(s.started_at, ''), '') AS started_at,
-                  COALESCE(NULLIF(s.ended_at, ''), '') AS ended_at,
-                  {_preferred_session_model_expr()} AS model,
-                  COALESCE(
-                      GROUP_CONCAT(
-                          DISTINCT CASE
-                              WHEN (COALESCE(u.estimated_cost_usd, 0) > 0 OR u.estimated_cost_usd IS NULL)
-                               AND u.model NOT IN ('', '<synthetic>')
-                              THEN u.model
-                          END
-                      ),
-                      ''
-                  ) AS models,
-                  SUM(u.message_count) AS message_count,
-                  SUM(u.user_turns) AS user_turns,
-                  COALESCE(SUM(u.input_tokens), 0) AS input_tokens,
-                  COALESCE(SUM(u.output_tokens), 0) AS output_tokens,
-                  COALESCE(SUM(u.cache_read_tokens), 0) AS cache_read_tokens,
-                  COALESCE(SUM(u.cache_creation_tokens), 0) AS cache_creation_tokens,
-                  COALESCE(SUM(u.estimated_cost_usd), 0) AS estimated_cost_usd,
-                  {_unknown_cost_expr("u.estimated_cost_usd")} AS unknown_cost_count
-           FROM {usage} AS u
-           LEFT JOIN sessions AS s
-             ON s.session_id = u.session_id
-            AND s.agent_type = u.agent_type
-            AND s.data_root = u.data_root
-           WHERE u.usage_date BETWEEN ? AND ?
-           GROUP BY u.session_id, u.agent_type, u.provider, u.data_root
-           HAVING COALESCE(SUM(u.estimated_cost_usd), 0) > 0 OR {_unknown_cost_expr("u.estimated_cost_usd")} > 0
-           ORDER BY estimated_cost_usd DESC, unknown_cost_count DESC
-           LIMIT ?
-        """,
-        (from_date, to_date, limit),
-    ).fetchall()
-    out = []
-    for r in rows:
-        row = dict(r)
-        raw_primary = row.get("model") or ""
-        row["raw_model"] = raw_primary
-        row["model"] = _model_label(raw_primary)
-        raw_models = [m.strip() for m in (row.get("models") or "").split(",") if m.strip()]
-        row["raw_models"] = ",".join(raw_models)
-        models = []
-        for model in raw_models:
-            label = _model_label(model)
-            if label not in models:
-                models.append(label)
-        if row.get("unknown_cost_count") and not models:
-            models.append("Unknown")
-        row["models"] = ",".join(models)
-        out.append(row)
-    # Re-sort: known sessions by cost desc, unknown (cost=0) at the end.
-    out.sort(key=lambda r: (1 if (r.get("unknown_cost_count") or 0) > 0 and (r.get("estimated_cost_usd") or 0) == 0 else 0, -(r.get("estimated_cost_usd") or 0)))
-    return out
-
-
 def get_range_daily(db: Database, from_date: str, to_date: str) -> list[dict]:
     """Return per-day aggregates within the given date range (ascending)."""
     usage = _usage_source(db)
@@ -1364,3 +901,55 @@ def get_trend(db: Database, unit: str, count: int) -> list[tuple[str, float]]:
         return result
 
     raise ValueError(f"Unknown trend unit: {unit}")
+
+
+def _trend_window(unit: str, count: int) -> tuple[str, str]:
+    """Return the inclusive ``(from_date, to_date)`` span covered by a trend.
+
+    Matches ``get_trend``'s bucket math so per-provider totals over this window
+    sum to the same grand total as the trend strip.
+    """
+    now = datetime.now()
+    today = now.date()
+    if unit == "day":
+        from_d = today - timedelta(days=count - 1)
+        to_d = today
+    elif unit == "week":
+        this_monday = today - timedelta(days=today.weekday())
+        from_d = this_monday - timedelta(weeks=count - 1)
+        to_d = this_monday + timedelta(days=6)
+    elif unit == "month":
+        y, m = now.year, now.month - (count - 1)
+        while m <= 0:
+            m += 12
+            y -= 1
+        from_d = datetime(y, m, 1).date()
+        if now.month == 12:
+            to_d = datetime(now.year + 1, 1, 1).date() - timedelta(days=1)
+        else:
+            to_d = datetime(now.year, now.month + 1, 1).date() - timedelta(days=1)
+    else:
+        raise ValueError(f"Unknown trend unit: {unit}")
+    return from_d.strftime("%Y-%m-%d"), to_d.strftime("%Y-%m-%d")
+
+
+def get_trend_provider_totals(db: Database, unit: str, count: int) -> list[dict]:
+    """Return per-provider cost totals over the same window as ``get_trend``.
+
+    Each row: ``{provider, estimated_cost_usd, unknown_cost_count}``, sorted by
+    cost desc. An empty provider is labelled ``"—"``.
+    """
+    from_d, to_d = _trend_window(unit, count)
+    usage = _usage_source(db)
+    rows = db.conn.execute(
+        f"""SELECT CASE WHEN provider = '' THEN '—' ELSE provider END AS provider,
+                  COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd,
+                  {_unknown_cost_expr()} AS unknown_cost_count
+           FROM {usage}
+           WHERE usage_date BETWEEN ? AND ?
+           GROUP BY provider
+           ORDER BY estimated_cost_usd DESC, unknown_cost_count DESC
+        """,
+        (from_d, to_d),
+    ).fetchall()
+    return [dict(r) for r in rows]
