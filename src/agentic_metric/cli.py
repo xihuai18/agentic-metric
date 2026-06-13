@@ -17,6 +17,7 @@ from rich.text import Text
 from .formatting import (
     cache_hit_rate as _cache_hit_rate,
     cache_tokens as _cache_tokens,
+    clip as _clip,
     fmt_cost as _fmt_cost,
     fmt_tokens as _fmt_tokens,
     has_cost_signal as _has_cost_signal,
@@ -463,8 +464,17 @@ def _print_report(
     )
 
     panel_width = _panel_width()
+    provider_rollup = _build_provider_rollup_block(
+        by_provider,
+        tot_cost,
+        total_unknown=tot_cost_unknown,
+    )
+    header_items: list[object] = [header_text, Text(""), stats]
+    if provider_rollup is not None:
+        header_items.extend([Text(""), provider_rollup])
+
     header_panel = Panel(
-        Group(header_text, Text(""), stats),
+        Group(*header_items),
         box=box.ROUNDED,
         border_style=C_SURFACE1,
         padding=(1, 2),
@@ -575,6 +585,43 @@ def _build_unknown_models_note(by_agent_model: list[dict]) -> Group | None:
             (" -i <input> -o <output>", C_MUTED),
         ))
     return Group(*lines)
+
+
+def _build_provider_rollup_block(
+    by_provider: list[dict],
+    total_cost: float,
+    *,
+    total_unknown: bool = False,
+    limit: int = 4,
+) -> Text | None:
+    """Compact provider cost rollup for the report header."""
+    entries = [r for r in by_provider if _has_cost_signal(r)][:limit]
+    if not entries:
+        return None
+
+    all_entries = [r for r in by_provider if _has_cost_signal(r)]
+    any_unknown = total_unknown or any(_has_unknown_cost(r) for r in all_entries)
+
+    line = Text()
+    line.append("Providers ", style=C_MUTED)
+    for i, row in enumerate(entries):
+        if i:
+            line.append(" · ", style=C_MUTED)
+        provider = _clip(str(row.get("provider") or "—"), 18)
+        cost = row.get("estimated_cost_usd") or 0.0
+        unknown = _has_unknown_cost(row)
+        line.append(provider, style=C_SKY)
+        line.append(" ", style=C_MUTED)
+        line.append(_fmt_cost(cost, unknown=unknown), style=C_YELLOW)
+        line.append(
+            _share_suffix(cost, total_cost, unknown=unknown, total_unknown=any_unknown),
+            style=C_MUTED,
+        )
+
+    hidden = len(all_entries) - len(entries)
+    if hidden > 0:
+        line.append(f" · +{hidden} more", style=C_MUTED)
+    return line
 
 
 def _build_heatmap_panel(

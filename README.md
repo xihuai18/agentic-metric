@@ -88,14 +88,15 @@ agentic-metric pricing               # Manage model pricing
 | `--week` | This week (Mon → today) |
 | `--month` | This month |
 | `--range FROM:TO` | Custom date range, e.g. `2026-04-01:2026-04-23` |
-| `--full` | Show extra drill-down tables (by agent, periodic breakdown) |
+| `--full` | Show extra drill-down tables (by host, agent, provider, model, and time) |
 | `--limit N` / `-n N` | Rows in driver tables and per-provider model breakdown (1–25, default 8) |
 | `--json` | Output machine-readable JSON instead of tables (for scripts / pipes) |
 | `--watch N` / `-w N` | Refresh the report every N seconds (Ctrl-C to stop) |
 | `--no-sync` | Skip syncing collectors before querying |
 
 `report` shows a header with total cost / sessions / turns / tokens / cache-hit
-rate, a delta vs. the previous equivalent period, a heatmap strip (hours for
+rate, a delta vs. the previous equivalent period, a compact provider cost
+rollup, a heatmap strip (hours for
 `--today`, days for `--week`, weeks for `--month`), plus a default `agent × provider × model`
 breakdown, top projects, top cost drivers, and optional extra drill-down tables.
 
@@ -171,6 +172,8 @@ Shown in the footer as: `←→ View · ↑↓ Range · . Now · R Auto · p Pri
 
 Data auto-syncs every 5 min by default; there is no manual one-shot sync key.
 To copy data out of the dashboard, use the CLI (`agentic-metric report` / `today` / `week` / `month`).
+The heatmap panel shows the selected range's provider cost rollup; the trend
+panel shows provider totals over the longer trend window.
 
 Refresh intervals can be overridden in the config file (`$DATA/agentic_metric/config.json`):
 

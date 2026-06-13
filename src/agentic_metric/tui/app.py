@@ -21,6 +21,7 @@ from ..models import LiveSession
 from ..store.aggregator import (
     get_heatmap,
     get_range_by_agent_model,
+    get_range_by_provider,
     get_range_by_project,
     get_range_totals,
     get_today_sessions,
@@ -227,12 +228,14 @@ class AgenticMetricApp(App):
         label, frm, to = resolve_range(self._focus, offset=self._offset)
         totals = get_range_totals(self._db, frm, to)
         project_rows = get_range_by_project(self._db, frm, to, limit=3)
+        provider_rows = get_range_by_provider(self._db, frm, to)
 
         self.query_one("#heatmap", PeriodicHeatmap).update_data(
             buckets,
             highlight_index=None,
             totals=totals,
             projects=project_rows,
+            providers=provider_rows,
             total_cost=totals.get("estimated_cost_usd") or 0.0,
         )
 

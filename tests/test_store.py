@@ -28,7 +28,7 @@ from agentic_metric.store.aggregator import (
 )
 from agentic_metric.formatting import fmt_cost as cli_fmt_cost
 from agentic_metric.tui.app import _summary_label
-from agentic_metric.tui.widgets import Breakdown, SummaryCell, TrendBlocks, fmt_cost as tui_fmt_cost
+from agentic_metric.tui.widgets import Breakdown, PeriodicHeatmap, SummaryCell, TrendBlocks, fmt_cost as tui_fmt_cost
 from agentic_metric.tui.help_screen import HelpScreen, _SECTIONS
 from agentic_metric.cli import app as cli_app
 
@@ -1262,6 +1262,59 @@ def test_tui_trend_blocks_no_provider_line_without_data():
     assert widget._provider_line(80) is None
 
 
+def test_tui_heatmap_renders_current_range_provider_rollup():
+    widget = PeriodicHeatmap()
+    widget.update_data(
+        [{"label": "10", "cost": 4.0, "tokens": 420}],
+        totals={
+            "estimated_cost_usd": 4.0,
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "cache_read_tokens": 300,
+            "cache_creation_tokens": 0,
+            "unknown_cost_count": 0,
+        },
+        providers=[
+            {"provider": "ichat", "estimated_cost_usd": 3.0, "unknown_cost_count": 0},
+            {"provider": "openai", "estimated_cost_usd": 1.0, "unknown_cost_count": 0},
+            {"provider": "anthropic", "estimated_cost_usd": 0.0, "unknown_cost_count": 0},
+        ],
+        total_cost=4.0,
+    )
+
+    console = Console(record=True, width=120, color_system=None)
+    console.print(widget.render())
+    rendered = console.export_text()
+    assert "Providers" in rendered
+    assert "ichat · $3.00 (75.0%)" in rendered
+    assert "openai · $1.00 (25.0%)" in rendered
+    assert "anthropic" not in rendered
+
+
+def test_tui_heatmap_provider_rollup_handles_unknown_cost():
+    widget = PeriodicHeatmap()
+    widget.update_data(
+        [{"label": "10", "cost": 3.0, "tokens": 420, "unknown_cost_count": 1}],
+        totals={
+            "estimated_cost_usd": 3.0,
+            "input_tokens": 100,
+            "unknown_cost_count": 1,
+        },
+        providers=[
+            {"provider": "ichat", "estimated_cost_usd": 3.0, "unknown_cost_count": 0},
+            {"provider": "custom", "estimated_cost_usd": 0.0, "unknown_cost_count": 1},
+        ],
+        total_cost=3.0,
+    )
+
+    console = Console(record=True, width=120, color_system=None)
+    console.print(widget.render())
+    rendered = console.export_text()
+    assert "ichat · $3.00" in rendered
+    assert "custom · ?" in rendered
+    assert "(100.0%)" not in rendered
+
+
 def test_tui_breakdown_multi_host_tree_structure():
     """Lock the header columns and tree connectors for a multi-host render."""
     def _host(name, cost):
@@ -1473,6 +1526,53 @@ def test_report_renders_tables_sequentially_and_highlights_cache_pct(monkeypatch
     assert "By agent × model" in rendered
     assert "By project × model" in rendered
     assert not any("By provider" in line and "By day" in line for line in rendered.splitlines())
+
+
+def test_report_header_shows_provider_rollup_in_default_view(monkeypatch):
+    console = Console(record=True, width=140, color_system=None)
+    monkeypatch.setattr(cli_module, "console", console)
+
+    totals = {
+        "estimated_cost_usd": 4.0,
+        "session_count": 2,
+        "message_count": 10,
+        "user_turns": 4,
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "cache_read_tokens": 300,
+        "cache_creation_tokens": 0,
+        "unknown_cost_count": 0,
+    }
+    by_provider = [
+        {"provider": "ichat", "estimated_cost_usd": 3.0, "unknown_cost_count": 0},
+        {"provider": "openai", "estimated_cost_usd": 1.0, "unknown_cost_count": 0},
+        {"provider": "anthropic", "estimated_cost_usd": 0.0, "unknown_cost_count": 0},
+    ]
+
+    cli_module._print_report(
+        "Range",
+        "2026-05-25",
+        "2026-05-26",
+        totals,
+        [],
+        [],
+        by_provider,
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        None,
+        full=False,
+    )
+
+    rendered = console.export_text()
+    assert "Providers" in rendered
+    assert "ichat $3.00 (75.0%)" in rendered
+    assert "openai $1.00 (25.0%)" in rendered
+    assert "anthropic" not in rendered
+    assert "By provider" not in rendered
 
 
 def test_unknown_models_note_lists_distinct_models():

@@ -86,14 +86,14 @@ agentic-metric pricing               # 管理模型定价
 | `--week` | 本周用量(周一至今) |
 | `--month` | 本月用量 |
 | `--range FROM:TO` | 自定义日期区间,如 `2026-04-01:2026-04-23` |
-| `--full` | 显示额外明细表(按 agent 汇总、时间粒度分解) |
+| `--full` | 显示额外明细表(按 host、agent、provider、model 与时间分解) |
 | `--limit N` / `-n N` | 明细表与 provider 内模型分解的行数(1–25,默认 8) |
 | `--json` | 输出机器可读 JSON(便于脚本 / 管道),不渲染表格 |
 | `--watch N` / `-w N` | 每 N 秒刷新报告(Ctrl-C 退出) |
 | `--no-sync` | 跳过查询前的 collector 同步 |
 
 `report` 会输出:总成本 / sessions / 用户轮次 / tokens / 缓存命中率的汇总条,
-与上一同类周期的差额,一个热图条(`--today` 按小时、`--week` 按日、`--month`
+与上一同类周期的差额、provider 成本汇总,一个热图条(`--today` 按小时、`--week` 按日、`--month`
 按周),默认展示 agent × provider × model 明细、项目排行、cost drivers,并可按需展开额外明细表。
 
 ### 定价管理
@@ -158,6 +158,7 @@ agentic-metric pricing cache reset claude-sonnet-4                # 删除覆盖
 
 默认每 5 分钟自动同步,没有手动一次性同步键。
 如需把数据从面板里导出,请使用 CLI(`agentic-metric report` / `today` / `week` / `month`)。
+热图面板会显示当前选中范围的 provider 成本汇总;趋势面板会显示更长趋势窗口内的 provider 总额。
 
 刷新间隔可在配置文件(`$DATA/agentic_metric/config.json`)覆盖:
 

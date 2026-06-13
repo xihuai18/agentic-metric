@@ -10,6 +10,7 @@ from textual.geometry import Size
 from textual.widgets import Static
 
 from ..formatting import cache_hit_rate as _cache_hit_rate
+from ..formatting import clip as _clip
 from ..formatting import root_label as _root_label
 from ..formatting import source_prefixed_path as _source_prefixed_path
 
@@ -247,6 +248,7 @@ class PeriodicHeatmap(Static):
         self._highlight: int | None = None
         self._totals: dict = {}
         self._projects: list[dict] = []
+        self._providers: list[dict] = []
         self._total_cost: float = 0.0
 
     def update_data(
@@ -255,12 +257,14 @@ class PeriodicHeatmap(Static):
         highlight_index: int | None = None,
         totals: dict | None = None,
         projects: list[dict] | None = None,
+        providers: list[dict] | None = None,
         total_cost: float = 0.0,
     ) -> None:
         self._buckets = buckets
         self._highlight = highlight_index
         self._totals = totals or {}
         self._projects = projects or []
+        self._providers = providers or []
         self._total_cost = total_cost
         self.refresh()
 
@@ -365,6 +369,15 @@ class PeriodicHeatmap(Static):
 
         body.extend(rows)
         body.append(peak_line)
+
+        providers_block = _top_providers_block(
+            self._providers,
+            self._total_cost,
+            total_unknown=_has_unknown_cost(self._totals),
+        )
+        if providers_block is not None:
+            body.append(Text(""))
+            body.extend(providers_block)
 
         projects_block = _top_projects_block(
             self._projects,
@@ -610,6 +623,59 @@ def _token_summary_block(totals: dict) -> Group | None:
         line_split.append(fmt_tokens(cache_w), style="bright_green")
 
     return Group(line_total, line_split)
+
+
+def _top_providers_block(
+    providers: list[dict],
+    total_cost: float,
+    *,
+    total_unknown: bool = False,
+    limit: int = 3,
+) -> list[Text] | None:
+    """Up to ``limit`` provider cost rows for the focused TUI range."""
+    entries = [
+        p for p in providers
+        if (p.get("estimated_cost_usd") or 0) > 0 or _has_unknown_cost(p)
+    ][:limit]
+    if not entries:
+        return None
+
+    all_entries = [
+        p for p in providers
+        if (p.get("estimated_cost_usd") or 0) > 0 or _has_unknown_cost(p)
+    ]
+    any_unknown = total_unknown or any(_has_unknown_cost(p) for p in all_entries)
+    label_text = "Providers"
+
+    lines: list[Text] = []
+    for i, p in enumerate(entries):
+        unknown = _has_unknown_cost(p)
+        share = None
+        if total_cost and not any_unknown:
+            share = (p.get("estimated_cost_usd") or 0) / total_cost * 100
+
+        line = Text("  ")
+        if i == 0:
+            line.append(label_text, style="white")
+        else:
+            line.append(" " * len(label_text), style="default")
+        line.append("  ")
+        line.append(_clip(str(p.get("provider") or "—"), 16), style="bright_blue")
+        line.append(
+            f" · {fmt_cost(p.get('estimated_cost_usd'), unknown=unknown)}",
+            style="bold bright_yellow" if i == 0 else "bright_yellow",
+        )
+        if share is not None:
+            line.append(f" ({share:.1f}%)", style="white")
+        lines.append(line)
+
+    hidden = len(all_entries) - len(entries)
+    if hidden > 0:
+        line = Text("  ")
+        line.append(" " * len(label_text), style="default")
+        line.append(f"  +{hidden} more", style="white")
+        lines.append(line)
+    return lines
 
 
 def _top_projects_block(
