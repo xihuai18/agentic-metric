@@ -169,18 +169,22 @@ agentic-metric pricing cache reset claude-sonnet-4                # 删除覆盖
 
 ## 内置模型定价
 
-价格为 USD / 1M tokens。数据来源为官方定价页面(2026-04-25 核实；Claude Opus 4.8 于 2026-06-02 核实)。
+价格为 USD / 1M tokens。数据来源为官方定价页面(2026-04-25 核实；Claude Fable 5 于 2026-06-12 核实；Claude Opus 4.8 于 2026-06-02 核实)。
 
 <details>
 <summary>Anthropic Claude</summary>
 
 | 模型 | Input | Output | Cache Read | Cache Write |
 |------|------:|-------:|-----------:|------------:|
-| claude-opus-4-8 / 4-7 / 4-6 / 4-5 | $5.00 | $25.00 | $0.50 | $6.25 |
-| claude-opus-4-1 / 4 | $15.00 | $75.00 | $1.50 | $18.75 |
-| claude-sonnet-4-6 / 4-5 / 4 / 3-7 | $3.00 | $15.00 | $0.30 | $3.75 |
+<!-- pricing:anthropic:start -->
+| claude-fable-5 | $10.00 | $50.00 | $1.00 | $12.50 |
+| claude-opus-4-8 / claude-opus-4-7 / claude-opus-4-6 / claude-opus-4-5 | $5.00 | $25.00 | $0.50 | $6.25 |
+| claude-opus-4-1 / claude-opus-4 / claude-3-opus | $15.00 | $75.00 | $1.50 | $18.75 |
+| claude-sonnet-4-6 / claude-sonnet-4-5 / claude-sonnet-4 / claude-sonnet-3-7 / claude-3-7-sonnet / claude-3-5-sonnet | $3.00 | $15.00 | $0.30 | $3.75 |
 | claude-haiku-4-5 | $1.00 | $5.00 | $0.10 | $1.25 |
-| claude-haiku-3-5 | $0.80 | $4.00 | $0.08 | $1.00 |
+| claude-haiku-3-5 / claude-3-5-haiku | $0.80 | $4.00 | $0.08 | $1.00 |
+| claude-3-haiku | $0.25 | $1.25 | $0.03 | $0.30 |
+<!-- pricing:anthropic:end -->
 
 </details>
 
@@ -189,11 +193,14 @@ agentic-metric pricing cache reset claude-sonnet-4                # 删除覆盖
 
 | 模型 | Input | Output | Cache Read | Cache Write |
 |------|------:|-------:|-----------:|------------:|
+<!-- pricing:openai:start -->
 | gpt-5.5 | $5.00 | $30.00 | $0.50 | — |
-| gpt-5.4 | $2.50 | $15.00 | $0.25 | — |
 | gpt-5.4-mini | $0.75 | $4.50 | $0.075 | — |
 | gpt-5.4-nano | $0.20 | $1.25 | $0.02 | — |
-| gpt-5.3 / 5.2 / 5.1 / 5 | $1.25–$1.75 | $10.00–$14.00 | $0.125–$0.175 | — |
+| gpt-5.4 | $2.50 | $15.00 | $0.25 | — |
+| gpt-5.2-codex / gpt-5.2-chat-latest / gpt-5.2 / gpt-5.3-codex / gpt-5.3-chat-latest / gpt-5.3 | $1.75 | $14.00 | $0.175 | — |
+| gpt-5.1-codex-max / gpt-5.1-codex / gpt-5.1-chat-latest / gpt-5.1 / gpt-5-codex / gpt-5-chat-latest / gpt-5 | $1.25 | $10.00 | $0.125 | — |
+<!-- pricing:openai:end -->
 
 </details>
 
@@ -202,9 +209,16 @@ agentic-metric pricing cache reset claude-sonnet-4                # 删除覆盖
 
 | 模型 | Input | Output | Cache Read | Cache Write |
 |------|------:|-------:|-----------:|------------:|
-| gemini-3.1-pro / 3-pro | $2.00 | $12.00 | $0.20 | — |
+<!-- pricing:gemini:start -->
+| gemini-3.5-flash | $1.50 | $9.00 | $0.15 | — |
+| gemini-3.1-pro / gemini-3-pro | $2.00 | $12.00 | $0.20 | — |
+| gemini-3.1-flash-lite | $0.25 | $1.50 | $0.025 | — |
 | gemini-3-flash | $0.50 | $3.00 | $0.05 | — |
 | gemini-2.5-flash | $0.30 | $2.50 | $0.03 | — |
+| gemini-2.5-flash-lite | $0.10 | $0.40 | $0.01 | — |
+| gemini-2.0-flash | $0.10 | $0.40 | $0.025 | — |
+| gemini-2.0-flash-lite | $0.075 | $0.30 | $0.00 | — |
+<!-- pricing:gemini:end -->
 
 </details>
 
@@ -215,13 +229,15 @@ agentic-metric pricing cache reset claude-sonnet-4                # 删除覆盖
 ```
 src/agentic_metric/
 ├── cli.py              # Typer CLI 命令和 Rich 报告渲染
-├── config.py           # 平台路径、环境变量、常量
+├── config.py           # 平台路径、collector roots、SSH 远程配置
 ├── models.py           # 数据类(LiveSession, TodayOverview, DailyTrend)
 ├── pricing.py          # 内置 + 用户定价,成本估算引擎
+├── formatting.py       # 纯格式化辅助(成本 / token、source / host 标签)
 ├── collectors/
 │   ├── __init__.py     # Collector 注册中心和基类
 │   ├── claude_code.py  # Claude Code JSONL 解析器和进程检测
 │   ├── codex.py        # Codex JSONL 解析器和进程检测
+│   ├── remote.py       # SSH 封装:把远程 root 镜像到本地缓存后解析
 │   └── _process.py     # 跨平台进程检测(psutil / tasklist)
 ├── store/
 │   ├── __init__.py
@@ -229,8 +245,11 @@ src/agentic_metric/
 │   └── aggregator.py   # 查询层:区间汇总、热图、多维分解
 └── tui/
     ├── __init__.py
-    ├── app.py          # Textual TUI 应用
-    └── widgets.py      # 自定义 TUI 组件
+    ├── app.py            # Textual TUI 应用
+    ├── widgets.py        # 自定义 TUI 组件(汇总卡片、热图、趋势)
+    ├── help_screen.py    # 快捷键速查表弹窗
+    ├── pricing_screen.py # 只读定价视图(标记未知模型)
+    └── styles.tcss       # Textual CSS
 ```
 
 ### 数据流

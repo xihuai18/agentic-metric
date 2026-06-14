@@ -192,12 +192,15 @@ Prices are USD per 1M tokens. Verified against official pricing docs
 
 | Model | Input | Output | Cache Read | Cache Write |
 |-------|------:|-------:|-----------:|------------:|
+<!-- pricing:anthropic:start -->
 | claude-fable-5 | $10.00 | $50.00 | $1.00 | $12.50 |
-| claude-opus-4-8 / 4-7 / 4-6 / 4-5 | $5.00 | $25.00 | $0.50 | $6.25 |
-| claude-opus-4-1 / 4 | $15.00 | $75.00 | $1.50 | $18.75 |
-| claude-sonnet-4-6 / 4-5 / 4 / 3-7 | $3.00 | $15.00 | $0.30 | $3.75 |
+| claude-opus-4-8 / claude-opus-4-7 / claude-opus-4-6 / claude-opus-4-5 | $5.00 | $25.00 | $0.50 | $6.25 |
+| claude-opus-4-1 / claude-opus-4 / claude-3-opus | $15.00 | $75.00 | $1.50 | $18.75 |
+| claude-sonnet-4-6 / claude-sonnet-4-5 / claude-sonnet-4 / claude-sonnet-3-7 / claude-3-7-sonnet / claude-3-5-sonnet | $3.00 | $15.00 | $0.30 | $3.75 |
 | claude-haiku-4-5 | $1.00 | $5.00 | $0.10 | $1.25 |
-| claude-haiku-3-5 | $0.80 | $4.00 | $0.08 | $1.00 |
+| claude-haiku-3-5 / claude-3-5-haiku | $0.80 | $4.00 | $0.08 | $1.00 |
+| claude-3-haiku | $0.25 | $1.25 | $0.03 | $0.30 |
+<!-- pricing:anthropic:end -->
 
 </details>
 
@@ -206,11 +209,14 @@ Prices are USD per 1M tokens. Verified against official pricing docs
 
 | Model | Input | Output | Cache Read | Cache Write |
 |-------|------:|-------:|-----------:|------------:|
+<!-- pricing:openai:start -->
 | gpt-5.5 | $5.00 | $30.00 | $0.50 | — |
-| gpt-5.4 | $2.50 | $15.00 | $0.25 | — |
 | gpt-5.4-mini | $0.75 | $4.50 | $0.075 | — |
 | gpt-5.4-nano | $0.20 | $1.25 | $0.02 | — |
-| gpt-5.3 / 5.2 / 5.1 / 5 | $1.25–$1.75 | $10.00–$14.00 | $0.125–$0.175 | — |
+| gpt-5.4 | $2.50 | $15.00 | $0.25 | — |
+| gpt-5.2-codex / gpt-5.2-chat-latest / gpt-5.2 / gpt-5.3-codex / gpt-5.3-chat-latest / gpt-5.3 | $1.75 | $14.00 | $0.175 | — |
+| gpt-5.1-codex-max / gpt-5.1-codex / gpt-5.1-chat-latest / gpt-5.1 / gpt-5-codex / gpt-5-chat-latest / gpt-5 | $1.25 | $10.00 | $0.125 | — |
+<!-- pricing:openai:end -->
 
 </details>
 
@@ -219,9 +225,16 @@ Prices are USD per 1M tokens. Verified against official pricing docs
 
 | Model | Input | Output | Cache Read | Cache Write |
 |-------|------:|-------:|-----------:|------------:|
-| gemini-3.1-pro / 3-pro | $2.00 | $12.00 | $0.20 | — |
+<!-- pricing:gemini:start -->
+| gemini-3.5-flash | $1.50 | $9.00 | $0.15 | — |
+| gemini-3.1-pro / gemini-3-pro | $2.00 | $12.00 | $0.20 | — |
+| gemini-3.1-flash-lite | $0.25 | $1.50 | $0.025 | — |
 | gemini-3-flash | $0.50 | $3.00 | $0.05 | — |
 | gemini-2.5-flash | $0.30 | $2.50 | $0.03 | — |
+| gemini-2.5-flash-lite | $0.10 | $0.40 | $0.01 | — |
+| gemini-2.0-flash | $0.10 | $0.40 | $0.025 | — |
+| gemini-2.0-flash-lite | $0.075 | $0.30 | $0.00 | — |
+<!-- pricing:gemini:end -->
 
 </details>
 
@@ -232,13 +245,15 @@ Run `agentic-metric pricing list` for the full table including your overrides.
 ```
 src/agentic_metric/
 ├── cli.py              # Typer CLI commands and Rich report rendering
-├── config.py           # Platform paths, environment variables, constants
+├── config.py           # Platform paths, collector roots, SSH remote specs
 ├── models.py           # Data classes (LiveSession, TodayOverview, DailyTrend)
 ├── pricing.py          # Builtin + user pricing, cost estimation engine
+├── formatting.py       # Pure formatting helpers (cost/tokens, source/host labels)
 ├── collectors/
 │   ├── __init__.py     # Collector registry and base class
 │   ├── claude_code.py  # Claude Code JSONL parser and process detector
 │   ├── codex.py        # Codex JSONL parser and process detector
+│   ├── remote.py       # SSH-backed wrapper: mirror a remote root, then parse
 │   └── _process.py     # Cross-platform process detection (psutil/tasklist)
 ├── store/
 │   ├── __init__.py
@@ -246,8 +261,11 @@ src/agentic_metric/
 │   └── aggregator.py   # Query layer: range totals, heatmaps, breakdowns
 └── tui/
     ├── __init__.py
-    ├── app.py          # Textual TUI application
-    └── widgets.py      # Custom TUI widgets
+    ├── app.py            # Textual TUI application
+    ├── widgets.py        # Custom TUI widgets (summary cells, heatmap, trend)
+    ├── help_screen.py    # Keybinding cheatsheet modal
+    ├── pricing_screen.py # Read-only pricing view (flags unknown models)
+    └── styles.tcss       # Textual CSS
 ```
 
 ### Data flow
