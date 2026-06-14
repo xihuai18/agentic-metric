@@ -105,7 +105,11 @@ def normalize_anthropic_usage(usage: object) -> TokenUsage | None:
     )
 
 
-def normalize_openai_usage(usage: object) -> TokenUsage | None:
+def normalize_openai_usage(
+    usage: object,
+    *,
+    default_input_tokens_are_separate: bool = False,
+) -> TokenUsage | None:
     """Normalize OpenAI/Codex-compatible usage fields.
 
     OpenAI reports ``input_tokens`` as total input, with
@@ -123,16 +127,26 @@ def normalize_openai_usage(usage: object) -> TokenUsage | None:
     cached = int(usage.get("cached_input_tokens") or 0)
     output = int(usage.get("output_tokens") or 0)
     cache_create = int(usage.get("cache_creation_input_tokens") or 0)
+    cache_create_1h = int(usage.get("cache_creation_1h_input_tokens") or 0)
+    cache_creation = usage.get("cache_creation", {})
+    if isinstance(cache_creation, dict):
+        cache_create_1h = max(
+            cache_create_1h,
+            int(cache_creation.get("ephemeral_1h_input_tokens") or 0),
+        )
+    cache_write_1h = min(cache_create_1h, cache_create)
     return TokenUsage(
         input_tokens=openai_non_cached_input(
             usage,
             raw_input=raw_input,
             cached_input=cached,
             output_tokens=output,
+            default_is_separate=default_input_tokens_are_separate,
         ),
         output_tokens=output,
         cache_read_tokens=cached,
-        cache_write_5m_tokens=cache_create,
+        cache_write_5m_tokens=cache_create - cache_write_1h,
+        cache_write_1h_tokens=cache_write_1h,
     )
 
 
@@ -142,6 +156,7 @@ def openai_non_cached_input(
     raw_input: int,
     cached_input: int,
     output_tokens: int,
+    default_is_separate: bool = False,
 ) -> int:
     """Return non-cached input tokens for OpenAI-compatible usage."""
     if openai_input_tokens_are_separate(
@@ -149,6 +164,7 @@ def openai_non_cached_input(
         raw_input=raw_input,
         cached_input=cached_input,
         output_tokens=output_tokens,
+        default_is_separate=default_is_separate,
     ):
         return raw_input
     return max(raw_input - cached_input, 0)
@@ -160,6 +176,7 @@ def openai_input_tokens_are_separate(
     raw_input: int,
     cached_input: int,
     output_tokens: int,
+    default_is_separate: bool = False,
 ) -> bool:
     """True when raw input already excludes cached input."""
     if cached_input <= 0:
@@ -168,7 +185,7 @@ def openai_input_tokens_are_separate(
         return True
     total = usage.get("total_tokens")
     if total is None:
-        return False
+        return default_is_separate
     try:
         total_tokens = int(total)
     except (TypeError, ValueError):

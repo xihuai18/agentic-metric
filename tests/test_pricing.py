@@ -290,6 +290,30 @@ def test_claude_cache_creation_1h_and_sonnet_long_context(tmp_path):
     _reset_cache()
 
 
+def test_cache_creation_tokens_can_trigger_long_context_pricing(tmp_path):
+    with _patch_empty_user_pricing(tmp_path):
+        cost = estimate_cost(
+            "claude-sonnet-4-20250514",
+            input_tokens=1,
+            cache_creation_tokens=200_001,
+        )
+        expected = (1 * 6.0 + 200_001 * 7.5) / 1_000_000
+        assert abs(cost - expected) < 0.001
+    _reset_cache()
+
+
+def test_cache_creation_1h_tokens_are_clamped_to_total_cache_write(tmp_path):
+    with _patch_empty_user_pricing(tmp_path):
+        cost = estimate_cost(
+            "claude-opus-4-8",
+            cache_creation_tokens=100,
+            cache_creation_1h_tokens=150,
+        )
+        expected = (100 * 10.0) / 1_000_000
+        assert abs(cost - expected) < 0.001
+    _reset_cache()
+
+
 def test_user_cache_write_1h_override(tmp_path):
     pricing_file = tmp_path / "pricing.json"
 

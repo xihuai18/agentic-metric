@@ -271,12 +271,6 @@ class AgenticMetricApp(App):
 
     def _populate_summary(self) -> None:
         active_count = self._count_active()
-        # Sparkline config per view: (trend_unit, bucket_count)
-        spark_cfg = {
-            "today": ("day",   7),
-            "week":  ("week",  8),
-            "month": ("month", 6),
-        }
         for kind, cell_id in (
             ("today", "#cell-today"),
             ("week", "#cell-week"),
@@ -300,10 +294,12 @@ class AgenticMetricApp(App):
             prev_cost = prev.get("estimated_cost_usd") or 0.0
             prev_cost_unknown = _has_unknown_cost(prev)
 
-            # Sparkline of the last N buckets for this focus
-            unit, count = spark_cfg[kind]
-            trend = get_trend(self._db, unit, count)
-            sparkline = [v for _, v in trend]
+            # Compact within-period distribution:
+            # today by hour, week by day, month by week.
+            distribution = [
+                bucket.get("cost") or 0.0
+                for bucket in get_heatmap(self._db, kind, offset=cell_offset)
+            ]
 
             cell = self.query_one(cell_id, SummaryCell)
             cell.label = _summary_label(kind, label, cell_offset)
@@ -311,7 +307,7 @@ class AgenticMetricApp(App):
                 cost, sess, tokens,
                 active=active_count if kind == "today" and cell_offset == 0 else 0,
                 prev_cost=prev_cost,
-                sparkline=[] if cell_offset else sparkline,
+                sparkline=distribution,
                 cost_unknown=cost_unknown,
                 prev_cost_unknown=prev_cost_unknown,
                 turns=turns,

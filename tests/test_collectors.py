@@ -361,7 +361,7 @@ def test_codex_history_sync_supports_same_root_provider_filters(tmp_path):
         ("openai-sid", "openai", data_root),
     ]
     assert db.conn.execute(
-        "SELECT COUNT(*) AS n FROM sync_state WHERE key LIKE 'codex_jsonl:v10:%'"
+        "SELECT COUNT(*) AS n FROM sync_state WHERE key LIKE 'codex_jsonl:v11:%'"
     ).fetchone()["n"] == 4
     db.close()
 
@@ -904,6 +904,46 @@ def test_codex_last_token_usage_supports_separate_cached_input_semantics():
     assert abs(sum(r["estimated_cost_usd"] for r in rows) - expected) < 1e-12
 
 
+def test_codex_last_token_usage_carries_cache_creation_1h_to_session():
+    accum = CodexSessionAccum(Path("/tmp/fake.jsonl"), project_path="/test")
+    accum.model = "gpt-5.5"
+    accum._process_event_msg({
+        "type": "token_count",
+        "info": {
+            "total_token_usage": {
+                "input_tokens": 1_000,
+                "cached_input_tokens": 0,
+                "output_tokens": 100,
+                "cache_creation_input_tokens": 40,
+            },
+            "last_token_usage": {
+                "input_tokens": 1_000,
+                "cached_input_tokens": 0,
+                "output_tokens": 100,
+                "cache_creation_input_tokens": 40,
+                "cache_creation": {"ephemeral_1h_input_tokens": 15},
+            },
+        },
+    }, ts="2026-04-24T10:00:00Z")
+
+    rows = accum.usage_bucket_rows()
+    live = accum.to_live_session()
+    assert accum.cache_create == 40
+    assert accum.cache_create_1h == 15
+    assert sum(r["cache_creation_tokens"] for r in rows) == 40
+    assert sum(r["cache_creation_1h_tokens"] for r in rows) == 15
+    assert live.cache_creation_tokens == 40
+    assert live.cache_creation_1h_tokens == 15
+    expected = estimate_cost(
+        "gpt-5.5",
+        input_tokens=1_000,
+        output_tokens=100,
+        cache_creation_tokens=40,
+        cache_creation_1h_tokens=15,
+    )
+    assert abs(sum(r["estimated_cost_usd"] for r in rows) - expected) < 1e-12
+
+
 def test_codex_cumulative_fallback_supports_separate_cached_input_semantics():
     accum = CodexSessionAccum(Path("/tmp/fake.jsonl"), project_path="/test")
     accum.model = "gpt-5.5"
@@ -927,6 +967,38 @@ def test_codex_cumulative_fallback_supports_separate_cached_input_semantics():
         input_tokens=4_543,
         output_tokens=699,
         cache_read_tokens=14_848,
+        apply_long_context=False,
+    )
+    assert abs(sum(r["estimated_cost_usd"] for r in rows) - expected) < 1e-12
+
+
+def test_codex_compatible_provider_defaults_to_separate_input_without_total_tokens():
+    accum = CodexSessionAccum(
+        Path("/tmp/fake.jsonl"),
+        project_path="/test",
+        provider="ichat",
+    )
+    accum.model = "gpt-5.5"
+    accum._process_event_msg({
+        "type": "token_count",
+        "info": {
+            "total_token_usage": {
+                "input_tokens": 2_000,
+                "cached_input_tokens": 1_000,
+                "output_tokens": 100,
+            },
+        },
+    }, ts="2026-04-24T10:00:00Z")
+
+    rows = accum.usage_bucket_rows()
+    assert sum(r["input_tokens"] for r in rows) == 2_000
+    assert sum(r["output_tokens"] for r in rows) == 100
+    assert sum(r["cache_read_tokens"] for r in rows) == 1_000
+    expected = estimate_cost(
+        "gpt-5.5",
+        input_tokens=2_000,
+        output_tokens=100,
+        cache_read_tokens=1_000,
         apply_long_context=False,
     )
     assert abs(sum(r["estimated_cost_usd"] for r in rows) - expected) < 1e-12
@@ -1298,8 +1370,8 @@ def test_claude_duplicate_assistant_message_id_uses_last_usage(tmp_path):
                     "input_tokens": 10,
                     "output_tokens": 1,
                     "cache_read_input_tokens": 100,
-                    "cache_creation_input_tokens": 5,
-                    "cache_creation": {"ephemeral_1h_input_tokens": 5},
+                    "cache_creation_input_tokens": 40,
+                    "cache_creation": {"ephemeral_1h_input_tokens": 15},
                 },
             },
         },
@@ -1313,8 +1385,8 @@ def test_claude_duplicate_assistant_message_id_uses_last_usage(tmp_path):
                     "input_tokens": 10,
                     "output_tokens": 20,
                     "cache_read_input_tokens": 100,
-                    "cache_creation_input_tokens": 5,
-                    "cache_creation": {"ephemeral_1h_input_tokens": 5},
+                    "cache_creation_input_tokens": 40,
+                    "cache_creation": {"ephemeral_1h_input_tokens": 15},
                 },
             },
         },
@@ -1328,21 +1400,21 @@ def test_claude_duplicate_assistant_message_id_uses_last_usage(tmp_path):
     assert accum.input_tokens == 10
     assert accum.output_tokens == 20
     assert accum.cache_read == 100
-    assert accum.cache_create == 5
-    assert accum.cache_create_1h == 5
+    assert accum.cache_create == 40
+    assert accum.cache_create_1h == 15
     assert sum(r["message_count"] for r in accum.usage_bucket_rows()) == 2
     assert sum(r["input_tokens"] for r in accum.usage_bucket_rows()) == 10
     assert sum(r["output_tokens"] for r in accum.usage_bucket_rows()) == 20
     assert sum(r["cache_read_tokens"] for r in accum.usage_bucket_rows()) == 100
-    assert sum(r["cache_creation_tokens"] for r in accum.usage_bucket_rows()) == 5
-    assert sum(r["cache_creation_1h_tokens"] for r in accum.usage_bucket_rows()) == 5
+    assert sum(r["cache_creation_tokens"] for r in accum.usage_bucket_rows()) == 40
+    assert sum(r["cache_creation_1h_tokens"] for r in accum.usage_bucket_rows()) == 15
     expected_cost = estimate_cost(
         "claude-sonnet-4-6",
         input_tokens=10,
         output_tokens=20,
         cache_read_tokens=100,
-        cache_creation_tokens=5,
-        cache_creation_1h_tokens=5,
+        cache_creation_tokens=40,
+        cache_creation_1h_tokens=15,
     )
     assert abs(sum(r["estimated_cost_usd"] for r in accum.usage_bucket_rows()) - expected_cost) < 1e-12
 
@@ -1628,6 +1700,78 @@ def test_claude_incremental_sync_uses_skipped_files_for_replay_dedupe(tmp_path):
            WHERE session_id = 'parent-session:agent-a2'"""
     ).fetchone()
     assert dict(row) == {"input_tokens": 5, "output_tokens": 1}
+    db.close()
+
+
+def test_claude_incremental_sync_rewrites_skipped_later_replay_file(tmp_path):
+    projects = tmp_path / "projects"
+    project_dir = projects / "-tmp-project"
+    subagents = project_dir / "parent-session" / "subagents"
+    subagents.mkdir(parents=True)
+
+    subagent_file = subagents / "agent-a1.jsonl"
+    subagent_file.write_text(
+        json.dumps({
+            "timestamp": "2026-04-23T10:00:00Z",
+            "type": "user",
+            "cwd": "/tmp/project",
+            "message": {"content": "subagent"},
+        }) + "\n" +
+        json.dumps({
+            "timestamp": "2026-04-23T10:00:01Z",
+            "type": "assistant",
+            "cwd": "/tmp/project",
+            "message": {
+                "id": "msg-parent",
+                "model": "claude-opus-4-8",
+                "usage": {"input_tokens": 10, "output_tokens": 20},
+            },
+        }) + "\n"
+    )
+
+    db = Database(db_path=str(tmp_path / "data.db"))
+    with patch("agentic_metric.collectors.claude_code.PROJECTS_DIR", projects):
+        ClaudeCodeCollector().sync_history(db)
+
+    parent_file = project_dir / "parent-session.jsonl"
+    parent_file.write_text(
+        json.dumps({
+            "timestamp": "2026-04-23T09:59:00Z",
+            "type": "user",
+            "cwd": "/tmp/project",
+            "message": {"content": "parent"},
+        }) + "\n" +
+        json.dumps({
+            "timestamp": "2026-04-23T09:59:01Z",
+            "type": "assistant",
+            "cwd": "/tmp/project",
+            "message": {
+                "id": "msg-parent",
+                "model": "claude-opus-4-8",
+                "usage": {"input_tokens": 10, "output_tokens": 20},
+            },
+        }) + "\n"
+    )
+    with patch("agentic_metric.collectors.claude_code.PROJECTS_DIR", projects):
+        ClaudeCodeCollector().sync_history(db)
+
+    rows = db.conn.execute(
+        """SELECT session_id, input_tokens, output_tokens
+           FROM sessions
+           WHERE agent_type = 'claude_code'
+           ORDER BY session_id"""
+    ).fetchall()
+    assert [(r["session_id"], r["input_tokens"], r["output_tokens"]) for r in rows] == [
+        ("parent-session", 10, 20),
+        ("parent-session:agent-a1", 0, 0),
+    ]
+    totals = db.conn.execute(
+        """SELECT SUM(input_tokens) AS input_tokens,
+                  SUM(output_tokens) AS output_tokens
+           FROM session_usage
+           WHERE agent_type = 'claude_code'"""
+    ).fetchone()
+    assert dict(totals) == {"input_tokens": 10, "output_tokens": 20}
     db.close()
 
 
@@ -1923,6 +2067,82 @@ def test_codex_forked_session_subtracts_replayed_parent_baseline(tmp_path):
     assert accum.message_count == 2
     assert accum.first_prompt == "child task"
     assert accum.input_tokens == 200
+    assert accum.cache_read == 100
+    assert accum.output_tokens == 20
+
+
+def test_codex_forked_compatible_session_keeps_separate_input_semantics(tmp_path):
+    session_file = tmp_path / "rollout-forked.jsonl"
+    lines = [
+        {
+            "timestamp": "2026-04-24T03:05:12Z",
+            "type": "session_meta",
+            "payload": {
+                "id": "child",
+                "model_provider": "ichat",
+                "forked_from_id": "parent",
+                "cwd": "/tmp/project",
+                "source": {"subagent": {"thread_spawn": {"parent_thread_id": "parent"}}},
+            },
+        },
+        {
+            "timestamp": "2026-04-24T03:05:12Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 1_000,
+                        "cached_input_tokens": 800,
+                        "output_tokens": 100,
+                        "total_tokens": 1_900,
+                    }
+                },
+            },
+        },
+        {
+            "timestamp": "2026-04-24T03:05:16Z",
+            "type": "turn_context",
+            "payload": {"model": "gpt-5.5"},
+        },
+        {
+            "timestamp": "2026-04-24T03:05:16Z",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "child task"},
+        },
+        {
+            "timestamp": "2026-04-24T03:05:17Z",
+            "type": "event_msg",
+            "payload": {"type": "agent_message"},
+        },
+        {
+            "timestamp": "2026-04-24T03:05:19Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 1_300,
+                        "cached_input_tokens": 900,
+                        "output_tokens": 120,
+                        "total_tokens": 2_320,
+                    }
+                },
+            },
+        },
+    ]
+    session_file.write_text("".join(json.dumps(line) + "\n" for line in lines))
+
+    accum = CodexSessionAccum(
+        session_file,
+        project_path="/tmp/project",
+        provider="ichat",
+    )
+    accum.read_new_lines()
+
+    assert accum.session_id == "child"
+    assert accum.provider == "ichat"
+    assert accum.input_tokens == 300
     assert accum.cache_read == 100
     assert accum.output_tokens == 20
 

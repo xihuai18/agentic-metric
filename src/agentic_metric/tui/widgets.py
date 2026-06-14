@@ -198,7 +198,7 @@ class SummaryCell(Static):
             t.append("Cache % ", style="white")
             t.append(f"{self.cache_pct}%", style="bold bright_green")
             t.append("\n")
-        # Sparkline (trend of the last N buckets for this focus)
+        # Compact distribution for this card's current period.
         if self.sparkline:
             t.append(fmt_sparkline(self.sparkline), style="bright_cyan")
             t.append("\n")

@@ -846,7 +846,9 @@ class ClaudeCodeCollector(BaseCollector):
         # sync, so a changed sibling cannot re-count skipped parent usage.
         # v10: usage buckets preserve cache_creation_1h_tokens for accurate
         # repricing of 1-hour prompt-cache writes.
-        sync_prefix = "cc_jsonl:v10:"
+        # v11: skipped later files are reparsed when a newly seen earlier file
+        # owns the same assistant id, replacing stale replayed usage rows.
+        sync_prefix = "cc_jsonl:v11:"
 
         for project_dir in projects_dir.iterdir():
             if not project_dir.is_dir():
@@ -872,9 +874,13 @@ class ClaudeCodeCollector(BaseCollector):
                 file_size = stat.st_size
                 mtime_ns = stat.st_mtime_ns
 
+                reprocess_for_replay = False
                 if _sync_state_matches(prev_state, file_size, mtime_ns):
-                    seen_assistant_ids.update(_read_assistant_ids(jsonl_file))
-                    continue
+                    assistant_ids = _read_assistant_ids(jsonl_file)
+                    reprocess_for_replay = bool(seen_assistant_ids & assistant_ids)
+                    if not reprocess_for_replay:
+                        seen_assistant_ids.update(assistant_ids)
+                        continue
 
                 # Resolve the real project path from the JSONL cwd up front so
                 # both the session row and its usage buckets record the actual
@@ -895,6 +901,18 @@ class ClaudeCodeCollector(BaseCollector):
                 seen_assistant_ids.update(accum.assistant_message_dates)
 
                 if accum.user_turns == 0:
+                    if reprocess_for_replay:
+                        session_id = _session_id_for_jsonl(
+                            project_dir,
+                            jsonl_file,
+                            accum.session_id,
+                        )
+                        db.delete_session(
+                            session_id,
+                            self.agent_type,
+                            provider=self.provider,
+                            data_root=self.data_root,
+                        )
                     # Mark as processed even if empty
                     db.set_sync_state(sync_key, _sync_state_value(file_size, mtime_ns))
                     continue

@@ -16,7 +16,6 @@ from ..usage import (
     estimate_token_usage_cost,
     openai_input_tokens_are_separate,
     normalize_openai_usage,
-    openai_non_cached_input,
 )
 from . import BaseCollector
 from ._process import get_running_cwds, normalize_cwd_key
@@ -51,19 +50,23 @@ class _SessionAccum:
         "output_tokens",
         "cache_read",
         "cache_create",
+        "cache_create_1h",
         "_cum_output_tokens",
         "_cum_cache_read",
         "_cum_cache_create",
+        "_cum_total_tokens",
         "today_user_turns",
         "today_message_count",
         "today_input_tokens",
         "today_output_tokens",
         "today_cache_read",
         "today_cache_create",
+        "today_cache_create_1h",
         "today_input_base",
         "today_output_base",
         "today_cache_read_base",
         "today_cache_create_base",
+        "today_cache_create_1h_base",
         "today_key",
         "first_ts",
         "last_ts",
@@ -80,6 +83,7 @@ class _SessionAccum:
         "fork_baseline_output",
         "fork_baseline_cache_read",
         "fork_baseline_cache_create",
+        "fork_baseline_total_tokens",
         "usage_buckets",
         "provider",
         "provider_locked",
@@ -107,19 +111,23 @@ class _SessionAccum:
         self.output_tokens = 0
         self.cache_read = 0
         self.cache_create = 0
+        self.cache_create_1h = 0
         self._cum_output_tokens = 0
         self._cum_cache_read = 0
         self._cum_cache_create = 0
+        self._cum_total_tokens = 0
         self.today_user_turns = 0
         self.today_message_count = 0
         self.today_input_tokens = 0
         self.today_output_tokens = 0
         self.today_cache_read = 0
         self.today_cache_create = 0
+        self.today_cache_create_1h = 0
         self.today_input_base = 0
         self.today_output_base = 0
         self.today_cache_read_base = 0
         self.today_cache_create_base = 0
+        self.today_cache_create_1h_base = 0
         self.today_key = ""
         self.first_ts = ""
         self.last_ts = ""
@@ -136,6 +144,7 @@ class _SessionAccum:
         self.fork_baseline_output = 0
         self.fork_baseline_cache_read = 0
         self.fork_baseline_cache_create = 0
+        self.fork_baseline_total_tokens = 0
         self.usage_buckets: dict[tuple[str, int, str], dict] = {}
         self.provider = provider.strip()
         self.provider_locked = bool(self.provider)
@@ -207,9 +216,11 @@ class _SessionAccum:
         self.output_tokens = 0
         self.cache_read = 0
         self.cache_create = 0
+        self.cache_create_1h = 0
         self._cum_output_tokens = 0
         self._cum_cache_read = 0
         self._cum_cache_create = 0
+        self._cum_total_tokens = 0
         self.first_ts = ""
         self.last_ts = ""
         self.first_prompt = ""
@@ -223,6 +234,7 @@ class _SessionAccum:
         self.fork_baseline_output = 0
         self.fork_baseline_cache_read = 0
         self.fork_baseline_cache_create = 0
+        self.fork_baseline_total_tokens = 0
         self.usage_buckets.clear()
         self.observed_provider = ""
         self._reset_today_counters(today_str)
@@ -236,10 +248,12 @@ class _SessionAccum:
         self.today_output_tokens = 0
         self.today_cache_read = 0
         self.today_cache_create = 0
+        self.today_cache_create_1h = 0
         self.today_input_base = self.input_tokens
         self.today_output_base = self.output_tokens
         self.today_cache_read_base = self.cache_read
         self.today_cache_create_base = self.cache_create
+        self.today_cache_create_1h_base = self.cache_create_1h
 
     @staticmethod
     def _ts_local_date(ts: str) -> str:
@@ -407,11 +421,17 @@ class _SessionAccum:
             cached = usage.get("cached_input_tokens")
             out = usage.get("output_tokens")
             cache_create = usage.get("cache_creation_input_tokens")
-            event_usage = normalize_openai_usage(info.get("last_token_usage"))
+            total = usage.get("total_tokens")
+            default_separate = _input_tokens_default_separate(self.provider)
+            event_usage = normalize_openai_usage(
+                info.get("last_token_usage"),
+                default_input_tokens_are_separate=default_separate,
+            )
             prev_raw_input = self.raw_input_tokens
             prev_output = self._cum_output_tokens
             prev_cache_read = self._cum_cache_read
             prev_cache_create = self._cum_cache_create
+            prev_total = self._cum_total_tokens
             if out is not None:
                 self._cum_output_tokens = max(out - self.fork_baseline_output, 0)
             if raw_input is not None:
@@ -420,39 +440,37 @@ class _SessionAccum:
                 self._cum_cache_read = max(cached - self.fork_baseline_cache_read, 0)
             if cache_create is not None:
                 self._cum_cache_create = max(cache_create - self.fork_baseline_cache_create, 0)
+            if total is not None:
+                self._cum_total_tokens = max(total - self.fork_baseline_total_tokens, 0)
             if event_usage is not None:
                 cumulative_changed = (
                     self.raw_input_tokens != prev_raw_input
                     or self._cum_output_tokens != prev_output
                     or self._cum_cache_read != prev_cache_read
                     or self._cum_cache_create != prev_cache_create
+                    or self._cum_total_tokens != prev_total
                 )
                 d_input, d_output, d_cache_read, d_cache_create = (
                     event_usage.as_bucket_tuple() if cumulative_changed else (0, 0, 0, 0)
                 )
             else:
+                detection_usage = usage
+                if total is not None:
+                    detection_usage = dict(usage)
+                    detection_usage["total_tokens"] = self._cum_total_tokens
                 input_is_separate = openai_input_tokens_are_separate(
-                    usage,
+                    detection_usage,
                     raw_input=self.raw_input_tokens,
                     cached_input=self._cum_cache_read,
                     output_tokens=self._cum_output_tokens,
+                    default_is_separate=default_separate,
                 )
                 if input_is_separate:
                     prev_input = prev_raw_input
                     current_input = self.raw_input_tokens
                 else:
-                    prev_input = openai_non_cached_input(
-                        usage,
-                        raw_input=prev_raw_input,
-                        cached_input=prev_cache_read,
-                        output_tokens=prev_output,
-                    )
-                    current_input = openai_non_cached_input(
-                        usage,
-                        raw_input=self.raw_input_tokens,
-                        cached_input=self._cum_cache_read,
-                        output_tokens=self._cum_output_tokens,
-                    )
+                    prev_input = max(prev_raw_input - prev_cache_read, 0)
+                    current_input = max(self.raw_input_tokens - self._cum_cache_read, 0)
                 d_input = current_input - prev_input
                 d_output = self._cum_output_tokens - prev_output
                 d_cache_read = self._cum_cache_read - prev_cache_read
@@ -475,12 +493,14 @@ class _SessionAccum:
                         output_tokens=d_output,
                         cache_read_tokens=d_cache_read,
                         cache_creation_tokens=d_cache_create,
+                        cache_creation_1h_tokens=d_cache_create_1h,
                         apply_long_context=False,
                     )
                 self.input_tokens += d_input
                 self.output_tokens += d_output
                 self.cache_read += d_cache_read
                 self.cache_create += d_cache_create
+                self.cache_create_1h += d_cache_create_1h
                 self._add_usage_bucket(
                     ts,
                     input_tokens=d_input,
@@ -495,11 +515,16 @@ class _SessionAccum:
                 self.today_output_tokens = max(self.output_tokens - self.today_output_base, 0)
                 self.today_cache_read = max(self.cache_read - self.today_cache_read_base, 0)
                 self.today_cache_create = max(self.cache_create - self.today_cache_create_base, 0)
+                self.today_cache_create_1h = max(
+                    self.cache_create_1h - self.today_cache_create_1h_base,
+                    0,
+                )
             else:
                 self.today_input_base = self.input_tokens
                 self.today_output_base = self.output_tokens
                 self.today_cache_read_base = self.cache_read
                 self.today_cache_create_base = self.cache_create
+                self.today_cache_create_1h_base = self.cache_create_1h
 
     def _update_fork_baseline(self, payload: dict) -> None:
         """Remember replayed parent cumulative usage before a forked run starts."""
@@ -513,6 +538,7 @@ class _SessionAccum:
         cached = usage.get("cached_input_tokens")
         out = usage.get("output_tokens")
         cache_create = usage.get("cache_creation_input_tokens")
+        total = usage.get("total_tokens")
         if raw_input is not None:
             self.fork_baseline_raw_input = raw_input
         if cached is not None:
@@ -521,6 +547,8 @@ class _SessionAccum:
             self.fork_baseline_output = out
         if cache_create is not None:
             self.fork_baseline_cache_create = cache_create
+        if total is not None:
+            self.fork_baseline_total_tokens = total
 
     def to_live_session(self) -> LiveSession:
         return LiveSession(
@@ -537,6 +565,7 @@ class _SessionAccum:
             output_tokens=self.output_tokens,
             cache_read_tokens=self.cache_read,
             cache_creation_tokens=self.cache_create,
+            cache_creation_1h_tokens=self.cache_create_1h,
             started=self.first_ts,
             last_active=self.last_ts,
             first_prompt=self.first_prompt,
@@ -546,6 +575,7 @@ class _SessionAccum:
             today_output_tokens=self.today_output_tokens,
             today_cache_read_tokens=self.today_cache_read,
             today_cache_creation_tokens=self.today_cache_create,
+            today_cache_creation_1h_tokens=self.today_cache_create_1h,
             today_user_turns=self.today_user_turns,
             today_message_count=self.today_message_count,
         )
@@ -801,7 +831,9 @@ class CodexCollector(BaseCollector):
         # provider-specific shape.
         # v10: usage buckets preserve cache_creation_1h_tokens for accurate
         # repricing while still storing total cache write tokens.
-        sync_prefix = f"codex_jsonl:v10:{_sync_key_identity(self.provider, self.data_root)}:"
+        # v11: provider-aware cached-input fallback and forked baseline
+        # detection use one consistent total-token frame.
+        sync_prefix = f"codex_jsonl:v11:{_sync_key_identity(self.provider, self.data_root)}:"
 
         for jsonl_file in sessions_dir.rglob("rollout-*.jsonl"):
             sync_key = f"{sync_prefix}{jsonl_file}"
@@ -861,6 +893,7 @@ class CodexCollector(BaseCollector):
                 output_tokens=accum.output_tokens,
                 cache_read_tokens=accum.cache_read,
                 cache_creation_tokens=accum.cache_create,
+                cache_creation_1h_tokens=accum.cache_create_1h,
                 estimated_cost_usd=cost,
                 started_at=accum.first_ts,
                 ended_at=accum.last_ts,
@@ -904,6 +937,11 @@ def _sync_state_matches(state: str | None, file_size: int, mtime_ns: int) -> boo
         return int(parts[0]) == file_size and int(parts[1]) == mtime_ns
     except ValueError:
         return False
+
+
+def _input_tokens_default_separate(provider: str) -> bool:
+    """Default ambiguous cached-input semantics for one Codex provider."""
+    return bool(provider) and provider.strip().lower() != "openai"
 
 
 def _usage_rows_cost(rows: list[dict]) -> float | None:
