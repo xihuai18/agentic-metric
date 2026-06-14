@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.7.0 (2026-06-14)
+
+### Changes
+
+- **Auto-refresh key `R` → `r`**: the TUI fast auto-refresh toggle is now the
+  lowercase `r`, shown in the footer as `Auto-refresh` (was `Auto`).
+- **Simplified keybinding docs**: the help cheatsheet and README keybinding
+  tables now list only the primary keys (`←→` view, `PgUp/PgDn` range, `.` now,
+  `↑↓` scroll), with alternate bindings kept working but hidden.
+- **Anonymized TUI demo screenshot**: added a reproducible generator
+  (`tests/test_tui_demo.py`) that paints the README screenshot from privacy-safe
+  demo data, so the dashboard image carries no personal paths or usage.
+
+## v0.6.10 (2026-06-13)
+
+### Changes
+
+- **Provider cost rollups**: the CLI report and TUI now surface a per-provider
+  cost rollup for the selected range alongside the existing breakdowns.
+
+## v0.6.9 (2026-06-13)
+
+### Changes
+
+- **Per-provider totals in the TUI Trend panel**: the trend panel now shows
+  per-provider cost totals over the trend window.
+
+### Fixes
+
+- **Remote sync no longer discarded on changed files**: when a session file
+  changed during the tar transfer, the whole remote sync was dropped; it now
+  completes instead of discarding the synced data.
+
 ## v0.6.8 (2026-06-12)
 
 ### Changes
