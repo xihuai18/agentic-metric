@@ -807,6 +807,60 @@ def test_replace_session_usage_prices_known_model():
     db.close()
 
 
+def test_replace_session_usage_prices_cache_creation_1h_tokens():
+    db = _make_db()
+    db.replace_session_usage(
+        "s1",
+        "claude_code",
+        [
+            {
+                "usage_date": "2026-04-24",
+                "usage_hour": 10,
+                "model": "claude-opus-4-8",
+                "cache_creation_tokens": 1_000_000,
+                "cache_creation_1h_tokens": 1_000_000,
+            },
+        ],
+    )
+    db.commit()
+
+    row = db.conn.execute(
+        """SELECT cache_creation_tokens, cache_creation_1h_tokens, estimated_cost_usd
+           FROM session_usage
+           WHERE session_id = 's1' AND agent_type = 'claude_code'"""
+    ).fetchone()
+    assert row["cache_creation_tokens"] == 1_000_000
+    assert row["cache_creation_1h_tokens"] == 1_000_000
+    assert row["estimated_cost_usd"] == 10.0
+
+    db.close()
+
+
+def test_session_fallback_reprices_cache_creation_1h_tokens():
+    db = _make_db()
+    db.upsert_session(
+        "s1",
+        "claude_code",
+        model="claude-opus-4-8",
+        cache_creation_tokens=1_000_000,
+        cache_creation_1h_tokens=1_000_000,
+        estimated_cost_usd=0.0,
+    )
+    db.conn.execute("DELETE FROM sync_state WHERE key = 'pricing:fingerprint'")
+    db.ensure_pricing_current()
+
+    row = db.conn.execute(
+        """SELECT cache_creation_tokens, cache_creation_1h_tokens, estimated_cost_usd
+           FROM sessions
+           WHERE session_id = 's1' AND agent_type = 'claude_code'"""
+    ).fetchone()
+    assert row["cache_creation_tokens"] == 1_000_000
+    assert row["cache_creation_1h_tokens"] == 1_000_000
+    assert row["estimated_cost_usd"] == 10.0
+
+    db.close()
+
+
 def test_explicit_usage_cost_survives_pricing_reprice(tmp_path):
     pricing_file = tmp_path / "pricing.json"
     db_path = str(tmp_path / "data.db")

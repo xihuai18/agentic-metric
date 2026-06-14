@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     output_tokens INTEGER DEFAULT 0,
     cache_read_tokens INTEGER DEFAULT 0,
     cache_creation_tokens INTEGER DEFAULT 0,
+    cache_creation_1h_tokens INTEGER DEFAULT 0,
     estimated_cost_usd REAL DEFAULT 0,
     started_at TEXT,
     ended_at TEXT,
@@ -51,6 +52,7 @@ CREATE TABLE IF NOT EXISTS session_usage (
     output_tokens INTEGER DEFAULT 0,
     cache_read_tokens INTEGER DEFAULT 0,
     cache_creation_tokens INTEGER DEFAULT 0,
+    cache_creation_1h_tokens INTEGER DEFAULT 0,
     estimated_cost_usd REAL DEFAULT 0,
     cost_is_explicit INTEGER DEFAULT 0,
     PRIMARY KEY (session_id, agent_type, data_root, usage_date, usage_hour, model)
@@ -86,6 +88,12 @@ class Database:
             )
             info = self._conn.execute("PRAGMA table_info(sessions)").fetchall()
             cols = {r[1] for r in info}
+        if "cache_creation_1h_tokens" not in cols:
+            self._conn.execute(
+                "ALTER TABLE sessions ADD COLUMN cache_creation_1h_tokens INTEGER DEFAULT 0"
+            )
+            info = self._conn.execute("PRAGMA table_info(sessions)").fetchall()
+            cols = {r[1] for r in info}
 
         pk_cols = [r[1] for r in sorted(info, key=lambda row: row[5]) if r[5] > 0]
         if (
@@ -104,6 +112,7 @@ class Database:
             "provider" not in usage_cols
             or "data_root" not in usage_cols
             or "cost_is_explicit" not in usage_cols
+            or "cache_creation_1h_tokens" not in usage_cols
             or usage_pk_cols != [
                 "session_id",
                 "agent_type",
@@ -188,7 +197,8 @@ class Database:
                    (session_id, agent_type, provider, data_root,
                     project_path, git_branch, model,
                     message_count, user_turns, input_tokens, output_tokens,
-                    cache_read_tokens, cache_creation_tokens, estimated_cost_usd,
+                    cache_read_tokens, cache_creation_tokens, cache_creation_1h_tokens,
+                    estimated_cost_usd,
                     started_at, ended_at, first_prompt, last_prompt, summary)
                SELECT session_id,
                       {self._pure_agent_expr()},
@@ -203,6 +213,7 @@ class Database:
                       {self._column_expr(cols, "output_tokens", "0")},
                       {self._column_expr(cols, "cache_read_tokens", "0")},
                       {self._column_expr(cols, "cache_creation_tokens", "0")},
+                      {self._column_expr(cols, "cache_creation_1h_tokens", "0")},
                       {self._column_expr(cols, "estimated_cost_usd", "0")},
                       {self._column_expr(cols, "started_at", "''")},
                       {self._column_expr(cols, "ended_at", "''")},
@@ -224,7 +235,8 @@ class Database:
                    (session_id, agent_type, provider, data_root,
                     usage_date, usage_hour, project_path, model,
                     message_count, user_turns, input_tokens, output_tokens,
-                    cache_read_tokens, cache_creation_tokens, estimated_cost_usd,
+                    cache_read_tokens, cache_creation_tokens, cache_creation_1h_tokens,
+                    estimated_cost_usd,
                     cost_is_explicit)
                SELECT session_id,
                       {self._pure_agent_expr()},
@@ -240,6 +252,7 @@ class Database:
                       {self._column_expr(cols, "output_tokens", "0")},
                       {self._column_expr(cols, "cache_read_tokens", "0")},
                       {self._column_expr(cols, "cache_creation_tokens", "0")},
+                      {self._column_expr(cols, "cache_creation_1h_tokens", "0")},
                       {self._column_expr(cols, "estimated_cost_usd", "0")},
                       {self._column_expr(cols, "cost_is_explicit", "0")}
                FROM session_usage_old"""
@@ -291,7 +304,8 @@ class Database:
         usage_rows = self._conn.execute(
             """SELECT session_id, agent_type, data_root, usage_date, usage_hour, model,
                       input_tokens, output_tokens,
-                      cache_read_tokens, cache_creation_tokens
+                      cache_read_tokens, cache_creation_tokens,
+                      cache_creation_1h_tokens
                FROM session_usage
                WHERE COALESCE(cost_is_explicit, 0) = 0"""
         ).fetchall()
@@ -303,6 +317,7 @@ class Database:
                     output_tokens=row["output_tokens"] or 0,
                     cache_read_tokens=row["cache_read_tokens"] or 0,
                     cache_creation_tokens=row["cache_creation_tokens"] or 0,
+                    cache_creation_1h_tokens=row["cache_creation_1h_tokens"] or 0,
                     apply_long_context=False,
                 ),
                 row["session_id"],
@@ -330,7 +345,8 @@ class Database:
         rows = self._conn.execute(
             """SELECT session_id, agent_type, data_root, model,
                       input_tokens, output_tokens,
-                      cache_read_tokens, cache_creation_tokens
+                      cache_read_tokens, cache_creation_tokens,
+                      cache_creation_1h_tokens
                FROM sessions AS s
                WHERE NOT EXISTS (
                    SELECT 1
@@ -349,6 +365,7 @@ class Database:
                     output_tokens=row["output_tokens"] or 0,
                     cache_read_tokens=row["cache_read_tokens"] or 0,
                     cache_creation_tokens=row["cache_creation_tokens"] or 0,
+                    cache_creation_1h_tokens=row["cache_creation_1h_tokens"] or 0,
                     apply_long_context=False,
                 ),
                 row["session_id"],
@@ -418,6 +435,7 @@ class Database:
         output_tokens: int | None = None,
         cache_read_tokens: int | None = None,
         cache_creation_tokens: int | None = None,
+        cache_creation_1h_tokens: int | None = None,
         estimated_cost_usd: float | None | object = _UNSET,
         started_at: str | None = None,
         ended_at: str | None = None,
@@ -439,9 +457,10 @@ class Database:
                        (session_id, agent_type, provider, data_root,
                         project_path, git_branch, model,
                         message_count, user_turns, input_tokens, output_tokens,
-                        cache_read_tokens, cache_creation_tokens, estimated_cost_usd,
+                        cache_read_tokens, cache_creation_tokens, cache_creation_1h_tokens,
+                        estimated_cost_usd,
                         started_at, ended_at, first_prompt, last_prompt, summary)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     agent_type,
@@ -456,6 +475,7 @@ class Database:
                     0 if output_tokens is None else output_tokens,
                     0 if cache_read_tokens is None else cache_read_tokens,
                     0 if cache_creation_tokens is None else cache_creation_tokens,
+                    0 if cache_creation_1h_tokens is None else cache_creation_1h_tokens,
                     0.0 if estimated_cost_usd is _UNSET else estimated_cost_usd,
                     started_at or "",
                     ended_at or "",
@@ -479,6 +499,7 @@ class Database:
             ("output_tokens", output_tokens),
             ("cache_read_tokens", cache_read_tokens),
             ("cache_creation_tokens", cache_creation_tokens),
+            ("cache_creation_1h_tokens", cache_creation_1h_tokens),
             ("estimated_cost_usd", estimated_cost_usd),
             ("started_at", started_at),
             ("ended_at", ended_at),
@@ -559,6 +580,7 @@ class Database:
             output_tokens = int(bucket.get("output_tokens") or 0)
             cache_read_tokens = int(bucket.get("cache_read_tokens") or 0)
             cache_creation_tokens = int(bucket.get("cache_creation_tokens") or 0)
+            cache_creation_1h_tokens = int(bucket.get("cache_creation_1h_tokens") or 0)
             if "estimated_cost_usd" in bucket:
                 raw_cost = bucket.get("estimated_cost_usd")
                 estimated_cost_usd = None if raw_cost is None else float(raw_cost)
@@ -570,6 +592,7 @@ class Database:
                     output_tokens=output_tokens,
                     cache_read_tokens=cache_read_tokens,
                     cache_creation_tokens=cache_creation_tokens,
+                    cache_creation_1h_tokens=cache_creation_1h_tokens,
                     apply_long_context=False,
                 )
                 cost_is_explicit = 0
@@ -588,6 +611,7 @@ class Database:
                 output_tokens,
                 cache_read_tokens,
                 cache_creation_tokens,
+                cache_creation_1h_tokens,
                 estimated_cost_usd,
                 cost_is_explicit,
             ))
@@ -597,9 +621,10 @@ class Database:
                    (session_id, agent_type, provider, data_root,
                     usage_date, usage_hour, project_path,
                     model, message_count, user_turns, input_tokens, output_tokens,
-                    cache_read_tokens, cache_creation_tokens, estimated_cost_usd,
+                    cache_read_tokens, cache_creation_tokens, cache_creation_1h_tokens,
+                    estimated_cost_usd,
                     cost_is_explicit)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             rows,
         )
 

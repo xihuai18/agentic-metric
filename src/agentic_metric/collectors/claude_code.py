@@ -12,6 +12,7 @@ from pathlib import Path
 from ..config import PROJECTS_DIR
 from ..models import LiveSession
 from ..pricing import estimate_cost
+from ..usage import estimate_token_usage_cost, normalize_anthropic_usage
 from . import BaseCollector
 from ._process import get_running_cwds, normalize_cwd_key
 
@@ -65,6 +66,7 @@ class _SessionAccum:
         "output_tokens",
         "cache_read",
         "cache_create",
+        "cache_create_1h",
         "first_ts",
         "last_ts",
         "first_prompt",
@@ -77,6 +79,7 @@ class _SessionAccum:
         "today_output_tokens",
         "today_cache_read",
         "today_cache_create",
+        "today_cache_create_1h",
         "today_key",
         "partial_line",
         "file_id",
@@ -107,6 +110,7 @@ class _SessionAccum:
         self.output_tokens = 0
         self.cache_read = 0
         self.cache_create = 0
+        self.cache_create_1h = 0
         self.first_ts = ""
         self.last_ts = ""
         self.first_prompt = ""
@@ -119,12 +123,16 @@ class _SessionAccum:
         self.today_output_tokens = 0
         self.today_cache_read = 0
         self.today_cache_create = 0
+        self.today_cache_create_1h = 0
         self.today_key = ""
         self.partial_line = b""
         self.file_id: tuple[int, int] | None = None
         self.file_mtime_ns = -1
         self.assistant_message_dates: dict[str, tuple[str, int, str]] = {}
-        self.assistant_usage_by_id: dict[str, tuple[int, int, int, int, float | None, str, int, str]] = {}
+        self.assistant_usage_by_id: dict[
+            str,
+            tuple[int, int, int, int, int, float | None, str, int, str],
+        ] = {}
         self.usage_buckets: dict[tuple[str, int, str], dict] = {}
 
     def read_new_lines(self) -> None:
@@ -184,6 +192,7 @@ class _SessionAccum:
         self.output_tokens = 0
         self.cache_read = 0
         self.cache_create = 0
+        self.cache_create_1h = 0
         self.first_ts = ""
         self.last_ts = ""
         self.first_prompt = ""
@@ -217,6 +226,7 @@ class _SessionAccum:
         self.today_output_tokens = 0
         self.today_cache_read = 0
         self.today_cache_create = 0
+        self.today_cache_create_1h = 0
 
     @staticmethod
     def _ts_local_date(ts: str) -> str:
@@ -236,6 +246,7 @@ class _SessionAccum:
         output_tokens: int = 0,
         cache_read_tokens: int = 0,
         cache_creation_tokens: int = 0,
+        cache_creation_1h_tokens: int = 0,
         estimated_cost_usd: float | None = 0.0,
     ) -> None:
         if not usage_date:
@@ -255,6 +266,7 @@ class _SessionAccum:
                 "output_tokens": 0,
                 "cache_read_tokens": 0,
                 "cache_creation_tokens": 0,
+                "cache_creation_1h_tokens": 0,
                 "estimated_cost_usd": 0.0,
             },
         )
@@ -265,6 +277,7 @@ class _SessionAccum:
         bucket["output_tokens"] += output_tokens
         bucket["cache_read_tokens"] += cache_read_tokens
         bucket["cache_creation_tokens"] += cache_creation_tokens
+        bucket["cache_creation_1h_tokens"] += cache_creation_1h_tokens
         if estimated_cost_usd is None:
             bucket["estimated_cost_usd"] = None
         elif bucket["estimated_cost_usd"] is not None:
@@ -280,6 +293,7 @@ class _SessionAccum:
                 or bucket["output_tokens"]
                 or bucket["cache_read_tokens"]
                 or bucket["cache_creation_tokens"]
+                or bucket["cache_creation_1h_tokens"]
                 or bucket["estimated_cost_usd"]
             ):
                 rows.append(bucket)
@@ -349,25 +363,15 @@ class _SessionAccum:
             )
 
             if usage:
-                inp = int(usage.get("input_tokens") or 0)
-                out = int(usage.get("output_tokens") or 0)
-                cr = int(usage.get("cache_read_input_tokens") or 0)
-                cw = int(usage.get("cache_creation_input_tokens") or 0)
-                cache_creation = usage.get("cache_creation", {})
-                cw_1h = 0
-                if isinstance(cache_creation, dict):
-                    cw_1h = int(cache_creation.get("ephemeral_1h_input_tokens") or 0)
-                usage_cost = estimate_cost(
-                    bucket_model,
-                    input_tokens=inp,
-                    output_tokens=out,
-                    cache_read_tokens=cr,
-                    cache_creation_tokens=cw,
-                    cache_creation_1h_tokens=cw_1h,
-                )
+                normalized = normalize_anthropic_usage(usage)
+                if normalized is None:
+                    return
+                inp, out, cr, cw = normalized.as_bucket_tuple()
+                cw_1h = normalized.cache_write_1h_tokens
+                usage_cost = estimate_token_usage_cost(bucket_model, normalized)
                 self._set_assistant_usage(
                     msg_id,
-                    (inp, out, cr, cw, usage_cost),
+                    (inp, out, cr, cw, cw_1h, usage_cost),
                     entry_date,
                     entry_hour,
                     today_str,
@@ -436,23 +440,24 @@ class _SessionAccum:
     def _set_assistant_usage(
         self,
         msg_id: str,
-        usage: tuple[int, int, int, int, float | None],
+        usage: tuple[int, int, int, int, int, float | None],
         entry_date: str,
         entry_hour: int,
         today_str: str,
         model: str,
     ) -> None:
         """Use the last usage snapshot for a Claude Code assistant message."""
-        inp, out, cr, cw, cost = usage
+        inp, out, cr, cw, cw_1h, cost = usage
 
         if msg_id:
             prev = self.assistant_usage_by_id.get(msg_id)
             if prev is not None:
-                p_in, p_out, p_cr, p_cw, p_cost, p_date, p_hour, p_model = prev
+                p_in, p_out, p_cr, p_cw, p_cw_1h, p_cost, p_date, p_hour, p_model = prev
                 self.input_tokens = max(0, self.input_tokens - p_in)
                 self.output_tokens = max(0, self.output_tokens - p_out)
                 self.cache_read = max(0, self.cache_read - p_cr)
                 self.cache_create = max(0, self.cache_create - p_cw)
+                self.cache_create_1h = max(0, self.cache_create_1h - p_cw_1h)
                 self._add_usage_bucket(
                     p_date,
                     p_hour,
@@ -461,6 +466,7 @@ class _SessionAccum:
                     output_tokens=-p_out,
                     cache_read_tokens=-p_cr,
                     cache_creation_tokens=-p_cw,
+                    cache_creation_1h_tokens=-p_cw_1h,
                     estimated_cost_usd=-p_cost if p_cost is not None else None,
                 )
                 if p_date == today_str:
@@ -468,12 +474,14 @@ class _SessionAccum:
                     self.today_output_tokens = max(0, self.today_output_tokens - p_out)
                     self.today_cache_read = max(0, self.today_cache_read - p_cr)
                     self.today_cache_create = max(0, self.today_cache_create - p_cw)
+                    self.today_cache_create_1h = max(0, self.today_cache_create_1h - p_cw_1h)
 
             self.assistant_usage_by_id[msg_id] = (
                 inp,
                 out,
                 cr,
                 cw,
+                cw_1h,
                 cost,
                 entry_date,
                 entry_hour,
@@ -484,6 +492,7 @@ class _SessionAccum:
         self.output_tokens += out
         self.cache_read += cr
         self.cache_create += cw
+        self.cache_create_1h += cw_1h
         self._add_usage_bucket(
             entry_date,
             entry_hour,
@@ -492,6 +501,7 @@ class _SessionAccum:
             output_tokens=out,
             cache_read_tokens=cr,
             cache_creation_tokens=cw,
+            cache_creation_1h_tokens=cw_1h,
             estimated_cost_usd=cost,
         )
         if entry_date == today_str:
@@ -499,6 +509,7 @@ class _SessionAccum:
             self.today_output_tokens += out
             self.today_cache_read += cr
             self.today_cache_create += cw
+            self.today_cache_create_1h += cw_1h
 
     def to_live_session(self) -> LiveSession:
         return LiveSession(
@@ -513,6 +524,7 @@ class _SessionAccum:
             output_tokens=self.output_tokens,
             cache_read_tokens=self.cache_read,
             cache_creation_tokens=self.cache_create,
+            cache_creation_1h_tokens=self.cache_create_1h,
             started=self.first_ts,
             last_active=self.last_ts,
             first_prompt=self.first_prompt,
@@ -522,6 +534,7 @@ class _SessionAccum:
             today_output_tokens=self.today_output_tokens,
             today_cache_read_tokens=self.today_cache_read,
             today_cache_creation_tokens=self.today_cache_create,
+            today_cache_creation_1h_tokens=self.today_cache_create_1h,
             today_user_turns=self.today_user_turns,
             today_message_count=self.today_message_count,
         )
@@ -829,7 +842,11 @@ class ClaudeCodeCollector(BaseCollector):
         # v8: subagent JSONL files may replay parent assistant messages with
         # identical message ids; parse a project tree once and skip replayed
         # assistant usage across sibling files.
-        sync_prefix = "cc_jsonl:v8:"
+        # v9: unchanged earlier files still seed replay ids during incremental
+        # sync, so a changed sibling cannot re-count skipped parent usage.
+        # v10: usage buckets preserve cache_creation_1h_tokens for accurate
+        # repricing of 1-hour prompt-cache writes.
+        sync_prefix = "cc_jsonl:v10:"
 
         for project_dir in projects_dir.iterdir():
             if not project_dir.is_dir():
@@ -856,6 +873,7 @@ class ClaudeCodeCollector(BaseCollector):
                 mtime_ns = stat.st_mtime_ns
 
                 if _sync_state_matches(prev_state, file_size, mtime_ns):
+                    seen_assistant_ids.update(_read_assistant_ids(jsonl_file))
                     continue
 
                 # Resolve the real project path from the JSONL cwd up front so
@@ -900,6 +918,7 @@ class ClaudeCodeCollector(BaseCollector):
                     output_tokens=accum.output_tokens,
                     cache_read_tokens=accum.cache_read,
                     cache_creation_tokens=accum.cache_create,
+                    cache_creation_1h_tokens=accum.cache_create_1h,
                     estimated_cost_usd=cost,
                     started_at=accum.first_ts,
                     ended_at=accum.last_ts,
@@ -920,6 +939,27 @@ class ClaudeCodeCollector(BaseCollector):
 def _sync_state_value(file_size: int, mtime_ns: int) -> str:
     """Return the on-disk sync stamp for a JSONL file."""
     return f"{file_size}:{mtime_ns}"
+
+
+def _read_assistant_ids(jsonl_file: Path) -> set[str]:
+    """Read assistant message ids from a JSONL file without rebuilding usage."""
+    ids: set[str] = set()
+    try:
+        with jsonl_file.open(encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    entry = json.loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if entry.get("type") != "assistant":
+                    continue
+                msg = entry.get("message", {})
+                msg_id = msg.get("id", "") if isinstance(msg, dict) else ""
+                if msg_id:
+                    ids.add(msg_id)
+    except OSError:
+        return ids
+    return ids
 
 
 def _sync_state_matches(state: str | None, file_size: int, mtime_ns: int) -> bool:
@@ -960,6 +1000,7 @@ def _usage_rows_cost(rows: list[dict]) -> float | None:
                 output_tokens=int(row.get("output_tokens") or 0),
                 cache_read_tokens=int(row.get("cache_read_tokens") or 0),
                 cache_creation_tokens=int(row.get("cache_creation_tokens") or 0),
+                cache_creation_1h_tokens=int(row.get("cache_creation_1h_tokens") or 0),
                 apply_long_context=False,
             )
         if cost is None:

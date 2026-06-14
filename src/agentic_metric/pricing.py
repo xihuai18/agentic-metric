@@ -647,14 +647,13 @@ def estimate_cost(
 ) -> float | None:
     """Estimate API-equivalent cost in USD.
 
-    ``input_tokens`` must NOT include cached tokens — collectors are
-    responsible for stripping cached portions before storing, per each
-    provider's API semantics (Anthropic: already separate; OpenAI:
-    ``input_tokens`` is total, subtract ``cached_input_tokens``). Anthropic's
-    optional 1-hour cache writes are a subset of ``cache_creation_tokens`` and
-    are charged at the 1-hour prompt-cache multiplier when provided. Long-context
-    rates are only correct for single-request usage; callers that only have
-    hourly/session aggregates should pass ``apply_long_context=False``.
+    ``input_tokens`` must NOT include cached tokens. Collectors should normalize
+    provider payloads into non-overlapping buckets before storing them.
+    Anthropic's optional 1-hour cache writes are a subset of
+    ``cache_creation_tokens`` and are charged at the 1-hour prompt-cache
+    multiplier when provided. Long-context rates are only correct for
+    single-request usage; callers that only have hourly/session aggregates
+    should pass ``apply_long_context=False``.
     """
     if (
         input_tokens <= 0
@@ -701,5 +700,6 @@ def estimate_session_cost(session) -> float | None:
         output_tokens=session.output_tokens,
         cache_read_tokens=session.cache_read_tokens,
         cache_creation_tokens=session.cache_creation_tokens,
+        cache_creation_1h_tokens=getattr(session, "cache_creation_1h_tokens", 0),
         apply_long_context=False,
     )

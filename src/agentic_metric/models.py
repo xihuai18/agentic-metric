@@ -23,6 +23,7 @@ class LiveSession:
     output_tokens: int = 0
     cache_read_tokens: int = 0
     cache_creation_tokens: int = 0
+    cache_creation_1h_tokens: int = 0
     started: str = ""
     last_active: str = ""
     first_prompt: str = ""
@@ -35,6 +36,7 @@ class LiveSession:
     today_output_tokens: int = -1
     today_cache_read_tokens: int = -1
     today_cache_creation_tokens: int = -1
+    today_cache_creation_1h_tokens: int = -1
     today_user_turns: int = -1
     today_message_count: int = -1
 

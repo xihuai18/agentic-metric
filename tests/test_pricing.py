@@ -241,6 +241,20 @@ def test_live_session_estimate_does_not_apply_long_context_surcharge(tmp_path):
     _reset_cache()
 
 
+def test_live_session_estimate_prices_cache_creation_1h_tokens(tmp_path):
+    with _patch_empty_user_pricing(tmp_path):
+        session = LiveSession(
+            session_id="s",
+            agent_type="claude_code",
+            project_path="/tmp/project",
+            model="claude-opus-4-8",
+            cache_creation_tokens=1_000_000,
+            cache_creation_1h_tokens=1_000_000,
+        )
+        assert estimate_session_cost(session) == 10.0
+    _reset_cache()
+
+
 def test_gemini_pro_long_context_is_model_specific(tmp_path):
     with _patch_empty_user_pricing(tmp_path):
         cost = estimate_cost(
