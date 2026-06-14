@@ -2,6 +2,8 @@
 
 [![PyPI](https://img.shields.io/pypi/v/agentic-metric-x)](https://pypi.org/project/agentic-metric-x/)
 [![Python](https://img.shields.io/pypi/pyversions/agentic-metric-x)](https://pypi.org/project/agentic-metric-x/)
+[![Downloads](https://static.pepy.tech/badge/agentic-metric-x)](https://pepy.tech/project/agentic-metric-x)
+[![Downloads/month](https://img.shields.io/pypi/dm/agentic-metric-x)](https://pypi.org/project/agentic-metric-x/)
 
 [English](README.md)
 
