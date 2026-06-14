@@ -5,7 +5,7 @@ token buckets:
 
 - input_tokens: non-cached input only
 - output_tokens: generated output
-- cache_read_tokens: cached input reads
+- cache_read_tokens: reads of previously cached input
 - cache_write_5m_tokens: 5-minute prompt-cache writes
 - cache_write_1h_tokens: 1-hour prompt-cache writes
 
@@ -13,6 +13,9 @@ The database keeps ``cache_creation_tokens`` as the backward-compatible total
 cache-write field and stores ``cache_creation_1h_tokens`` as the 1-hour split.
 Billing derives 5-minute cache writes as ``total - 1h`` and never adds the
 split fields on top of the total.
+
+Within this project, ``cache`` names normalized billing buckets. ``cached`` is
+reserved for raw provider fields or prose that means "already cached".
 
 Provider APIs do not all expose the same raw semantics, so this module is the
 single place that converts raw usage payloads into those buckets.
@@ -23,6 +26,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .pricing import estimate_cost
+
+
+def _nonnegative_int(value: object) -> int:
+    """Parse provider token fields and clamp dirty negative values to zero."""
+    try:
+        parsed = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(parsed, 0)
 
 
 @dataclass(frozen=True)
@@ -93,13 +105,15 @@ def normalize_anthropic_usage(usage: object) -> TokenUsage | None:
     cache_creation = usage.get("cache_creation", {})
     cache_creation_1h_tokens = 0
     if isinstance(cache_creation, dict):
-        cache_creation_1h_tokens = int(cache_creation.get("ephemeral_1h_input_tokens") or 0)
-    cache_creation_tokens = int(usage.get("cache_creation_input_tokens") or 0)
+        cache_creation_1h_tokens = _nonnegative_int(
+            cache_creation.get("ephemeral_1h_input_tokens")
+        )
+    cache_creation_tokens = _nonnegative_int(usage.get("cache_creation_input_tokens"))
     cache_write_1h_tokens = min(cache_creation_1h_tokens, cache_creation_tokens)
     return TokenUsage(
-        input_tokens=int(usage.get("input_tokens") or 0),
-        output_tokens=int(usage.get("output_tokens") or 0),
-        cache_read_tokens=int(usage.get("cache_read_input_tokens") or 0),
+        input_tokens=_nonnegative_int(usage.get("input_tokens")),
+        output_tokens=_nonnegative_int(usage.get("output_tokens")),
+        cache_read_tokens=_nonnegative_int(usage.get("cache_read_input_tokens")),
         cache_write_5m_tokens=cache_creation_tokens - cache_write_1h_tokens,
         cache_write_1h_tokens=cache_write_1h_tokens,
     )
@@ -117,24 +131,20 @@ def normalize_openai_usage(
     report ``input_tokens`` as non-cached input and add cached tokens
     separately. We detect the latter using ``total_tokens`` when available,
     and also guard the impossible subset shape ``cached > input``.
+
+    OpenAI/Codex-compatible payloads do not expose Anthropic's 1-hour
+    cache-write billing tier, so all cache writes stay in the normalized 5m
+    bucket.
     """
     if not isinstance(usage, dict):
         return None
     if not any(k in usage for k in ("input_tokens", "output_tokens", "cached_input_tokens")):
         return None
 
-    raw_input = int(usage.get("input_tokens") or 0)
-    cached = int(usage.get("cached_input_tokens") or 0)
-    output = int(usage.get("output_tokens") or 0)
-    cache_create = int(usage.get("cache_creation_input_tokens") or 0)
-    cache_create_1h = int(usage.get("cache_creation_1h_input_tokens") or 0)
-    cache_creation = usage.get("cache_creation", {})
-    if isinstance(cache_creation, dict):
-        cache_create_1h = max(
-            cache_create_1h,
-            int(cache_creation.get("ephemeral_1h_input_tokens") or 0),
-        )
-    cache_write_1h = min(cache_create_1h, cache_create)
+    raw_input = _nonnegative_int(usage.get("input_tokens"))
+    cached = _nonnegative_int(usage.get("cached_input_tokens"))
+    output = _nonnegative_int(usage.get("output_tokens"))
+    cache_create = _nonnegative_int(usage.get("cache_creation_input_tokens"))
     return TokenUsage(
         input_tokens=openai_non_cached_input(
             usage,
@@ -145,8 +155,8 @@ def normalize_openai_usage(
         ),
         output_tokens=output,
         cache_read_tokens=cached,
-        cache_write_5m_tokens=cache_create - cache_write_1h,
-        cache_write_1h_tokens=cache_write_1h,
+        cache_write_5m_tokens=cache_create,
+        cache_write_1h_tokens=0,
     )
 
 

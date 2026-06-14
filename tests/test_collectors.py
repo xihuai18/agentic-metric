@@ -361,7 +361,7 @@ def test_codex_history_sync_supports_same_root_provider_filters(tmp_path):
         ("openai-sid", "openai", data_root),
     ]
     assert db.conn.execute(
-        "SELECT COUNT(*) AS n FROM sync_state WHERE key LIKE 'codex_jsonl:v11:%'"
+        "SELECT COUNT(*) AS n FROM sync_state WHERE key LIKE 'codex_jsonl:v13:%'"
     ).fetchone()["n"] == 4
     db.close()
 
@@ -904,7 +904,7 @@ def test_codex_last_token_usage_supports_separate_cached_input_semantics():
     assert abs(sum(r["estimated_cost_usd"] for r in rows) - expected) < 1e-12
 
 
-def test_codex_last_token_usage_carries_cache_creation_1h_to_session():
+def test_codex_last_token_usage_ignores_anthropic_cache_creation_1h_shape():
     accum = CodexSessionAccum(Path("/tmp/fake.jsonl"), project_path="/test")
     accum.model = "gpt-5.5"
     accum._process_event_msg({
@@ -929,17 +929,15 @@ def test_codex_last_token_usage_carries_cache_creation_1h_to_session():
     rows = accum.usage_bucket_rows()
     live = accum.to_live_session()
     assert accum.cache_create == 40
-    assert accum.cache_create_1h == 15
     assert sum(r["cache_creation_tokens"] for r in rows) == 40
-    assert sum(r["cache_creation_1h_tokens"] for r in rows) == 15
+    assert sum(r.get("cache_creation_1h_tokens", 0) for r in rows) == 0
     assert live.cache_creation_tokens == 40
-    assert live.cache_creation_1h_tokens == 15
+    assert live.cache_creation_1h_tokens == 0
     expected = estimate_cost(
         "gpt-5.5",
         input_tokens=1_000,
         output_tokens=100,
         cache_creation_tokens=40,
-        cache_creation_1h_tokens=15,
     )
     assert abs(sum(r["estimated_cost_usd"] for r in rows) - expected) < 1e-12
 
@@ -1152,7 +1150,7 @@ def test_codex_last_token_usage_skips_repeated_cumulative_snapshot():
     assert abs(sum(r["estimated_cost_usd"] for r in rows) - expected) < 1e-12
 
 
-def test_codex_cumulative_fallback_allows_negative_reclassification():
+def test_codex_cumulative_fallback_rebuilds_negative_reclassification():
     accum = CodexSessionAccum(Path("/tmp/fake.jsonl"), project_path="/test")
     accum.model = "gpt-5.5"
     accum._process_event_msg({
@@ -1177,21 +1175,20 @@ def test_codex_cumulative_fallback_allows_negative_reclassification():
     }, ts="2026-04-24T10:01:00Z")
 
     rows = accum.usage_bucket_rows()
+    for row in rows:
+        assert row["input_tokens"] >= 0
+        assert row["output_tokens"] >= 0
+        assert row["cache_read_tokens"] >= 0
+        assert row["cache_creation_tokens"] >= 0
     assert sum(r["input_tokens"] for r in rows) == 800
+    assert sum(r["output_tokens"] for r in rows) == 100
     assert sum(r["cache_read_tokens"] for r in rows) == 200
-    expected = (
-        estimate_cost(
-            "gpt-5.5",
-            input_tokens=1_000,
-            output_tokens=100,
-            apply_long_context=False,
-        )
-        + estimate_cost(
-            "gpt-5.5",
-            input_tokens=-200,
-            cache_read_tokens=200,
-            apply_long_context=False,
-        )
+    expected = estimate_cost(
+        "gpt-5.5",
+        input_tokens=800,
+        output_tokens=100,
+        cache_read_tokens=200,
+        apply_long_context=False,
     )
     assert abs(sum(r["estimated_cost_usd"] for r in rows) - expected) < 1e-12
 

@@ -294,20 +294,12 @@ class AgenticMetricApp(App):
             prev_cost = prev.get("estimated_cost_usd") or 0.0
             prev_cost_unknown = _has_unknown_cost(prev)
 
-            # Compact within-period distribution:
-            # today by hour, week by day, month by week.
-            distribution = [
-                bucket.get("cost") or 0.0
-                for bucket in get_heatmap(self._db, kind, offset=cell_offset)
-            ]
-
             cell = self.query_one(cell_id, SummaryCell)
             cell.label = _summary_label(kind, label, cell_offset)
             cell.update_data(
                 cost, sess, tokens,
                 active=active_count if kind == "today" and cell_offset == 0 else 0,
                 prev_cost=prev_cost,
-                sparkline=distribution,
                 cost_unknown=cost_unknown,
                 prev_cost_unknown=prev_cost_unknown,
                 turns=turns,
@@ -473,7 +465,6 @@ class AgenticMetricApp(App):
             cell.cost, cell.sessions, cell.tokens,
             active=self._count_active(),
             prev_cost=cell.prev_cost,
-            sparkline=cell.sparkline,
             cost_unknown=cell.cost_unknown,
             prev_cost_unknown=cell.prev_cost_unknown,
             turns=cell.turns,

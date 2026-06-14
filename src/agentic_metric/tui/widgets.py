@@ -41,31 +41,6 @@ def fmt_cost(usd: float | None, *, unknown: bool = False) -> str:
     return f"${usd_value:.3f}"
 
 
-_SPARK_BLOCKS = "▁▂▃▄▅▆▇█"
-
-
-def fmt_sparkline(values: list[float]) -> str:
-    """Compress a sequence of numbers into a unicode sparkline string.
-
-    Zero stays as a blank; other values are mapped across ▁-█ by
-    relative height. Returns an empty string for an empty list.
-    """
-    if not values:
-        return ""
-    max_v = max(values)
-    if max_v <= 0:
-        return " " * len(values)
-    out = []
-    for v in values:
-        if v <= 0:
-            out.append(" ")
-            continue
-        idx = int(round((v / max_v) * (len(_SPARK_BLOCKS) - 1)))
-        idx = max(0, min(len(_SPARK_BLOCKS) - 1, idx))
-        out.append(_SPARK_BLOCKS[idx])
-    return "".join(out)
-
-
 def ts_to_local(ts: str) -> str:
     """Convert an ISO-8601 timestamp to a short local-time string.
 
@@ -122,7 +97,6 @@ class SummaryCell(Static):
         self.active = 0
         self.prev_cost: float | None = None
         self.prev_cost_unknown = False
-        self.sparkline: list[float] = []
         self.focused_view = False
 
     def set_focused(self, focused: bool) -> None:
@@ -136,7 +110,6 @@ class SummaryCell(Static):
     def update_data(
         self, cost: float, sessions: int, tokens: int,
         active: int = 0, prev_cost: float | None = None,
-        sparkline: list[float] | None = None,
         cost_unknown: bool = False,
         prev_cost_unknown: bool = False,
         turns: int = 0,
@@ -153,8 +126,6 @@ class SummaryCell(Static):
         self.active = active
         self.prev_cost = prev_cost
         self.prev_cost_unknown = prev_cost_unknown
-        if sparkline is not None:
-            self.sparkline = sparkline
         self.refresh()
 
     def _delta(self) -> tuple[str, str] | None:
@@ -194,14 +165,12 @@ class SummaryCell(Static):
             t.append("  ")
             t.append(delta[0], style=delta[1])
         t.append("\n")
+        t.append("Token ", style="white")
+        t.append(fmt_tokens(self.tokens), style="bold bright_cyan")
         if self.cache_pct is not None:
-            t.append("Cache % ", style="white")
+            t.append("  ·  Cache % ", style="white")
             t.append(f"{self.cache_pct}%", style="bold bright_green")
-            t.append("\n")
-        # Compact distribution for this card's current period.
-        if self.sparkline:
-            t.append(fmt_sparkline(self.sparkline), style="bright_cyan")
-            t.append("\n")
+        t.append("\n")
         # Sessions / requests / turns — inline if they fit, stacked otherwise.
         parts = [f"{self.sessions:,} sess", f"{self.requests:,} req", f"{self.turns:,} turns"]
         inline = " · ".join(parts)
@@ -230,11 +199,11 @@ class SummaryCell(Static):
 
 
 class PeriodicHeatmap(Static):
-    """Heatmap panel body.
+    """Focused-period histogram panel body.
 
     Renders (top to bottom):
         - token split line (input · output · cache read · cache write)
-        - heatmap colored blocks + axis labels
+        - flat histogram strip + axis labels
         - peak bucket summary (``peak <label>  <cost>  <tokens>``)
         - top 3 projects (``Top projects  <path> · $X (pct)``)
 
@@ -268,80 +237,136 @@ class PeriodicHeatmap(Static):
         self._total_cost = total_cost
         self.refresh()
 
+    @staticmethod
+    def _truncate(text: str, width: int) -> str:
+        if width <= 0:
+            return ""
+        if len(text) <= width:
+            return text
+        if width <= 1:
+            return text[:width]
+        return text[: width - 1] + "…"
+
+    @staticmethod
+    def _fit_buckets(
+        buckets: list[dict],
+        max_points: int,
+        highlight_index: int | None,
+    ) -> list[dict]:
+        """Collapse older buckets only when the terminal is too narrow."""
+        if max_points <= 0:
+            return []
+        if len(buckets) <= max_points:
+            return [
+                {**bucket, "_highlighted": i == highlight_index}
+                for i, bucket in enumerate(buckets)
+            ]
+
+        bucket_w = len(buckets) / max_points
+        fitted: list[dict] = []
+        for i in range(max_points):
+            start = int(i * bucket_w)
+            end = int((i + 1) * bucket_w)
+            if i == max_points - 1:
+                end = len(buckets)
+            chunk = buckets[start:max(end, start + 1)]
+            fitted.append({
+                "label": chunk[-1].get("label", ""),
+                "cost": sum(b.get("cost") or 0 for b in chunk),
+                "tokens": sum(b.get("tokens") or 0 for b in chunk),
+                "unknown_cost_count": sum(b.get("unknown_cost_count") or 0 for b in chunk),
+                "_highlighted": (
+                    highlight_index is not None
+                    and any(start <= highlight_index < end for _b in chunk)
+                ),
+            })
+        return fitted
+
+    @classmethod
+    def _axis(cls, width: int, labels: list[str]) -> str:
+        if width <= 0 or not labels:
+            return ""
+        left = cls._truncate(labels[0], max(1, width))
+        right = cls._truncate(labels[-1], max(1, width))
+        mid = cls._truncate(labels[len(labels) // 2], max(1, width))
+
+        chars = [" "] * width
+        right_start = max(0, width - len(right))
+        for i, ch in enumerate(left[:width]):
+            chars[i] = ch
+        if right_start >= len(left) + 2:
+            for i, ch in enumerate(right):
+                chars[right_start + i] = ch
+
+        mid_start = max(0, width // 2 - len(mid) // 2)
+        mid_end = mid_start + len(mid)
+        if mid_start >= len(left) + 2 and mid_end <= right_start - 2:
+            for i, ch in enumerate(mid):
+                chars[mid_start + i] = ch
+        return "".join(chars).rstrip()
+
     def render(self) -> Group | Text:
         if not self._buckets:
             return Text("  (no data)", style="white")
 
-        # 7-level single-hue gradient. We keep one green family and vary
-        # density / intensity so the strip reads cleanly in terminals
-        # without turning into a rainbow.
-        blocks = ["·", "•", "░", "▒", "▓", "█", "█"]
-        colors = [
-            "grey35",            # 0: idle
-            "dim green",         # 1: trace
-            "green",             # 2: low
-            "green",             # 3: low-mid
-            "bright_green",      # 4: mid
-            "bright_green",      # 5: high
-            "bold bright_green", # 6: peak
-        ]
-        max_v = max((b.get("cost") or 0) for b in self._buckets) or 1.0
-        levels = len(blocks)
-
-        n = len(buckets := self._buckets)
-        if n >= 20:
-            preferred_cell_w = 4
-            label_every = 3
-        elif n >= 10:
-            preferred_cell_w = 6
-            label_every = 1
-        elif n >= 6:
-            preferred_cell_w = 8
-            label_every = 1
-        else:
-            preferred_cell_w = 12
-            label_every = 1
         try:
-            available = max(1, self.size.width - 2)
+            width = self.content_size.width
         except Exception:
-            available = max(1, preferred_cell_w * max(n, 1))
+            width = 0
+        available = max(1, width - 2) if width > 0 else 80
 
-        min_cell_w = 2 if available >= 2 else 1
-        if n and n * min_cell_w <= available:
-            cell_w = min(preferred_cell_w, max(min_cell_w, available // n))
-            buckets_per_row = n
-        else:
-            cell_w = min_cell_w
-            buckets_per_row = max(1, available // max(cell_w, 1))
+        max_points = max(1, available)
+        points = self._fit_buckets(self._buckets, max_points, self._highlight)
+        if not points:
+            return Text("  (no data)", style="white")
 
+        n_points = len(points)
+        preferred_cell_w = 2 if n_points >= 20 else 4 if n_points >= 10 else 6
+        cell_w = max(1, min(preferred_cell_w, available // max(n_points, 1)))
+        strip_width = n_points * cell_w
+
+        blocks = ["·", "▁", "▂", "▃", "▄", "▅", "▆", "█"]
+        colors = [
+            "grey35",
+            "dim green",
+            "green",
+            "green",
+            "bright_green",
+            "bright_green",
+            "bold bright_green",
+            "bold bright_green",
+        ]
+        max_v = max((b.get("cost") or 0) for b in points) or 1.0
+
+        strip = Text("  ")
+        for b in points:
+            cost = b.get("cost") or 0
+            if cost <= 0:
+                level = 0
+            else:
+                level = max(1, int(round((cost / max_v) * (len(blocks) - 1))))
+            level = min(level, len(blocks) - 1)
+            style = colors[level]
+            if b.get("_highlighted"):
+                style = f"{style} reverse"
+            strip.append(blocks[level] * cell_w, style=style)
+
+        axis = Text("  ")
+        axis.append(
+            self._axis(strip_width, [str(b.get("label") or "") for b in points]),
+            style="white",
+        )
+
+        buckets = self._buckets
+        n = len(buckets)
         known_peak_idx = max(range(n), key=lambda i: buckets[i].get("cost") or 0)
-        unknown_peak_idx = next((i for i, b in enumerate(buckets) if _has_unknown_cost(b)), None)
+        unknown_peak_idx = next(
+            (i for i, b in enumerate(buckets) if _has_unknown_cost(b)),
+            None,
+        )
         peak_idx = known_peak_idx if (buckets[known_peak_idx].get("cost") or 0) > 0 else (
             unknown_peak_idx if unknown_peak_idx is not None else known_peak_idx
         )
-
-        rows: list[Text] = []
-        for start in range(0, n, buckets_per_row):
-            chunk = buckets[start : start + buckets_per_row]
-            row_blocks = Text(" ")
-            row_labels = Text(" ")
-            for offset, b in enumerate(chunk):
-                i = start + offset
-                ratio = (b.get("cost") or 0) / max_v
-                lvl = min(levels - 1, int(round(ratio * (levels - 1))))
-                block = blocks[lvl]
-                style = colors[lvl]
-                if i == self._highlight:
-                    style = f"{style} reverse"
-
-                row_blocks.append(block * cell_w, style=style)
-
-                if i % label_every == 0:
-                    label = b["label"][:cell_w]
-                    row_labels.append(label.center(cell_w), style="white")
-                else:
-                    row_labels.append(" " * cell_w, style="default")
-            rows.extend([row_blocks, row_labels])
 
         peak_b = buckets[peak_idx]
         peak_unknown = _has_unknown_cost(peak_b)
@@ -365,9 +390,9 @@ class PeriodicHeatmap(Static):
         tsummary = _token_summary_block(self._totals)
         if tsummary is not None:
             body.append(tsummary)
-            body.append(Text(""))
 
-        body.extend(rows)
+        body.append(strip)
+        body.append(axis)
         body.append(peak_line)
 
         providers_block = _top_providers_block(
@@ -773,14 +798,14 @@ class Breakdown(Static):
         self.refresh(layout=True)
 
     # Fixed-width value columns to the right of every tree row:
-    #   cost · share% · in · out · cached · cache%
+    #   cost · share% · in · out · cache read · cache%
     # Fixed widths keep them aligned and stop the line from wrapping; the
     # column titles are shown once on a header row at the top of the panel.
     _W_COST = 10
     _W_SHARE = 6
     _W_IN = 7
     _W_OUT = 7
-    _W_CACHED = 8
+    _W_CACHED = 10
     _W_PCT = 6
     _VALUE_W = 1 + _W_COST + 1 + _W_SHARE + 1 + _W_IN + 1 + _W_OUT + 1 + _W_CACHED + 1 + _W_PCT
 
@@ -813,14 +838,14 @@ class Breakdown(Static):
             t.append(" " * gap, style="white")
 
     def _append_header(self, t: Text, label_width: int) -> None:
-        """Column-title row so IN / OUT / CACHED stay labeled."""
+        """Column-title row so input/output/cache-read values stay labeled."""
         t.append(" " * label_width, style="white")
         for title, width in (
             ("Cost", self._W_COST),
             ("%", self._W_SHARE),
             ("In", self._W_IN),
             ("Out", self._W_OUT),
-            ("Cached", self._W_CACHED),
+            ("Cache read", self._W_CACHED),
             ("Cache%", self._W_PCT),
         ):
             t.append(f" {title:>{width}}", style="bold white")

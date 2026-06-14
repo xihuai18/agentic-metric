@@ -848,7 +848,9 @@ class ClaudeCodeCollector(BaseCollector):
         # repricing of 1-hour prompt-cache writes.
         # v11: skipped later files are reparsed when a newly seen earlier file
         # owns the same assistant id, replacing stale replayed usage rows.
-        sync_prefix = "cc_jsonl:v11:"
+        # v12: provider is part of the sessions/session_usage primary key;
+        # reparse so every usage row has a matching session total row.
+        sync_prefix = "cc_jsonl:v12:"
 
         for project_dir in projects_dir.iterdir():
             if not project_dir.is_dir():

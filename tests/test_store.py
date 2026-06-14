@@ -114,7 +114,7 @@ def test_database_identity_migration_clears_legacy_history(tmp_path):
     assert {"provider", "data_root"}.issubset(usage_cols)
     assert db.conn.execute("SELECT COUNT(*) AS n FROM sessions").fetchone()["n"] == 0
     assert db.conn.execute("SELECT COUNT(*) AS n FROM session_usage").fetchone()["n"] == 0
-    assert db.get_sync_state("history_identity:version") == "provider-data-root-v3"
+    assert db.get_sync_state("history_identity:version") == "provider-data-root-v4"
     db.close()
 
 
@@ -144,7 +144,7 @@ def test_database_identity_migration_reclears_v2_rows(tmp_path):
     assert db.conn.execute("SELECT COUNT(*) AS n FROM sessions").fetchone()["n"] == 0
     assert db.conn.execute("SELECT COUNT(*) AS n FROM session_usage").fetchone()["n"] == 0
     assert db.get_sync_state("codex_jsonl:v6:/tmp/session.jsonl") is None
-    assert db.get_sync_state("history_identity:version") == "provider-data-root-v3"
+    assert db.get_sync_state("history_identity:version") == "provider-data-root-v4"
     db.close()
 
 
@@ -275,6 +275,81 @@ def test_upsert_session_is_scoped_by_data_root():
     assert len(rows) == 2
     assert {row["provider"] for row in rows} == {"openai", "custom"}
     assert {row["input_tokens"] for row in rows} == {1000, 2000}
+    db.close()
+
+
+def test_upsert_session_is_scoped_by_provider_when_data_root_matches():
+    db = _make_db()
+    db.upsert_session(
+        "s1",
+        "codex",
+        provider="openai",
+        data_root="/tmp/codex",
+        input_tokens=1000,
+    )
+    db.upsert_session(
+        "s1",
+        "codex",
+        provider="ichat",
+        data_root="/tmp/codex",
+        input_tokens=2000,
+    )
+    db.commit()
+
+    rows = db.conn.execute(
+        """SELECT provider, data_root, input_tokens
+           FROM sessions
+           WHERE session_id = 's1' AND agent_type = 'codex'
+           ORDER BY provider"""
+    ).fetchall()
+    assert [(r["provider"], r["data_root"], r["input_tokens"]) for r in rows] == [
+        ("ichat", "/tmp/codex", 2000),
+        ("openai", "/tmp/codex", 1000),
+    ]
+    db.close()
+
+
+def test_replace_session_usage_is_scoped_by_provider_when_identity_matches():
+    db = _make_db()
+    bucket = {
+        "usage_date": "2026-04-23",
+        "usage_hour": 10,
+        "model": "gpt-5.5",
+        "input_tokens": 1000,
+    }
+    db.replace_session_usage(
+        "s1",
+        "codex",
+        [bucket],
+        provider="openai",
+        data_root="/tmp/codex",
+    )
+    db.replace_session_usage(
+        "s1",
+        "codex",
+        [{**bucket, "input_tokens": 2000}],
+        provider="ichat",
+        data_root="/tmp/codex",
+    )
+    db.replace_session_usage(
+        "s1",
+        "codex",
+        [{**bucket, "input_tokens": 1500}],
+        provider="openai",
+        data_root="/tmp/codex",
+    )
+    db.commit()
+
+    rows = db.conn.execute(
+        """SELECT provider, data_root, input_tokens
+           FROM session_usage
+           WHERE session_id = 's1' AND agent_type = 'codex'
+           ORDER BY provider"""
+    ).fetchall()
+    assert [(r["provider"], r["data_root"], r["input_tokens"]) for r in rows] == [
+        ("ichat", "/tmp/codex", 2000),
+        ("openai", "/tmp/codex", 1500),
+    ]
     db.close()
 
 
@@ -1778,10 +1853,10 @@ def test_tui_summary_and_breakdown_render_cache_pct():
     }]
 
     rendered = widget.render().plain
-    # Value columns split tokens into in/out/cached plus cache hit rate.
-    assert "Cached" in rendered  # header label restored
-    assert "300" in rendered     # cached tokens
-    assert "75%" in rendered     # cache hit rate
+    # Value columns split tokens into input/output/cache-read plus cache hit rate.
+    assert "Cache read" in rendered  # header label restored
+    assert "300" in rendered         # cache-read tokens
+    assert "75%" in rendered         # cache hit rate
 
 
 def test_tui_summary_follows_focused_time_offset(monkeypatch, tmp_path):

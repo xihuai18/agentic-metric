@@ -48,6 +48,7 @@ _USAGE_SOURCE = """(
         FROM session_usage AS u
         WHERE u.session_id = s.session_id
           AND u.agent_type = s.agent_type
+          AND u.provider = s.provider
           AND u.data_root = s.data_root
     )
 )"""
@@ -123,6 +124,7 @@ def get_today_sessions(db: Database) -> list[dict]:
            LEFT JOIN sessions AS s
              ON s.session_id = u.session_id
             AND s.agent_type = u.agent_type
+            AND s.provider = u.provider
             AND s.data_root = u.data_root
            WHERE u.usage_date = ?
            GROUP BY u.session_id, u.agent_type, u.provider, u.data_root

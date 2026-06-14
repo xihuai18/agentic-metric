@@ -8,13 +8,13 @@ from ..config import DATA_DIR, DB_PATH
 from ..pricing import estimate_cost, get_pricing_fingerprint
 
 _UNSET = object()
-_HISTORY_IDENTITY_VERSION = "provider-data-root-v3"
+_HISTORY_IDENTITY_VERSION = "provider-data-root-v4"
 
 _SESSIONS_TABLE_SQL = """\
 CREATE TABLE IF NOT EXISTS sessions (
     session_id TEXT NOT NULL,
     agent_type TEXT NOT NULL,
-    provider TEXT DEFAULT '',
+    provider TEXT NOT NULL DEFAULT '',
     data_root TEXT NOT NULL DEFAULT '',
     project_path TEXT,
     git_branch TEXT DEFAULT '',
@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     first_prompt TEXT DEFAULT '',
     last_prompt TEXT DEFAULT '',
     summary TEXT DEFAULT '',
-    PRIMARY KEY (session_id, agent_type, data_root)
+    PRIMARY KEY (session_id, agent_type, provider, data_root)
 );
 """
 
@@ -40,7 +40,7 @@ _SESSION_USAGE_TABLE_SQL = """\
 CREATE TABLE IF NOT EXISTS session_usage (
     session_id TEXT NOT NULL,
     agent_type TEXT NOT NULL,
-    provider TEXT DEFAULT '',
+    provider TEXT NOT NULL DEFAULT '',
     data_root TEXT NOT NULL DEFAULT '',
     usage_date TEXT NOT NULL,
     usage_hour INTEGER NOT NULL,
@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS session_usage (
     cache_creation_1h_tokens INTEGER DEFAULT 0,
     estimated_cost_usd REAL DEFAULT 0,
     cost_is_explicit INTEGER DEFAULT 0,
-    PRIMARY KEY (session_id, agent_type, data_root, usage_date, usage_hour, model)
+    PRIMARY KEY (session_id, agent_type, provider, data_root, usage_date, usage_hour, model)
 );
 """
 
@@ -99,7 +99,7 @@ class Database:
         if (
             "provider" not in cols
             or "data_root" not in cols
-            or pk_cols != ["session_id", "agent_type", "data_root"]
+            or pk_cols != ["session_id", "agent_type", "provider", "data_root"]
         ):
             self._rebuild_sessions_table(cols)
 
@@ -116,6 +116,7 @@ class Database:
             or usage_pk_cols != [
                 "session_id",
                 "agent_type",
+                "provider",
                 "data_root",
                 "usage_date",
                 "usage_hour",
@@ -302,7 +303,7 @@ class Database:
         self._conn.execute("DELETE FROM sync_state WHERE key LIKE 'cc_jsonl:%'")
 
         usage_rows = self._conn.execute(
-            """SELECT session_id, agent_type, data_root, usage_date, usage_hour, model,
+            """SELECT session_id, agent_type, provider, data_root, usage_date, usage_hour, model,
                       input_tokens, output_tokens,
                       cache_read_tokens, cache_creation_tokens,
                       cache_creation_1h_tokens
@@ -322,6 +323,7 @@ class Database:
                 ),
                 row["session_id"],
                 row["agent_type"],
+                row["provider"],
                 row["data_root"],
                 row["usage_date"],
                 row["usage_hour"],
@@ -335,6 +337,7 @@ class Database:
                    SET estimated_cost_usd = ?
                    WHERE session_id = ?
                      AND agent_type = ?
+                     AND provider = ?
                      AND data_root = ?
                      AND usage_date = ?
                      AND usage_hour = ?
@@ -343,7 +346,7 @@ class Database:
             )
 
         rows = self._conn.execute(
-            """SELECT session_id, agent_type, data_root, model,
+            """SELECT session_id, agent_type, provider, data_root, model,
                       input_tokens, output_tokens,
                       cache_read_tokens, cache_creation_tokens,
                       cache_creation_1h_tokens
@@ -353,6 +356,7 @@ class Database:
                    FROM session_usage AS u
                    WHERE u.session_id = s.session_id
                      AND u.agent_type = s.agent_type
+                     AND u.provider = s.provider
                      AND u.data_root = s.data_root
                )"""
         ).fetchall()
@@ -370,6 +374,7 @@ class Database:
                 ),
                 row["session_id"],
                 row["agent_type"],
+                row["provider"],
                 row["data_root"],
             )
             for row in rows
@@ -378,7 +383,7 @@ class Database:
             self._conn.executemany(
                 """UPDATE sessions
                    SET estimated_cost_usd = ?
-                   WHERE session_id = ? AND agent_type = ? AND data_root = ?""",
+                   WHERE session_id = ? AND agent_type = ? AND provider = ? AND data_root = ?""",
                 updates,
             )
 
@@ -390,6 +395,7 @@ class Database:
                        FROM session_usage AS u
                        WHERE u.session_id = sessions.session_id
                          AND u.agent_type = sessions.agent_type
+                         AND u.provider = sessions.provider
                          AND u.data_root = sessions.data_root
                          AND u.estimated_cost_usd IS NULL
                    ) THEN NULL
@@ -398,6 +404,7 @@ class Database:
                        FROM session_usage AS u
                        WHERE u.session_id = sessions.session_id
                          AND u.agent_type = sessions.agent_type
+                         AND u.provider = sessions.provider
                          AND u.data_root = sessions.data_root
                    )
                END
@@ -406,6 +413,7 @@ class Database:
                    FROM session_usage AS u
                    WHERE u.session_id = sessions.session_id
                      AND u.agent_type = sessions.agent_type
+                     AND u.provider = sessions.provider
                      AND u.data_root = sessions.data_root
                )"""
         )
@@ -444,11 +452,12 @@ class Database:
         summary: str | None = None,
     ) -> None:
         data_root_value = data_root or ""
+        provider_value = provider or ""
         existing = self._conn.execute(
             """SELECT 1
                FROM sessions
-               WHERE session_id = ? AND agent_type = ? AND data_root = ?""",
-            (session_id, agent_type, data_root_value),
+               WHERE session_id = ? AND agent_type = ? AND provider = ? AND data_root = ?""",
+            (session_id, agent_type, provider_value, data_root_value),
         ).fetchone()
 
         if existing is None:
@@ -464,7 +473,7 @@ class Database:
                 (
                     session_id,
                     agent_type,
-                    provider or "",
+                    provider_value,
                     data_root_value,
                     project_path or "",
                     git_branch or "",
@@ -519,11 +528,11 @@ class Database:
         if not updates:
             return
 
-        params.extend((session_id, agent_type, data_root_value))
+        params.extend((session_id, agent_type, provider_value, data_root_value))
         self._conn.execute(
             f"""UPDATE sessions
                 SET {", ".join(updates)}
-                WHERE session_id = ? AND agent_type = ? AND data_root = ?""",
+                WHERE session_id = ? AND agent_type = ? AND provider = ? AND data_root = ?""",
             params,
         )
 
@@ -565,10 +574,11 @@ class Database:
     ) -> None:
         """Replace one session's per-local-hour usage buckets."""
         data_root_value = data_root or ""
+        provider_value = provider or ""
         self._conn.execute(
             """DELETE FROM session_usage
-               WHERE session_id = ? AND agent_type = ? AND data_root = ?""",
-            (session_id, agent_type, data_root_value),
+               WHERE session_id = ? AND agent_type = ? AND provider = ? AND data_root = ?""",
+            (session_id, agent_type, provider_value, data_root_value),
         )
         if not buckets:
             return
@@ -599,7 +609,7 @@ class Database:
             rows.append((
                 session_id,
                 agent_type,
-                provider or "",
+                provider_value,
                 data_root_value,
                 bucket.get("usage_date") or "",
                 int(bucket.get("usage_hour") or 0),
