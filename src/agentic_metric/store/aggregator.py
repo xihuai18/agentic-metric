@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from ..formatting import source_label
 from ..pricing import is_model_priced
@@ -57,6 +57,30 @@ _USAGE_SOURCE = """(
 def _usage_source(db: Database) -> str:
     """Return per-bucket usage plus a sessions fallback for pending re-syncs."""
     return _USAGE_SOURCE
+
+
+def _shifted_month(now: datetime, offset: int) -> tuple[int, int]:
+    """Return ``(year, month)`` shifted backward by ``offset`` months."""
+    y, m = now.year, now.month - offset
+    while m <= 0:
+        m += 12
+        y -= 1
+    return y, m
+
+
+def _month_bounds_for(year: int, month: int) -> tuple[date, date]:
+    """Return inclusive first/last dates for one calendar month."""
+    start = datetime(year, month, 1).date()
+    if month == 12:
+        end = datetime(year + 1, 1, 1).date() - timedelta(days=1)
+    else:
+        end = datetime(year, month + 1, 1).date() - timedelta(days=1)
+    return start, end
+
+
+def _shifted_month_bounds(now: datetime, offset: int) -> tuple[date, date]:
+    """Return inclusive first/last dates for a shifted calendar month."""
+    return _month_bounds_for(*_shifted_month(now, offset))
 
 
 def _session_count_expr(column: str = "session_id") -> str:
@@ -179,17 +203,7 @@ def resolve_range(kind: str, offset: int = 0) -> tuple[str, str, str]:
         return (label, start_d.strftime("%Y-%m-%d"), end_d.strftime("%Y-%m-%d"))
 
     if kind == "month":
-        y, m = now.year, now.month - offset
-        while m <= 0:
-            m += 12
-            y -= 1
-        start_d = datetime(y, m, 1).date()
-        # last day of that month
-        if m == 12:
-            next_month = datetime(y + 1, 1, 1).date()
-        else:
-            next_month = datetime(y, m + 1, 1).date()
-        end_d = next_month - timedelta(days=1)
+        start_d, end_d = _shifted_month_bounds(now, offset)
         if offset == 0:
             end_d = now.date()
             label = "This month"
@@ -756,47 +770,36 @@ def get_heatmap(
         return out
 
     if focus == "month":
-        # Focused year/month (shifted by offset months)
-        y, m = now.year, now.month - offset
-        while m <= 0:
-            m += 12
-            y -= 1
-        month_start = datetime(y, m, 1).date()
-        if m == 12:
-            month_end = datetime(y + 1, 1, 1).date() - timedelta(days=1)
-        else:
-            month_end = datetime(y, m + 1, 1).date() - timedelta(days=1)
+        month_start, month_end = _shifted_month_bounds(now, offset)
 
-        # Walk Mondays within the month; each bucket is Mon→Sun clipped
-        # to the month boundaries.
-        first_monday = month_start - timedelta(days=month_start.weekday())
-        weeks: list[tuple] = []
-        cursor = first_monday
-        week_num = 1
-        while cursor <= month_end:
-            wk_from = max(cursor, month_start)
-            wk_to = min(cursor + timedelta(days=6), month_end)
-            weeks.append((week_num, wk_from, wk_to))
-            cursor += timedelta(weeks=1)
-            week_num += 1
-
+        days = [
+            month_start + timedelta(days=i)
+            for i in range((month_end - month_start).days + 1)
+        ]
+        from_d = month_start.strftime("%Y-%m-%d")
+        to_d = month_end.strftime("%Y-%m-%d")
+        rows = db.conn.execute(
+            f"""SELECT usage_date AS d,
+                      COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                      COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                      COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+                      COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
+                      COALESCE(SUM(estimated_cost_usd), 0) AS cost,
+                      {_unknown_cost_expr()} AS unknown_cost_count,
+                      {_session_count_expr()} AS session_count
+               FROM {usage}
+               WHERE usage_date BETWEEN ? AND ?
+               GROUP BY d""",
+            (from_d, to_d),
+        ).fetchall()
+        seen = {r["d"]: r for r in rows}
         out = []
-        for wn, wf, wt in weeks:
-            row = db.conn.execute(
-                f"""SELECT COALESCE(SUM(input_tokens), 0) AS input_tokens,
-                          COALESCE(SUM(output_tokens), 0) AS output_tokens,
-                          COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
-                          COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
-                          COALESCE(SUM(estimated_cost_usd), 0) AS cost,
-                          {_unknown_cost_expr()} AS unknown_cost_count,
-                          {_session_count_expr()} AS session_count
-                   FROM {usage}
-                   WHERE usage_date BETWEEN ? AND ?""",
-                (wf.strftime("%Y-%m-%d"), wt.strftime("%Y-%m-%d")),
-            ).fetchone()
+        for day in days:
+            key = day.strftime("%Y-%m-%d")
+            row = seen.get(key)
             out.append({
-                "label": f"W{wn}",
-                "sublabel": f"{wf.strftime('%m-%d')} – {wt.strftime('%m-%d')}",
+                "label": day.strftime("%d"),
+                "sublabel": day.strftime("%m-%d"),
                 "cost": row["cost"] if row else 0.0,
                 "unknown_cost_count": row["unknown_cost_count"] if row else 0,
                 "tokens": _sum_tokens_row(row) if row else 0,
@@ -885,19 +888,15 @@ def get_trend(db: Database, unit: str, count: int) -> list[tuple[str, float]]:
         labels = [f"{y % 100:02d}-{m:02d}" for (y, m) in months]
 
         result = []
-        for (y, m) in months:
-            start = datetime(y, m, 1).date()
-            if m == 12:
-                end = datetime(y + 1, 1, 1).date() - timedelta(days=1)
-            else:
-                end = datetime(y, m + 1, 1).date() - timedelta(days=1)
+        for label, (y, m) in zip(labels, months):
+            start, end = _month_bounds_for(y, m)
             row = db.conn.execute(
                 f"""SELECT COALESCE(SUM(estimated_cost_usd), 0) AS cost
                    FROM {usage}
                    WHERE usage_date BETWEEN ? AND ?""",
                 (start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")),
             ).fetchone()
-            result.append((labels[months.index((y, m))], row["cost"] if row else 0.0))
+            result.append((label, row["cost"] if row else 0.0))
         return result
 
     raise ValueError(f"Unknown trend unit: {unit}")
@@ -919,15 +918,8 @@ def _trend_window(unit: str, count: int) -> tuple[str, str]:
         from_d = this_monday - timedelta(weeks=count - 1)
         to_d = this_monday + timedelta(days=6)
     elif unit == "month":
-        y, m = now.year, now.month - (count - 1)
-        while m <= 0:
-            m += 12
-            y -= 1
-        from_d = datetime(y, m, 1).date()
-        if now.month == 12:
-            to_d = datetime(now.year + 1, 1, 1).date() - timedelta(days=1)
-        else:
-            to_d = datetime(now.year, now.month + 1, 1).date() - timedelta(days=1)
+        from_d, _ = _shifted_month_bounds(now, count - 1)
+        _, to_d = _shifted_month_bounds(now, 0)
     else:
         raise ValueError(f"Unknown trend unit: {unit}")
     return from_d.strftime("%Y-%m-%d"), to_d.strftime("%Y-%m-%d")

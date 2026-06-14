@@ -541,25 +541,28 @@ class Database:
         session_id: str,
         agent_type: str,
         *,
-        provider: str | None = None,
+        provider: str,
         data_root: str | None = None,
     ) -> None:
-        """Delete one derived session and its usage rows."""
+        """Delete one derived session and its usage rows for one provider/root."""
+        if provider is None:
+            raise TypeError("provider is required")
         data_root_value = data_root or ""
-        provider_clause = " AND provider = ?" if provider is not None else ""
+        provider_value = provider or ""
         params: tuple[object, ...] = (
-            (session_id, agent_type, data_root_value, provider or "")
-            if provider is not None
-            else (session_id, agent_type, data_root_value)
+            session_id,
+            agent_type,
+            provider_value,
+            data_root_value,
         )
         self._conn.execute(
-            f"""DELETE FROM session_usage
-                WHERE session_id = ? AND agent_type = ? AND data_root = ?{provider_clause}""",
+            """DELETE FROM session_usage
+               WHERE session_id = ? AND agent_type = ? AND provider = ? AND data_root = ?""",
             params,
         )
         self._conn.execute(
-            f"""DELETE FROM sessions
-                WHERE session_id = ? AND agent_type = ? AND data_root = ?{provider_clause}""",
+            """DELETE FROM sessions
+               WHERE session_id = ? AND agent_type = ? AND provider = ? AND data_root = ?""",
             params,
         )
 

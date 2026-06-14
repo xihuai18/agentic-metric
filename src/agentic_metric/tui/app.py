@@ -245,9 +245,19 @@ class AgenticMetricApp(App):
         project_rows = get_range_by_project(self._db, frm, to, limit=3)
         provider_rows = get_range_by_provider(self._db, frm, to)
 
+        highlight_index = None
+        if self._offset == 0:
+            now = datetime.now()
+            if self._focus == "today":
+                highlight_index = now.hour
+            elif self._focus == "week":
+                highlight_index = now.weekday()
+            elif self._focus == "month":
+                highlight_index = now.day - 1
+
         self.query_one("#heatmap", PeriodicHeatmap).update_data(
             buckets,
-            highlight_index=None,
+            highlight_index=highlight_index,
             totals=totals,
             projects=project_rows,
             providers=provider_rows,
@@ -257,7 +267,7 @@ class AgenticMetricApp(App):
         titles = {
             "today": "Today by hour",
             "week":  "This week by day",
-            "month": "This month by week",
+            "month": "This month by day",
         }
         title = titles.get(self._focus, "")
         if self._offset > 0:
@@ -266,7 +276,7 @@ class AgenticMetricApp(App):
             elif self._focus == "week":
                 title = f"{label} by day"
             elif self._focus == "month":
-                title = f"{label} by week"
+                title = f"{label} by day"
         self.query_one("#heatmap-panel", Vertical).border_title = title
 
     def _populate_summary(self) -> None:

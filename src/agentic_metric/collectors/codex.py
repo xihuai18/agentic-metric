@@ -312,7 +312,9 @@ class _SessionAccum:
         cumulative snapshots. If a later snapshot moves tokens from input into
         cache read, a raw delta would create a negative input bucket. Rebuilding
         the token snapshot keeps buckets non-negative and preserves the current
-        normalized session totals.
+        normalized session totals. This rare fallback collapses prior hourly
+        token distribution into the current timestamp bucket; the session total
+        remains correct, but the historical hour split does not.
         """
         for bucket in self.usage_buckets.values():
             bucket["input_tokens"] = 0
@@ -980,7 +982,14 @@ def _sync_state_matches(state: str | None, file_size: int, mtime_ns: int) -> boo
 
 
 def _input_tokens_default_separate(provider: str) -> bool:
-    """Default ambiguous cached-input semantics for one Codex provider."""
+    """Default ambiguous cached-input semantics for one Codex provider.
+
+    Non-OpenAI Codex-compatible gateways are treated as "input is already
+    non-cached" only when ``total_tokens`` is missing. Current ichat payloads
+    include ``total_tokens`` and use OpenAI-style total-input semantics, so the
+    equality check in ``openai_input_tokens_are_separate`` overrides this
+    default and prevents double counting cached input.
+    """
     return bool(provider) and provider.strip().lower() != "openai"
 
 

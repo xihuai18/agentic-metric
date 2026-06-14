@@ -16,6 +16,7 @@ from rich.text import Text
 
 from .formatting import (
     cache_hit_rate as _cache_hit_rate,
+    cache_hit_rate_band as _cache_hit_rate_band,
     cache_tokens as _cache_tokens,
     clip as _clip,
     fmt_cost as _fmt_cost,
@@ -26,6 +27,7 @@ from .formatting import (
     shorten_home as _shorten_home,
     source_prefixed_path as _source_prefixed_path,
     source_root_label as _source_root_label,
+    token_summary as _token_summary,
 )
 
 app = typer.Typer(
@@ -70,6 +72,26 @@ C_SKY      = "bright_blue"
 C_BLUE     = "bright_blue"
 C_MAUVE    = "bright_magenta"
 C_SURFACE1 = "white"
+
+
+_CACHE_PCT_STYLES = {
+    "excellent": "bold bright_green",
+    "good": "bright_green",
+    "warn": "bright_yellow",
+    "low": "yellow",
+    "none": C_MUTED,
+}
+
+
+def _cache_pct_style(cache_pct: float | int | None) -> str:
+    return _CACHE_PCT_STYLES[_cache_hit_rate_band(cache_pct)]
+
+
+def _cache_pct_text(cache_pct: float) -> Text:
+    if cache_pct < 0:
+        return Text("—", style=C_MUTED)
+    return Text(f"{cache_pct:.0f}%", style=_cache_pct_style(cache_pct))
+
 
 # Boxed panels (header + heatmap) share one width: capped, but adapting
 # down to narrower terminals.
@@ -457,7 +479,11 @@ def _print_report(
         stats.add_column(justify="left")
     stats.add_row(
         cost_cell,
-        _stat("Cache %", f"{cache_pct:.0f}%" if cache_pct >= 0 else "—", C_GREEN),
+        _stat(
+            "Cache %",
+            f"{cache_pct:.0f}%" if cache_pct >= 0 else "—",
+            _cache_pct_style(cache_pct),
+        ),
         _stat("Sessions", f"{tot_sess:,}", C_MAUVE),
         _stat("Requests", f"{tot_requests:,}", C_SKY),
         _stat("Turns", f"{tot_turns:,}", C_SKY),
@@ -633,18 +659,25 @@ def _build_heatmap_panel(
     width: int | None = None,
 ) -> Panel:
     """Render the activity heatmap with token split + peak + top projects."""
-    blocks = ["·", "•", "░", "▒", "▓", "█", "█"]
+    # Full-height ``█`` cells only — partial-height block glyphs (▄▅▆…) are
+    # vertically-centered by some terminal fonts and look like they float.
+    # Magnitude is shown by color intensity (dim → bright) instead.
     styles = [
         "grey35",
         "dim green",
         "green",
         "green",
         "bright_green",
-        "bright_green",
         "bold bright_green",
     ]
-    levels = len(blocks)
-    max_v = max((b.get("cost") or 0) for b in buckets) or 1.0
+    levels = len(styles)
+    # Normalize heights/colors over the non-zero data range (min→max maps to
+    # 1→bar_rows) so activity clustered in a high, narrow band still spreads
+    # across the full height instead of all rounding to the same bar.
+    _nonzero = [c for c in ((b.get("cost") or 0) for b in buckets) if c > 0]
+    v_min = min(_nonzero) if _nonzero else 0.0
+    v_max = max(_nonzero) if _nonzero else 0.0
+    span = v_max - v_min
 
     n = len(buckets)
     if n >= 20:
@@ -669,19 +702,30 @@ def _build_heatmap_panel(
     elif focus_kind == "week":
         highlight = now.weekday()
     elif focus_kind == "month":
-        highlight = n - 1
+        highlight = min(now.day - 1, n - 1)
 
-    row_blocks = Text(" ")
+    # Stacked solid ``█`` rows: bar height = filled rows from the bottom (full
+    # cells render flush in every font), color refines magnitude. The current
+    # bucket is marked on its axis label, not by inverting its bar (a reversed
+    # full block vanishes into the background).
+    bar_rows = 4
+    rows_text = [Text(" ") for _ in range(bar_rows)]
     row_labels = Text(" ")
     for i, b in enumerate(buckets):
-        ratio = (b.get("cost") or 0) / max_v
-        lvl = min(levels - 1, int(round(ratio * (levels - 1))))
+        cost = b.get("cost") or 0
+        if cost <= 0 or v_max <= 0:
+            filled, lvl = 0, 0
+        else:
+            norm = (cost - v_min) / span if span > 0 else 1.0
+            filled = 1 + int(round(norm * (bar_rows - 1)))
+            lvl = max(1, min(levels - 1, 1 + int(round(norm * (levels - 2)))))
         style = styles[lvl]
-        if i == highlight:
-            style = f"{style} reverse"
-        row_blocks.append(blocks[lvl] * cell_w, style=style)
-        if i % label_every == 0:
-            row_labels.append(b["label"][:cell_w].center(cell_w), style=C_MUTED)
+        for r, line in enumerate(rows_text):  # r = 0 is the top row
+            lit = (bar_rows - r) <= filled
+            line.append(("█" if lit else " ") * cell_w, style=style if lit else "default")
+        if i % label_every == 0 or i == highlight:
+            label_style = "bold reverse" if i == highlight else C_MUTED
+            row_labels.append(b["label"][:cell_w].center(cell_w), style=label_style)
         else:
             row_labels.append(" " * cell_w, style="default")
 
@@ -711,15 +755,14 @@ def _build_heatmap_panel(
     body: list[object] = []
     if tsplit is not None:
         body.append(tsplit)
-        body.append(Text(""))
-    body.extend([row_blocks, row_labels, peak_line])
+    body.extend([*rows_text, row_labels, peak_line])
     if projects_block is not None:
         body.append(Text(""))
         body.append(projects_block)
 
     titles = {"today": "Today by hour",
               "week":  "This week by day",
-              "month": "This month by week"}
+              "month": "This month by day"}
     return Panel(
         Group(*body),
         title=titles.get(focus_kind, "Heatmap"),
@@ -812,7 +855,7 @@ def _build_dimension_table(
     tbl.add_column("In", justify="right", style=C_TEAL, no_wrap=True)
     tbl.add_column("Out", justify="right", style=C_TEAL, no_wrap=True)
     tbl.add_column("Cache", justify="right", style=C_GREEN, no_wrap=True)
-    tbl.add_column("C%", justify="right", style=C_GREEN, no_wrap=True)
+    tbl.add_column("C%", justify="right", no_wrap=True)
     tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}", no_wrap=True, min_width=6)
 
     for r in nonzero:
@@ -830,7 +873,7 @@ def _build_dimension_table(
             _fmt_tokens(r.get("input_tokens") or 0),
             _fmt_tokens(r.get("output_tokens") or 0),
             _fmt_tokens(_cache_tokens(r)),
-            f"{cp:.0f}%" if cp >= 0 else "—",
+            _cache_pct_text(cp),
             _fmt_cost(r.get("estimated_cost_usd"), unknown=_has_unknown_cost(r)),
         )
     return tbl
@@ -861,7 +904,7 @@ def _build_by_agent_model_table(rows: list[dict], *, limit: int = 8) -> Table | 
     tbl.add_column("In", justify="right", style=C_TEAL, no_wrap=True)
     tbl.add_column("Out", justify="right", style=C_TEAL, no_wrap=True)
     tbl.add_column("Cache", justify="right", style=C_GREEN, no_wrap=True)
-    tbl.add_column("C%", justify="right", style=C_GREEN, no_wrap=True)
+    tbl.add_column("C%", justify="right", no_wrap=True)
     tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}", no_wrap=True, min_width=6)
 
     # Group consecutive rows by (agent, provider, root) and cap the model
@@ -889,7 +932,7 @@ def _build_by_agent_model_table(rows: list[dict], *, limit: int = 8) -> Table | 
             _fmt_tokens(r.get("input_tokens") or 0),
             _fmt_tokens(r.get("output_tokens") or 0),
             _fmt_tokens(_cache_tokens(r)),
-            f"{cp:.0f}%" if cp >= 0 else "—",
+            _cache_pct_text(cp),
             _fmt_cost(r.get("estimated_cost_usd"), unknown=_has_unknown_cost(r)),
         )
 
@@ -915,7 +958,7 @@ def _build_by_agent_model_table(rows: list[dict], *, limit: int = 8) -> Table | 
                 _fmt_tokens(agg["input_tokens"]),
                 _fmt_tokens(agg["output_tokens"]),
                 _fmt_tokens(_cache_tokens(agg)),
-                f"{agg_cp:.0f}%" if agg_cp >= 0 else "—",
+                _cache_pct_text(agg_cp),
                 _fmt_cost(agg["estimated_cost_usd"], unknown=_has_unknown_cost(agg)),
             )
     return tbl
@@ -956,7 +999,7 @@ def _build_cross_table(
     tbl.add_column("In", justify="right", style=C_TEAL, no_wrap=True)
     tbl.add_column("Out", justify="right", style=C_TEAL, no_wrap=True)
     tbl.add_column("Cache", justify="right", style=C_GREEN, no_wrap=True)
-    tbl.add_column("C%", justify="right", style=C_GREEN, no_wrap=True)
+    tbl.add_column("C%", justify="right", no_wrap=True)
     tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}", no_wrap=True, min_width=7)
     for r in nonzero:
         model_display = r.get("model") or "—"
@@ -970,7 +1013,7 @@ def _build_cross_table(
             _fmt_tokens(r.get("input_tokens") or 0),
             _fmt_tokens(r.get("output_tokens") or 0),
             _fmt_tokens(_cache_tokens(r)),
-            f"{cp:.0f}%" if cp >= 0 else "—",
+            _cache_pct_text(cp),
             _fmt_cost(r.get("estimated_cost_usd"), unknown=_has_unknown_cost(r)),
         )
     return tbl
@@ -996,7 +1039,7 @@ def _build_top_projects_table(rows: list[dict]) -> Table | None:
     tbl.add_column("Input", justify="right", style=C_TEAL, no_wrap=True)
     tbl.add_column("Output", justify="right", style=C_TEAL, no_wrap=True)
     tbl.add_column("Cache", justify="right", style=C_GREEN, no_wrap=True)
-    tbl.add_column("C%", justify="right", style=C_GREEN, no_wrap=True)
+    tbl.add_column("C%", justify="right", no_wrap=True)
     tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}", no_wrap=True, min_width=7)
     for r in nonzero:
         path = _source_prefixed_path(
@@ -1011,7 +1054,7 @@ def _build_top_projects_table(rows: list[dict]) -> Table | None:
             _fmt_tokens(r.get("input_tokens") or 0),
             _fmt_tokens(r.get("output_tokens") or 0),
             _fmt_tokens(_cache_tokens(r)),
-            f"{cp:.0f}%" if cp >= 0 else "—",
+            _cache_pct_text(cp),
             _fmt_cost(r.get("estimated_cost_usd"), unknown=_has_unknown_cost(r)),
         )
     return tbl
@@ -1041,7 +1084,7 @@ def _build_project_agent_table(rows: list[dict]) -> Table | None:
     tbl.add_column("In", justify="right", style=C_TEAL, no_wrap=True)
     tbl.add_column("Out", justify="right", style=C_TEAL, no_wrap=True)
     tbl.add_column("Cache", justify="right", style=C_GREEN, no_wrap=True)
-    tbl.add_column("C%", justify="right", style=C_GREEN, no_wrap=True)
+    tbl.add_column("C%", justify="right", no_wrap=True)
     tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}", no_wrap=True, min_width=6)
     for r in nonzero:
         turns = r.get("user_turns") or 0
@@ -1061,7 +1104,7 @@ def _build_project_agent_table(rows: list[dict]) -> Table | None:
             _fmt_tokens(r.get("input_tokens") or 0),
             _fmt_tokens(r.get("output_tokens") or 0),
             _fmt_tokens(_cache_tokens(r)),
-            f"{cp:.0f}%" if cp >= 0 else "—",
+            _cache_pct_text(cp),
             _fmt_cost(r.get("estimated_cost_usd"), unknown=_has_unknown_cost(r)),
         )
     return tbl
@@ -1078,7 +1121,7 @@ def _build_periodic_table(periodic: list[dict], focus_kind: str | None) -> Table
     elif focus_kind == "week":
         periodic_title, bucket_col = "By day", "Day"
     else:
-        periodic_title, bucket_col = "By week", "Week"
+        periodic_title, bucket_col = "By day", "Day"
 
     max_cost = max((b.get("cost") or 0) for b in nonzero) or 1e-9
     tbl = Table(
@@ -1093,7 +1136,7 @@ def _build_periodic_table(periodic: list[dict], focus_kind: str | None) -> Table
     )
     tbl.add_column(bucket_col, style=C_BLUE, no_wrap=True)
     tbl.add_column("Sessions", justify="right", style=C_TEXT, no_wrap=True)
-    tbl.add_column("Cache %", justify="right", style=f"bold {C_GREEN}", no_wrap=True, min_width=7)
+    tbl.add_column("Cache %", justify="right", no_wrap=True, min_width=7)
     tbl.add_column("Tokens", justify="right", style=C_TEAL, no_wrap=True)
     tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}", no_wrap=True)
     tbl.add_column("", justify="left", no_wrap=True)
@@ -1113,7 +1156,7 @@ def _build_periodic_table(periodic: list[dict], focus_kind: str | None) -> Table
         tbl.add_row(
             label_col,
             f"{b['session_count']:,}",
-            f"{cp:.0f}%" if cp >= 0 else "—",
+            _cache_pct_text(cp),
             _fmt_tokens(b.get("tokens") or 0),
             _fmt_cost(cost, unknown=unknown),
             bar,
@@ -1121,9 +1164,10 @@ def _build_periodic_table(periodic: list[dict], focus_kind: str | None) -> Table
     return tbl
 
 
-def _stat(label: str, value: str, color: str) -> Group:
+def _stat(label: str, value: str, style: str) -> Group:
     label_text = Text(label.upper(), style=f"{C_MUTED}")
-    return Group(label_text, Text(value, style=f"bold {color}"))
+    value_style = style if "bold" in style.split() else f"bold {style}"
+    return Group(label_text, Text(value, style=value_style))
 
 
 # ── helpers ────────────────────────────────────────────────────────
@@ -1138,22 +1182,23 @@ def _token_summary_block(totals: dict) -> Group | None:
     """
     if not totals:
         return None
-    input_t = totals.get("input_tokens") or 0
-    output_t = totals.get("output_tokens") or 0
-    cache_r = totals.get("cache_read_tokens") or 0
-    cache_w = totals.get("cache_creation_tokens") or 0
-    total_t = input_t + output_t + cache_r + cache_w
+    summary = _token_summary(totals)
+    input_t = summary["input_tokens"]
+    output_t = summary["output_tokens"]
+    cache_r = summary["cache_read_tokens"]
+    cache_w = summary["cache_creation_tokens"]
+    total_t = summary["total_tokens"]
     if total_t == 0:
         return None
 
-    cache_pct = _cache_hit_rate(totals)
+    cache_pct = summary["cache_pct"]
 
     line_total = Text()
     line_total.append("Token total ", style=C_MUTED)
     line_total.append(_fmt_tokens(total_t), style=C_TEAL)
     if cache_pct >= 0:
         line_total.append("  ·  Cache % ", style=C_MUTED)
-        line_total.append(f"{cache_pct:.0f}%", style=C_GREEN)
+        line_total.append(f"{cache_pct:.0f}%", style=_cache_pct_style(cache_pct))
 
     line_split = Text()
     line_split.append("Token ", style=C_MUTED)

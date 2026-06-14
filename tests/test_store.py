@@ -4,14 +4,16 @@ import json
 import sqlite3
 import tempfile
 import asyncio
+import pytest
 from typer.testing import CliRunner
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import patch
 
 from rich.console import Console
 
 from agentic_metric import cli as cli_module
-from agentic_metric.formatting import cache_hit_rate
+from agentic_metric.formatting import cache_hit_rate, cache_hit_rate_band, token_summary
+from agentic_metric.store import aggregator as aggregator_module
 from agentic_metric.store.database import Database
 from agentic_metric.store.aggregator import (
     get_heatmap,
@@ -28,7 +30,15 @@ from agentic_metric.store.aggregator import (
 )
 from agentic_metric.formatting import fmt_cost as cli_fmt_cost
 from agentic_metric.tui.app import _summary_label
-from agentic_metric.tui.widgets import Breakdown, PeriodicHeatmap, SummaryCell, TrendBlocks, fmt_cost as tui_fmt_cost
+from agentic_metric.tui.widgets import (
+    Breakdown,
+    PeriodicHeatmap,
+    SummaryCell,
+    TrendBlocks,
+    _cache_pct_style as tui_cache_pct_style,
+    _render_histogram,
+    fmt_cost as tui_fmt_cost,
+)
 from agentic_metric.tui.help_screen import HelpScreen, _SECTIONS
 from agentic_metric.cli import app as cli_app
 
@@ -400,6 +410,20 @@ def test_delete_session_can_be_scoped_by_provider():
     assert db.conn.execute(
         "SELECT COUNT(*) AS n FROM sessions WHERE session_id = 's2'"
     ).fetchone()["n"] == 1
+    db.close()
+
+
+def test_delete_session_requires_provider():
+    db = _make_db()
+    with pytest.raises(TypeError):
+        db.delete_session("s1", "codex", data_root="/tmp/codex")  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        db.delete_session(
+            "s1",
+            "codex",
+            provider=None,  # type: ignore[arg-type]
+            data_root="/tmp/codex",
+        )
     db.close()
 
 
@@ -1823,6 +1847,134 @@ def test_heatmap_buckets_carry_cache_fields_for_cache_pct():
     db.close()
 
 
+def test_month_heatmap_uses_daily_buckets():
+    db = _make_db()
+    now = datetime.now()
+    month_start = datetime(now.year, now.month, 1).date()
+    if now.month == 12:
+        month_end = datetime(now.year + 1, 1, 1).date() - timedelta(days=1)
+    else:
+        month_end = datetime(now.year, now.month + 1, 1).date() - timedelta(days=1)
+    mid_day = month_start + timedelta(days=14)
+    db.replace_session_usage(
+        "s1",
+        "codex",
+        [
+            {
+                "usage_date": month_start.strftime("%Y-%m-%d"),
+                "usage_hour": 10,
+                "project_path": "/tmp/project",
+                "model": "gpt-5.5",
+                "message_count": 2,
+                "input_tokens": 100,
+                "estimated_cost_usd": 1.0,
+            },
+            {
+                "usage_date": mid_day.strftime("%Y-%m-%d"),
+                "usage_hour": 11,
+                "project_path": "/tmp/project",
+                "model": "gpt-5.5",
+                "message_count": 3,
+                "input_tokens": 200,
+                "estimated_cost_usd": 2.0,
+            },
+        ],
+    )
+    db.commit()
+
+    buckets = get_heatmap(db, "month")
+
+    assert len(buckets) == month_end.day
+    assert buckets[0]["label"] == "01"
+    assert buckets[-1]["label"] == f"{month_end.day:02d}"
+    assert buckets[0]["sublabel"] == month_start.strftime("%m-%d")
+    assert buckets[0]["cost"] == 1.0
+    assert buckets[14]["label"] == "15"
+    assert buckets[14]["cost"] == 2.0
+    assert buckets[1]["cost"] == 0.0
+    db.close()
+
+
+def test_month_heatmap_handles_leap_february(monkeypatch):
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2024, 2, 15)
+
+    monkeypatch.setattr(aggregator_module, "datetime", FixedDateTime)
+    db = _make_db()
+
+    buckets = get_heatmap(db, "month")
+
+    assert len(buckets) == 29
+    assert buckets[0]["label"] == "01"
+    assert buckets[-1]["label"] == "29"
+    assert buckets[-1]["sublabel"] == "02-29"
+    db.close()
+
+
+def test_cache_pct_threshold_styles_match_tui_and_cli():
+    summary = token_summary({
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "cache_read_tokens": 300,
+        "cache_creation_tokens": 30,
+    })
+    assert summary["total_tokens"] == 450
+    assert summary["cache_pct"] == 300 / 430 * 100
+
+    assert cache_hit_rate({
+        "input_tokens": 100,
+        "cache_read_tokens": 300,
+        "cache_creation_tokens": 0,
+    }) == 75.0
+    assert cache_hit_rate({
+        "input": 100,
+        "cache_read": 300,
+        "cache_write": 0,
+    }) == 75.0
+
+    expected = {
+        96: "excellent",
+        95: "excellent",
+        94: "good",
+        90: "good",
+        89: "warn",
+        80: "warn",
+        79: "low",
+        -1: "none",
+    }
+    for pct, band in expected.items():
+        assert cache_hit_rate_band(pct) == band
+        assert tui_cache_pct_style(pct) == cli_module._cache_pct_style(pct)
+
+    styles = [tui_cache_pct_style(pct) for pct in (95, 94, 89, 79)]
+    assert len(set(styles)) == 4
+
+
+def test_cli_month_periodic_table_uses_daily_label():
+    periodic = [{
+        "label": "01",
+        "sublabel": "02-01",
+        "session_count": 1,
+        "tokens": 100,
+        "input_tokens": 20,
+        "output_tokens": 5,
+        "cache_read_tokens": 75,
+        "cache_creation_tokens": 0,
+        "cost": 1.0,
+    }]
+
+    table = cli_module._build_periodic_table(periodic, "month")
+    console = Console(record=True, width=120, color_system=None)
+    console.print(table)
+    rendered = console.export_text()
+
+    assert "By day" in rendered
+    assert "Day" in rendered
+    assert "By week" not in rendered
+
+
 def test_tui_summary_and_breakdown_render_cache_pct():
     cell = SummaryCell("TODAY")
     cell.update_data(1.0, 2, 420, requests=6, turns=4, cache_pct=75)
@@ -1853,10 +2005,79 @@ def test_tui_summary_and_breakdown_render_cache_pct():
     }]
 
     rendered = widget.render().plain
-    # Value columns split tokens into input/output/cache-read plus cache hit rate.
-    assert "Cache read" in rendered  # header label restored
+    # Value columns split tokens into input/output/cache plus cache hit rate.
+    assert "Cache read" not in rendered
+    assert "Cache%" in rendered
     assert "300" in rendered         # cache-read tokens
     assert "75%" in rendered         # cache hit rate
+
+
+def test_tui_summary_stats_wrap_on_whole_segments():
+    cell = SummaryCell("TODAY")
+    cell.update_data(
+        1.0,
+        195,
+        1_200_000_000,
+        requests=6_319,
+        turns=1_280,
+        active=2,
+        cache_pct=94,
+    )
+
+    lines = ["".join(text for text, _style in row) for row in cell._stats_lines(28)]
+    assert lines == [
+        "195 sess · 6.3K req",
+        "1.3K turns  ● 2 live",
+    ]
+
+
+def test_tui_histograms_render_discrete_bars():
+    histogram = _render_histogram(
+        [4.0, 2.0, 3.0],
+        labels=["Mon", "Tue", "Wed"],
+        available=80,
+        colors=["green"] * 8,
+        rows=3,
+    )
+    console = Console(record=True, width=120, color_system=None)
+    console.print(histogram.bars)
+    bar_lines = console.export_text().splitlines()
+    # Multi-row bar chart: taller value (4.0) fills more rows than shorter (2.0).
+    assert len(bar_lines) == 3
+    assert "█" in "".join(bar_lines)
+    assert any("  " in line.strip() for line in bar_lines)
+    assert "Mon" in histogram.axis.plain
+    assert "Tue" in histogram.axis.plain
+    assert "Wed" in histogram.axis.plain
+
+    heatmap = PeriodicHeatmap()
+    heatmap.update_data(
+        [
+            {"label": "00", "cost": 1.0, "tokens": 100},
+            {"label": "12", "cost": 3.0, "tokens": 300},
+            {"label": "23", "cost": 2.0, "tokens": 200},
+        ],
+        totals={
+            "input_tokens": 10,
+            "output_tokens": 10,
+            "cache_read_tokens": 10,
+            "cache_creation_tokens": 10,
+        },
+        total_cost=6.0,
+    )
+    console = Console(record=True, width=120, color_system=None)
+    console.print(heatmap.render())
+    heatmap_lines = console.export_text().splitlines()
+    assert any("█" in line for line in heatmap_lines)
+    assert any("00" in line for line in heatmap_lines)
+
+    trend = TrendBlocks()
+    trend.update_data([("06-01", 1.0), ("06-08", 3.0), ("06-14", 2.0)], "last 14 days")
+    console = Console(record=True, width=120, color_system=None)
+    console.print(trend.render())
+    trend_lines = console.export_text().splitlines()
+    assert any("█" in line for line in trend_lines)
+    assert any("06-01" in line for line in trend_lines)
 
 
 def test_tui_summary_follows_focused_time_offset(monkeypatch, tmp_path):

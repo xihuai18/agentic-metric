@@ -150,13 +150,59 @@ def cache_tokens(r: dict) -> int:
 
 def cache_hit_rate(r: dict) -> float:
     """Return cache-read share of prompt-side tokens in %, or -1 if N/A."""
-    cache_read = r.get("cache_read_tokens") or 0
-    input_tok = r.get("input_tokens") or 0
-    cache_create = r.get("cache_creation_tokens") or 0
+    cache_read = r.get("cache_read_tokens")
+    if cache_read is None:
+        cache_read = r.get("cache_read")
+    if cache_read is None:
+        cache_read = r.get("cache") or 0
+
+    input_tok = r.get("input_tokens")
+    if input_tok is None:
+        input_tok = r.get("input") or 0
+
+    cache_create = r.get("cache_creation_tokens")
+    if cache_create is None:
+        cache_create = r.get("cache_write") or 0
+
     prompt_side = cache_read + input_tok + cache_create
     if prompt_side <= 0:
         return -1.0
     return 100.0 * cache_read / prompt_side
+
+
+def cache_hit_rate_band(rate: float | int | None) -> str:
+    """Return the shared display band for a cache-hit percentage."""
+    if rate is None or rate < 0:
+        return "none"
+    if rate >= 95:
+        return "excellent"
+    if rate >= 90:
+        return "good"
+    if rate >= 80:
+        return "warn"
+    return "low"
+
+
+def token_summary(r: dict) -> dict:
+    """Return canonical token totals used by CLI and TUI summaries."""
+    input_tokens = r.get("input_tokens") or 0
+    output_tokens = r.get("output_tokens") or 0
+    cache_read_tokens = r.get("cache_read_tokens") or 0
+    cache_creation_tokens = r.get("cache_creation_tokens") or 0
+    total_tokens = (
+        input_tokens
+        + output_tokens
+        + cache_read_tokens
+        + cache_creation_tokens
+    )
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "cache_creation_tokens": cache_creation_tokens,
+        "total_tokens": total_tokens,
+        "cache_pct": cache_hit_rate(r),
+    }
 
 
 def time_bucket_label(row: dict) -> str:

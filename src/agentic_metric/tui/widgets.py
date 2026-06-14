@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 
 from rich.console import Group
@@ -10,9 +11,11 @@ from textual.geometry import Size
 from textual.widgets import Static
 
 from ..formatting import cache_hit_rate as _cache_hit_rate
+from ..formatting import cache_hit_rate_band as _cache_hit_rate_band
 from ..formatting import clip as _clip
 from ..formatting import root_label as _root_label
 from ..formatting import source_prefixed_path as _source_prefixed_path
+from ..formatting import token_summary as _token_summary
 
 
 # ── Formatting helpers ────────────────────────────────────────────────
@@ -57,25 +60,166 @@ def ts_to_local(ts: str) -> str:
         return ts[:16]
 
 
-def _cache_hit_pct(row: dict) -> int | None:
-    input_tokens = row.get("input_tokens")
-    if input_tokens is None:
-        input_tokens = row.get("input") or 0
+_CACHE_PCT_STYLES = {
+    "excellent": "bold bright_green",
+    "good": "bright_green",
+    "warn": "bright_yellow",
+    "low": "yellow",
+    "none": "white",
+}
 
-    cache_read = row.get("cache_read_tokens")
-    if cache_read is None:
-        cache_read = row.get("cache_read")
-    if cache_read is None:
-        cache_read = row.get("cache") or 0
 
-    cache_write = row.get("cache_creation_tokens")
-    if cache_write is None:
-        cache_write = row.get("cache_write") or 0
+def _cache_pct_style(cache_pct: float | int | None) -> str:
+    return _CACHE_PCT_STYLES[_cache_hit_rate_band(cache_pct)]
 
-    denom = (input_tokens or 0) + (cache_read or 0) + (cache_write or 0)
-    if denom <= 0:
-        return None
-    return round((cache_read or 0) / denom * 100)
+
+@dataclass(frozen=True)
+class _HistogramRender:
+    bars: Group
+    axis: Text
+    width: int
+
+
+def _histogram_layout(point_count: int, available: int) -> tuple[int, int, int]:
+    """Return ``(bar_width, gap_width, total_width)`` for one histogram."""
+    if point_count <= 0:
+        return 0, 0, 0
+
+    if point_count <= 8:
+        preferred_bar_w, preferred_gap_w = 3, 2
+    elif point_count <= 14:
+        preferred_bar_w, preferred_gap_w = 3, 1
+    else:
+        preferred_bar_w, preferred_gap_w = 2, 1
+
+    for gap_w in (preferred_gap_w, 1, 0):
+        usable = available - gap_w * (point_count - 1)
+        if usable < point_count:
+            continue
+        bar_w = max(1, min(preferred_bar_w, usable // point_count))
+        return bar_w, gap_w, point_count * bar_w + (point_count - 1) * gap_w
+
+    return 1, 0, point_count
+
+
+def _axis_from_layout(
+    labels: list[str],
+    *,
+    bar_w: int,
+    gap_w: int,
+    width: int,
+    highlight_index: int | None = None,
+) -> Text:
+    """Build the axis label row, evenly spaced and as dense as fits.
+
+    The current bucket's label (``highlight_index``) is emphasized instead of
+    inverting its bar, so a full-height bar never has to be drawn in reverse
+    (which makes it vanish into the background).
+    """
+    if width <= 0 or not labels:
+        return Text("  ")
+
+    pitch = bar_w + gap_w
+    n = len(labels)
+    if n <= 8:
+        indexes = list(range(n))
+    else:
+        # As many evenly spaced labels as fit without colliding: pick a step so
+        # consecutive labels are at least one space apart (e.g. a ~30-day month
+        # lands a label roughly every 4-10 days instead of only 3 total).
+        max_len = max((len(str(label or "")) for label in labels), default=1)
+        step = max(1, -(-(max_len + 2) // pitch))  # ceil division
+        indexes = list(range(0, n, step))
+        if n - 1 not in indexes:
+            indexes.append(n - 1)
+
+    # Place the highlighted label first so it always survives collision pruning.
+    order = list(indexes)
+    if highlight_index is not None and 0 <= highlight_index < n and highlight_index not in order:
+        order.insert(0, highlight_index)
+
+    chars = [" "] * width
+    styles: list[str] = ["white"] * width
+    occupied = [False] * width
+    for idx in order:
+        label = str(labels[idx] or "")
+        if not label:
+            continue
+        label = label[:width]
+        center = idx * pitch + (bar_w // 2)
+        start = max(0, min(width - len(label), center - len(label) // 2))
+        end = start + len(label)
+        if any(occupied[max(0, start - 1):min(width, end + 1)]):
+            continue
+        style = "bold reverse" if idx == highlight_index else "white"
+        for pos, ch in enumerate(label, start):
+            chars[pos] = ch
+            occupied[pos] = True
+            styles[pos] = style
+
+    out = Text("  ")
+    i = 0
+    while i < width:
+        j = i
+        while j < width and styles[j] == styles[i]:
+            j += 1
+        out.append("".join(chars[i:j]), style=styles[i])
+        i = j
+    return out
+
+
+def _render_histogram(
+    values: list[float],
+    *,
+    labels: list[str],
+    available: int,
+    colors: list[str],
+    highlighted: list[bool] | None = None,
+    rows: int = 4,
+) -> _HistogramRender:
+    """Render a multi-row vertical bar chart.
+
+    Bars are stacked solid ``█`` blocks: every cell is a *full* block (which
+    renders flush in every terminal font), so bar height is encoded by how many
+    rows are filled from the bottom — never by partial-height glyphs (``▁▂▄``),
+    which some fonts center vertically and make look like they float.
+
+    Heights and colors are normalized over the *non-zero data range*
+    (``min``→``max`` maps to ``1``→``rows``) rather than ``0``→``max``. Activity
+    that clusters in a high, narrow band (typical for daily/hourly cost) would
+    otherwise round to the same one or two heights; spreading it over the full
+    range makes the differences visible. Absolute totals live in the peak/total
+    captions.
+    """
+    bar_w, gap_w, strip_width = _histogram_layout(len(values), available)
+    nonzero = [v for v in values if v > 0]
+    v_min = min(nonzero) if nonzero else 0.0
+    v_max = max(nonzero) if nonzero else 0.0
+    span = v_max - v_min
+    highlight_flags = highlighted or [False] * len(values)
+    highlight_index = next((i for i, flag in enumerate(highlight_flags) if flag), None)
+
+    lines = [Text("  ") for _ in range(rows)]
+    for idx, value in enumerate(values):
+        if value <= 0 or v_max <= 0:
+            filled = 0
+            style = colors[0]
+        else:
+            norm = (value - v_min) / span if span > 0 else 1.0
+            filled = 1 + int(round(norm * (rows - 1)))
+            color_idx = max(1, min(len(colors) - 1, 1 + int(round(norm * (len(colors) - 2)))))
+            style = colors[color_idx]
+        for row, line in enumerate(lines):  # row 0 = top
+            if idx:
+                line.append(" " * gap_w, style="default")
+            lit = (rows - row) <= filled
+            line.append("█" * bar_w if lit else " " * bar_w, style=style if lit else "default")
+
+    bars = Group(*lines)
+    axis = _axis_from_layout(
+        labels, bar_w=bar_w, gap_w=gap_w, width=strip_width, highlight_index=highlight_index
+    )
+    return _HistogramRender(bars=bars, axis=axis, width=strip_width)
 
 
 # ── Widgets ───────────────────────────────────────────────────────────
@@ -149,6 +293,56 @@ class SummaryCell(Static):
         pct = (1 - ratio) * 100
         return (f"▼ -{pct:.0f}%", "bright_green")
 
+    @staticmethod
+    def _count_label(value: int, label: str, *, compact: bool) -> str:
+        number = fmt_tokens(value) if compact else f"{value:,}"
+        return f"{number} {label}"
+
+    def _stats_lines(self, available: int) -> list[tuple[tuple[str, str], ...]]:
+        """Return pre-wrapped stats rows that fit within the summary cell."""
+        width = available if available > 0 else 36
+        live = f"● {self.active} live" if self.active else ""
+
+        def parts(*, compact: bool) -> list[tuple[str, str]]:
+            return [
+                (self._count_label(self.sessions, "sess", compact=compact), "white"),
+                (self._count_label(self.requests, "req", compact=compact), "white"),
+                (self._count_label(self.turns, "turns", compact=compact), "white"),
+            ]
+
+        def line_len(line: list[tuple[str, str]]) -> int:
+            return sum(len(text) for text, _style in line)
+
+        def joined_line(items: list[tuple[str, str]]) -> list[tuple[str, str]]:
+            line: list[tuple[str, str]] = []
+            for idx, item in enumerate(items):
+                if idx:
+                    line.append((" · ", "white"))
+                line.append(item)
+            return line
+
+        for compact in (False, True):
+            inline = joined_line(parts(compact=compact))
+            if live:
+                inline_with_live = inline + [("  ", "white"), (live, "bold bright_green")]
+                if line_len(inline_with_live) <= width:
+                    return [tuple(inline_with_live)]
+            if line_len(inline) <= width:
+                rows = [tuple(inline)]
+                if live:
+                    rows.append(((live, "bold bright_green"),))
+                return rows
+
+        compact_parts = parts(compact=True)
+        first = joined_line(compact_parts[:2])
+        second = [compact_parts[2]]
+        if live and line_len(second + [("  ", "white"), (live, "bold bright_green")]) <= width:
+            second.extend([("  ", "white"), (live, "bold bright_green")])
+        rows = [tuple(first), tuple(second)]
+        if live and len(rows[-1]) == 1:
+            rows.append(((live, "bold bright_green"),))
+        return rows
+
     def render(self) -> Text:
         # Use ANSI named colors so we inherit the terminal's palette.
         label_style = (
@@ -169,32 +363,18 @@ class SummaryCell(Static):
         t.append(fmt_tokens(self.tokens), style="bold bright_cyan")
         if self.cache_pct is not None:
             t.append("  ·  Cache % ", style="white")
-            t.append(f"{self.cache_pct}%", style="bold bright_green")
+            t.append(f"{self.cache_pct}%", style=_cache_pct_style(self.cache_pct))
         t.append("\n")
-        # Sessions / requests / turns — inline if they fit, stacked otherwise.
-        parts = [f"{self.sessions:,} sess", f"{self.requests:,} req", f"{self.turns:,} turns"]
-        inline = " · ".join(parts)
-        live_str = f"● {self.active} live" if self.active else ""
-        # content_size.width accounts for padding; fall back to 30 if unknown.
+        # Sessions / requests / turns — fit deliberately so labels never wrap.
         try:
             avail = self.content_size.width
         except Exception:
-            avail = 30
-        need = len(inline) + (2 + len(live_str) if live_str else 0)
-        if avail >= need:
-            t.append(inline, style="white")
-            if live_str:
-                t.append("  ")
-                t.append(live_str, style="bold bright_green")
-        else:
-            t.append(parts[0], style="white")
-            t.append(" · ", style="white")
-            t.append(parts[1], style="white")
-            t.append(" · ", style="white")
-            t.append(parts[2], style="white")
-            if live_str:
+            avail = 36
+        for row_idx, row in enumerate(self._stats_lines(avail)):
+            if row_idx:
                 t.append("\n")
-                t.append(live_str, style="bold bright_green")
+            for text, style in row:
+                t.append(text, style=style)
         return t
 
 
@@ -203,7 +383,7 @@ class PeriodicHeatmap(Static):
 
     Renders (top to bottom):
         - token split line (input · output · cache read · cache write)
-        - flat histogram strip + axis labels
+        - histogram strip + axis labels
         - peak bucket summary (``peak <label>  <cost>  <tokens>``)
         - top 3 projects (``Top projects  <path> · $X (pct)``)
 
@@ -236,16 +416,6 @@ class PeriodicHeatmap(Static):
         self._providers = providers or []
         self._total_cost = total_cost
         self.refresh()
-
-    @staticmethod
-    def _truncate(text: str, width: int) -> str:
-        if width <= 0:
-            return ""
-        if len(text) <= width:
-            return text
-        if width <= 1:
-            return text[:width]
-        return text[: width - 1] + "…"
 
     @staticmethod
     def _fit_buckets(
@@ -282,29 +452,6 @@ class PeriodicHeatmap(Static):
             })
         return fitted
 
-    @classmethod
-    def _axis(cls, width: int, labels: list[str]) -> str:
-        if width <= 0 or not labels:
-            return ""
-        left = cls._truncate(labels[0], max(1, width))
-        right = cls._truncate(labels[-1], max(1, width))
-        mid = cls._truncate(labels[len(labels) // 2], max(1, width))
-
-        chars = [" "] * width
-        right_start = max(0, width - len(right))
-        for i, ch in enumerate(left[:width]):
-            chars[i] = ch
-        if right_start >= len(left) + 2:
-            for i, ch in enumerate(right):
-                chars[right_start + i] = ch
-
-        mid_start = max(0, width // 2 - len(mid) // 2)
-        mid_end = mid_start + len(mid)
-        if mid_start >= len(left) + 2 and mid_end <= right_start - 2:
-            for i, ch in enumerate(mid):
-                chars[mid_start + i] = ch
-        return "".join(chars).rstrip()
-
     def render(self) -> Group | Text:
         if not self._buckets:
             return Text("  (no data)", style="white")
@@ -320,12 +467,6 @@ class PeriodicHeatmap(Static):
         if not points:
             return Text("  (no data)", style="white")
 
-        n_points = len(points)
-        preferred_cell_w = 2 if n_points >= 20 else 4 if n_points >= 10 else 6
-        cell_w = max(1, min(preferred_cell_w, available // max(n_points, 1)))
-        strip_width = n_points * cell_w
-
-        blocks = ["·", "▁", "▂", "▃", "▄", "▅", "▆", "█"]
         colors = [
             "grey35",
             "dim green",
@@ -336,25 +477,12 @@ class PeriodicHeatmap(Static):
             "bold bright_green",
             "bold bright_green",
         ]
-        max_v = max((b.get("cost") or 0) for b in points) or 1.0
-
-        strip = Text("  ")
-        for b in points:
-            cost = b.get("cost") or 0
-            if cost <= 0:
-                level = 0
-            else:
-                level = max(1, int(round((cost / max_v) * (len(blocks) - 1))))
-            level = min(level, len(blocks) - 1)
-            style = colors[level]
-            if b.get("_highlighted"):
-                style = f"{style} reverse"
-            strip.append(blocks[level] * cell_w, style=style)
-
-        axis = Text("  ")
-        axis.append(
-            self._axis(strip_width, [str(b.get("label") or "") for b in points]),
-            style="white",
+        histogram = _render_histogram(
+            [b.get("cost") or 0 for b in points],
+            labels=[str(b.get("label") or "") for b in points],
+            available=available,
+            colors=colors,
+            highlighted=[bool(b.get("_highlighted")) for b in points],
         )
 
         buckets = self._buckets
@@ -385,24 +513,26 @@ class PeriodicHeatmap(Static):
         else:
             peak_line.append("peak —", style="white")
 
-        body: list[Text] = []
+        body: list[Text | Group] = []
 
         tsummary = _token_summary_block(self._totals)
         if tsummary is not None:
             body.append(tsummary)
 
-        body.append(strip)
-        body.append(axis)
+        body.append(histogram.bars)
+        body.append(histogram.axis)
         body.append(peak_line)
 
+        # Providers + Top projects share a single separator from the chart and
+        # sit back-to-back (each carries its own row label) to stay compact.
+        lists: list[Text] = []
         providers_block = _top_providers_block(
             self._providers,
             self._total_cost,
             total_unknown=_has_unknown_cost(self._totals),
         )
         if providers_block is not None:
-            body.append(Text(""))
-            body.extend(providers_block)
+            lists.extend(providers_block)
 
         projects_block = _top_projects_block(
             self._projects,
@@ -410,8 +540,11 @@ class PeriodicHeatmap(Static):
             total_unknown=_has_unknown_cost(self._totals),
         )
         if projects_block is not None:
+            lists.extend(projects_block)
+
+        if lists:
             body.append(Text(""))
-            body.extend(projects_block)
+            body.extend(lists)
 
         return Group(*body)
 
@@ -437,16 +570,6 @@ class TrendBlocks(Static):
         self.refresh()
 
     @staticmethod
-    def _truncate(text: str, width: int) -> str:
-        if width <= 0:
-            return ""
-        if len(text) <= width:
-            return text
-        if width <= 1:
-            return text[:width]
-        return text[: width - 1] + "…"
-
-    @staticmethod
     def _fit_points(data: list[tuple[str, float]], max_points: int) -> list[tuple[str, float]]:
         """Collapse older buckets only when the terminal is too narrow."""
         if max_points <= 0:
@@ -465,28 +588,6 @@ class TrendBlocks(Static):
             label = chunk[-1][0]
             fitted.append((label, sum(v for _label, v in chunk)))
         return fitted
-
-    def _axis(self, width: int, labels: list[str]) -> str:
-        if width <= 0 or not labels:
-            return ""
-        left = self._truncate(labels[0], max(1, width))
-        right = self._truncate(labels[-1], max(1, width))
-        mid = self._truncate(labels[len(labels) // 2], max(1, width))
-
-        chars = [" "] * width
-        right_start = max(0, width - len(right))
-        for i, ch in enumerate(left[:width]):
-            chars[i] = ch
-        if right_start >= len(left) + 2:
-            for i, ch in enumerate(right):
-                chars[right_start + i] = ch
-
-        mid_start = max(0, width // 2 - len(mid) // 2)
-        mid_end = mid_start + len(mid)
-        if mid_start >= len(left) + 2 and mid_end <= right_start - 2:
-            for i, ch in enumerate(mid):
-                chars[mid_start + i] = ch
-        return "".join(chars).rstrip()
 
     def render(self) -> Group | Text:
         if not self._data:
@@ -508,12 +609,6 @@ class TrendBlocks(Static):
         if not points:
             return Text(f"  No activity in the {self._span_label}.", style="white")
 
-        n = len(points)
-        preferred_cell_w = 2 if n >= 20 else 4 if n >= 10 else 6
-        cell_w = max(1, min(preferred_cell_w, available // max(n, 1)))
-        strip_width = n * cell_w
-
-        blocks = ["·", "▁", "▂", "▃", "▄", "▅", "▆", "█"]
         colors = [
             "grey35",
             "dim yellow",
@@ -524,23 +619,17 @@ class TrendBlocks(Static):
             "bold bright_yellow",
             "bold bright_yellow",
         ]
-        max_v = max(cost for _label, cost in points) or 1.0
-
-        strip = Text("  ")
-        for _label, cost in points:
-            if cost <= 0:
-                level = 0
-            else:
-                level = max(1, int(round((cost / max_v) * (len(blocks) - 1))))
-            level = min(level, len(blocks) - 1)
-            strip.append(blocks[level] * cell_w, style=colors[level])
-
-        axis = Text("  ")
-        axis.append(self._axis(strip_width, [label for label, _cost in points]), style="white")
+        histogram = _render_histogram(
+            [cost for _label, cost in points],
+            labels=[label for label, _cost in points],
+            available=available,
+            colors=colors,
+            rows=3,
+        )
 
         summary = self._summary(available)
 
-        rows = [strip, axis, summary]
+        rows = [histogram.bars, histogram.axis, summary]
         provider_line = self._provider_line(available)
         if provider_line is not None:
             rows.append(provider_line)
@@ -578,7 +667,7 @@ class TrendBlocks(Static):
     def _summary(self, available: int) -> Text:
         """Build the one-line summary, dropping segments that don't fit.
 
-        The chart panel is a fixed three rows (strip / axis / summary), so a
+        The chart panel has fixed rows (histogram / axis / summary), so a
         wrapped summary would overflow it. Lower-priority segments (total,
         then peak) drop off first on narrow terminals; "latest" is always
         shown.
@@ -618,22 +707,23 @@ def _token_summary_block(totals: dict) -> Group | None:
     """
     if not totals:
         return None
-    input_t = totals.get("input_tokens") or 0
-    output_t = totals.get("output_tokens") or 0
-    cache_r = totals.get("cache_read_tokens") or 0
-    cache_w = totals.get("cache_creation_tokens") or 0
-    total_t = input_t + output_t + cache_r + cache_w
+    summary = _token_summary(totals)
+    input_t = summary["input_tokens"]
+    output_t = summary["output_tokens"]
+    cache_r = summary["cache_read_tokens"]
+    cache_w = summary["cache_creation_tokens"]
+    total_t = summary["total_tokens"]
     if total_t == 0:
         return None
 
-    cache_pct = _cache_hit_rate(totals)
+    cache_pct = summary["cache_pct"]
 
     line_total = Text("  ")
     line_total.append("Token total ", style="white")
     line_total.append(fmt_tokens(total_t), style="bright_cyan")
     if cache_pct >= 0:
         line_total.append("  ·  Cache % ", style="white")
-        line_total.append(f"{cache_pct:.0f}%", style="bright_green")
+        line_total.append(f"{cache_pct:.0f}%", style=_cache_pct_style(cache_pct))
 
     line_split = Text("  ")
     line_split.append("Token ", style="white")
@@ -845,7 +935,7 @@ class Breakdown(Static):
             ("%", self._W_SHARE),
             ("In", self._W_IN),
             ("Out", self._W_OUT),
-            ("Cache read", self._W_CACHED),
+            ("Cache", self._W_CACHED),
             ("Cache%", self._W_PCT),
         ):
             t.append(f" {title:>{width}}", style="bold white")
@@ -861,14 +951,15 @@ class Breakdown(Static):
         share: str = "",
         cost_style: str = "bright_yellow",
     ) -> None:
-        cache_pct = _cache_hit_pct(row)
-        pct_str = f"{cache_pct}%" if cache_pct is not None else ""
+        cache_pct = _cache_hit_rate(row)
+        pct_str = f"{cache_pct:.0f}%" if cache_pct >= 0 else ""
+        pct_style = _cache_pct_style(cache_pct)
         t.append(f" {fmt_cost(cost, unknown=cost_unknown):>{self._W_COST}}", style=cost_style)
         t.append(f" {share:>{self._W_SHARE}}", style="white")
         t.append(f" {fmt_tokens(row.get('input') or 0):>{self._W_IN}}", style="bright_cyan")
         t.append(f" {fmt_tokens(row.get('output') or 0):>{self._W_OUT}}", style="bright_cyan")
         t.append(f" {fmt_tokens(row.get('cache') or 0):>{self._W_CACHED}}", style="bright_green")
-        t.append(f" {pct_str:>{self._W_PCT}}", style="bright_green")
+        t.append(f" {pct_str:>{self._W_PCT}}", style=pct_style)
         t.append("\n")
 
     @staticmethod
