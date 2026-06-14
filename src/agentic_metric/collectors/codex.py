@@ -25,8 +25,11 @@ _RECENT_ACTIVITY_SECONDS = 300
 class _SessionAccum:
     """Accumulator for incremental parsing of a single Codex session .jsonl file.
 
-    Key difference from Claude Code: token counts in ``total_token_usage``
-    are **cumulative**, so we overwrite rather than sum.
+    ``total_token_usage`` snapshots are cumulative. Newer Codex logs also carry
+    ``last_token_usage`` for the request that produced the snapshot; those
+    request-level values are the preferred billing source, while the cumulative
+    snapshot is used to skip repeated token_count events and to support older
+    logs that do not expose per-request usage.
     """
 
     __slots__ = (
@@ -42,6 +45,9 @@ class _SessionAccum:
         "output_tokens",
         "cache_read",
         "cache_create",
+        "_cum_output_tokens",
+        "_cum_cache_read",
+        "_cum_cache_create",
         "today_user_turns",
         "today_message_count",
         "today_input_tokens",
@@ -95,6 +101,9 @@ class _SessionAccum:
         self.output_tokens = 0
         self.cache_read = 0
         self.cache_create = 0
+        self._cum_output_tokens = 0
+        self._cum_cache_read = 0
+        self._cum_cache_create = 0
         self.today_user_turns = 0
         self.today_message_count = 0
         self.today_input_tokens = 0
@@ -192,6 +201,9 @@ class _SessionAccum:
         self.output_tokens = 0
         self.cache_read = 0
         self.cache_create = 0
+        self._cum_output_tokens = 0
+        self._cum_cache_read = 0
+        self._cum_cache_create = 0
         self.first_ts = ""
         self.last_ts = ""
         self.first_prompt = ""
@@ -370,7 +382,8 @@ class _SessionAccum:
             usage = info.get("total_token_usage", {})
             if not usage:
                 return
-            # Cumulative: overwrite, don't sum.
+            # total_token_usage is cumulative; last_token_usage, when present,
+            # is the request-level billing source.
             # OpenAI's ``input_tokens`` is the TOTAL (includes cached tokens),
             # whereas ``cached_input_tokens`` is the cached subset. Store the
             # non-cached portion as ``input_tokens`` so ``estimate_cost``
@@ -385,29 +398,38 @@ class _SessionAccum:
             cached = usage.get("cached_input_tokens")
             out = usage.get("output_tokens")
             cache_create = usage.get("cache_creation_input_tokens")
-            prev_input = self.input_tokens
-            prev_output = self.output_tokens
-            prev_cache_read = self.cache_read
-            prev_cache_create = self.cache_create
+            event_tokens = _event_tokens_from_token_usage(info.get("last_token_usage"))
+            prev_raw_input = self.raw_input_tokens
+            prev_output = self._cum_output_tokens
+            prev_cache_read = self._cum_cache_read
+            prev_cache_create = self._cum_cache_create
             if out is not None:
-                self.output_tokens = max(out - self.fork_baseline_output, 0)
+                self._cum_output_tokens = max(out - self.fork_baseline_output, 0)
             if raw_input is not None:
                 self.raw_input_tokens = max(raw_input - self.fork_baseline_raw_input, 0)
             if cached is not None:
-                self.cache_read = max(cached - self.fork_baseline_cache_read, 0)
+                self._cum_cache_read = max(cached - self.fork_baseline_cache_read, 0)
             if cache_create is not None:
-                self.cache_create = max(cache_create - self.fork_baseline_cache_create, 0)
-            if raw_input is not None or cached is not None:
-                self.input_tokens = max(self.raw_input_tokens - self.cache_read, 0)
-            d_input = self.input_tokens - prev_input
-            d_output = self.output_tokens - prev_output
-            d_cache_read = self.cache_read - prev_cache_read
-            d_cache_create = self.cache_create - prev_cache_create
-            if d_input or d_output or d_cache_read or d_cache_create:
-                event_cost = _event_cost_from_token_usage(
-                    self.model,
-                    info.get("last_token_usage"),
+                self._cum_cache_create = max(cache_create - self.fork_baseline_cache_create, 0)
+            if event_tokens is not None:
+                cumulative_changed = (
+                    self.raw_input_tokens != prev_raw_input
+                    or self._cum_output_tokens != prev_output
+                    or self._cum_cache_read != prev_cache_read
+                    or self._cum_cache_create != prev_cache_create
                 )
+                d_input, d_output, d_cache_read, d_cache_create = (
+                    event_tokens if cumulative_changed else (0, 0, 0, 0)
+                )
+            else:
+                prev_input = max(prev_raw_input - prev_cache_read, 0)
+                current_input = max(self.raw_input_tokens - self._cum_cache_read, 0)
+                d_input = current_input - prev_input
+                d_output = self._cum_output_tokens - prev_output
+                d_cache_read = self._cum_cache_read - prev_cache_read
+                d_cache_create = self._cum_cache_create - prev_cache_create
+            if d_input or d_output or d_cache_read or d_cache_create:
+                event_cost = _event_cost_from_token_usage(self.model, info.get("last_token_usage"))
                 if event_cost is None:
                     event_cost = estimate_cost(
                         self.model,
@@ -417,6 +439,10 @@ class _SessionAccum:
                         cache_creation_tokens=d_cache_create,
                         apply_long_context=False,
                     )
+                self.input_tokens += d_input
+                self.output_tokens += d_output
+                self.cache_read += d_cache_read
+                self.cache_create += d_cache_create
                 self._add_usage_bucket(
                     ts,
                     input_tokens=d_input,
@@ -731,7 +757,7 @@ class CodexCollector(BaseCollector):
         if not sessions_dir.exists():
             return
 
-        sync_prefix = f"codex_jsonl:v7:{_sync_key_identity(self.provider, self.data_root)}:"
+        sync_prefix = f"codex_jsonl:v8:{_sync_key_identity(self.provider, self.data_root)}:"
 
         for jsonl_file in sessions_dir.rglob("rollout-*.jsonl"):
             sync_key = f"{sync_prefix}{jsonl_file}"
@@ -859,6 +885,21 @@ def _usage_rows_cost(rows: list[dict]) -> float | None:
 
 def _event_cost_from_token_usage(model: str, usage: object) -> float | None:
     """Estimate one Codex/OpenAI token-count event when last-token usage exists."""
+    tokens = _event_tokens_from_token_usage(usage)
+    if tokens is None:
+        return None
+    input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens = tokens
+    return estimate_cost(
+        model,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_read_tokens=cache_read_tokens,
+        cache_creation_tokens=cache_creation_tokens,
+    )
+
+
+def _event_tokens_from_token_usage(usage: object) -> tuple[int, int, int, int] | None:
+    """Return one Codex/OpenAI event's billable token buckets."""
     if not isinstance(usage, dict):
         return None
     if not any(k in usage for k in ("input_tokens", "output_tokens", "cached_input_tokens")):
@@ -867,13 +908,7 @@ def _event_cost_from_token_usage(model: str, usage: object) -> float | None:
     cached = int(usage.get("cached_input_tokens") or 0)
     output = int(usage.get("output_tokens") or 0)
     cache_create = int(usage.get("cache_creation_input_tokens") or 0)
-    return estimate_cost(
-        model,
-        input_tokens=max(raw_input - cached, 0),
-        output_tokens=output,
-        cache_read_tokens=cached,
-        cache_creation_tokens=cache_create,
-    )
+    return (max(raw_input - cached, 0), output, cached, cache_create)
 
 
 def _local_bucket(ts: str) -> tuple[str, int]:

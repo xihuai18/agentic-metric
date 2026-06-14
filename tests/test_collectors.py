@@ -361,7 +361,7 @@ def test_codex_history_sync_supports_same_root_provider_filters(tmp_path):
         ("openai-sid", "openai", data_root),
     ]
     assert db.conn.execute(
-        "SELECT COUNT(*) AS n FROM sync_state WHERE key LIKE 'codex_jsonl:v7:%'"
+        "SELECT COUNT(*) AS n FROM sync_state WHERE key LIKE 'codex_jsonl:v8:%'"
     ).fetchone()["n"] == 4
     db.close()
 
@@ -871,6 +871,149 @@ def test_codex_last_token_usage_drives_long_context_cost():
     assert abs(sum(r["estimated_cost_usd"] for r in accum.usage_bucket_rows()) - expected) < 1e-12
 
 
+def test_codex_last_token_usage_ignores_cumulative_counter_reset():
+    accum = CodexSessionAccum(Path("/tmp/fake.jsonl"), project_path="/test")
+    accum.model = "gpt-5.5"
+    accum._process_event_msg({
+        "type": "token_count",
+        "info": {
+            "total_token_usage": {
+                "input_tokens": 1_000,
+                "cached_input_tokens": 0,
+                "output_tokens": 100,
+            },
+            "last_token_usage": {
+                "input_tokens": 1_000,
+                "cached_input_tokens": 0,
+                "output_tokens": 100,
+            },
+        },
+    }, ts="2026-04-24T10:00:00Z")
+    accum._process_event_msg({
+        "type": "token_count",
+        "info": {
+            "total_token_usage": {
+                "input_tokens": 0,
+                "cached_input_tokens": 0,
+                "output_tokens": 0,
+            },
+            "last_token_usage": {
+                "input_tokens": 0,
+                "cached_input_tokens": 0,
+                "output_tokens": 0,
+            },
+        },
+    }, ts="2026-04-24T10:01:00Z")
+    accum._process_event_msg({
+        "type": "token_count",
+        "info": {
+            "total_token_usage": {
+                "input_tokens": 200,
+                "cached_input_tokens": 50,
+                "output_tokens": 20,
+            },
+            "last_token_usage": {
+                "input_tokens": 200,
+                "cached_input_tokens": 50,
+                "output_tokens": 20,
+            },
+        },
+    }, ts="2026-04-24T10:02:00Z")
+
+    rows = accum.usage_bucket_rows()
+    assert sum(r["input_tokens"] for r in rows) == 1_150
+    assert sum(r["output_tokens"] for r in rows) == 120
+    assert sum(r["cache_read_tokens"] for r in rows) == 50
+    expected = (
+        estimate_cost("gpt-5.5", input_tokens=1_000, output_tokens=100)
+        + estimate_cost(
+            "gpt-5.5",
+            input_tokens=150,
+            output_tokens=20,
+            cache_read_tokens=50,
+        )
+    )
+    assert abs(sum(r["estimated_cost_usd"] for r in rows) - expected) < 1e-12
+
+
+def test_codex_last_token_usage_skips_repeated_cumulative_snapshot():
+    accum = CodexSessionAccum(Path("/tmp/fake.jsonl"), project_path="/test")
+    accum.model = "gpt-5.5"
+    payload = {
+        "type": "token_count",
+        "info": {
+            "total_token_usage": {
+                "input_tokens": 1_000,
+                "cached_input_tokens": 200,
+                "output_tokens": 100,
+            },
+            "last_token_usage": {
+                "input_tokens": 1_000,
+                "cached_input_tokens": 200,
+                "output_tokens": 100,
+            },
+        },
+    }
+    accum._process_event_msg(payload, ts="2026-04-24T10:00:00Z")
+    accum._process_event_msg(payload, ts="2026-04-24T10:00:01Z")
+
+    rows = accum.usage_bucket_rows()
+    assert sum(r["input_tokens"] for r in rows) == 800
+    assert sum(r["output_tokens"] for r in rows) == 100
+    assert sum(r["cache_read_tokens"] for r in rows) == 200
+    expected = estimate_cost(
+        "gpt-5.5",
+        input_tokens=800,
+        output_tokens=100,
+        cache_read_tokens=200,
+    )
+    assert abs(sum(r["estimated_cost_usd"] for r in rows) - expected) < 1e-12
+
+
+def test_codex_cumulative_fallback_allows_negative_reclassification():
+    accum = CodexSessionAccum(Path("/tmp/fake.jsonl"), project_path="/test")
+    accum.model = "gpt-5.5"
+    accum._process_event_msg({
+        "type": "token_count",
+        "info": {
+            "total_token_usage": {
+                "input_tokens": 1_000,
+                "cached_input_tokens": 0,
+                "output_tokens": 100,
+            },
+        },
+    }, ts="2026-04-24T10:00:00Z")
+    accum._process_event_msg({
+        "type": "token_count",
+        "info": {
+            "total_token_usage": {
+                "input_tokens": 1_000,
+                "cached_input_tokens": 200,
+                "output_tokens": 100,
+            },
+        },
+    }, ts="2026-04-24T10:01:00Z")
+
+    rows = accum.usage_bucket_rows()
+    assert sum(r["input_tokens"] for r in rows) == 800
+    assert sum(r["cache_read_tokens"] for r in rows) == 200
+    expected = (
+        estimate_cost(
+            "gpt-5.5",
+            input_tokens=1_000,
+            output_tokens=100,
+            apply_long_context=False,
+        )
+        + estimate_cost(
+            "gpt-5.5",
+            input_tokens=-200,
+            cache_read_tokens=200,
+            apply_long_context=False,
+        )
+    )
+    assert abs(sum(r["estimated_cost_usd"] for r in rows) - expected) < 1e-12
+
+
 def test_codex_cumulative_fallback_does_not_apply_long_context_cost():
     accum = CodexSessionAccum(Path("/tmp/fake.jsonl"), project_path="/test")
     accum.model = "gpt-5.4"
@@ -1200,6 +1343,97 @@ def test_claude_history_sync_scans_subagent_jsonl(tmp_path):
         "AND agent_type = 'claude_code'"
     ).fetchall()
     assert [r["project_path"] for r in usage] == ["/tmp/project"]
+    db.close()
+
+
+def test_claude_history_sync_skips_replayed_subagent_assistant_usage(tmp_path):
+    projects = tmp_path / "projects"
+    subagents = projects / "-tmp-project" / "parent-session" / "subagents"
+    subagents.mkdir(parents=True)
+
+    def write_subagent(path: Path, prompt: str, extra_id: str | None = None) -> None:
+        lines = [
+            {
+                "timestamp": "2026-04-23T10:00:00Z",
+                "type": "user",
+                "cwd": "/tmp/project",
+                "message": {"content": prompt},
+            },
+            {
+                "timestamp": "2026-04-23T10:00:01Z",
+                "type": "assistant",
+                "cwd": "/tmp/project",
+                "message": {
+                    "id": "msg-replayed",
+                    "model": "claude-opus-4-8",
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 20,
+                        "cache_read_input_tokens": 300,
+                        "cache_creation_input_tokens": 40,
+                    },
+                },
+            },
+        ]
+        if extra_id:
+            lines.append(
+                {
+                    "timestamp": "2026-04-23T10:00:02Z",
+                    "type": "assistant",
+                    "cwd": "/tmp/project",
+                    "message": {
+                        "id": extra_id,
+                        "model": "claude-opus-4-8",
+                        "usage": {"input_tokens": 7, "output_tokens": 8},
+                    },
+                }
+            )
+        path.write_text("".join(json.dumps(line) + "\n" for line in lines))
+
+    write_subagent(subagents / "agent-a1.jsonl", "sub task 1")
+    write_subagent(subagents / "agent-a2.jsonl", "sub task 2", extra_id="msg-unique")
+
+    db = Database(db_path=str(tmp_path / "data.db"))
+    with patch("agentic_metric.collectors.claude_code.PROJECTS_DIR", projects):
+        ClaudeCodeCollector().sync_history(db)
+
+    rows = db.conn.execute(
+        """SELECT session_id, input_tokens, output_tokens,
+                  cache_read_tokens, cache_creation_tokens
+           FROM sessions
+           WHERE agent_type = 'claude_code'
+           ORDER BY session_id"""
+    ).fetchall()
+    assert [dict(row) for row in rows] == [
+        {
+            "session_id": "parent-session:agent-a1",
+            "input_tokens": 10,
+            "output_tokens": 20,
+            "cache_read_tokens": 300,
+            "cache_creation_tokens": 40,
+        },
+        {
+            "session_id": "parent-session:agent-a2",
+            "input_tokens": 7,
+            "output_tokens": 8,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 0,
+        },
+    ]
+    totals = db.conn.execute(
+        """SELECT SUM(input_tokens) AS input_tokens,
+                  SUM(output_tokens) AS output_tokens,
+                  SUM(cache_read_tokens) AS cache_read_tokens,
+                  SUM(cache_creation_tokens) AS cache_creation_tokens
+           FROM session_usage
+           WHERE agent_type = 'claude_code'"""
+    ).fetchone()
+    assert dict(totals) == {
+        "input_tokens": 17,
+        "output_tokens": 28,
+        "cache_read_tokens": 300,
+        "cache_creation_tokens": 40,
+    }
     db.close()
 
 

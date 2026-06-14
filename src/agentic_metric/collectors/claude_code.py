@@ -57,6 +57,7 @@ class _SessionAccum:
         "project_path",
         "session_id",
         "pid",
+        "_replayed_assistant_ids",
         "offset",
         "user_turns",
         "message_count",
@@ -85,11 +86,20 @@ class _SessionAccum:
         "usage_buckets",
     )
 
-    def __init__(self, file_path: Path, project_path: str, pid: int = 0) -> None:
+    def __init__(
+        self,
+        file_path: Path,
+        project_path: str,
+        pid: int = 0,
+        replayed_assistant_ids: set[str] | None = None,
+    ) -> None:
         self.file_path = file_path
         self.project_path = project_path
         self.session_id = file_path.stem
         self.pid = pid
+        self._replayed_assistant_ids = (
+            replayed_assistant_ids if replayed_assistant_ids is not None else set()
+        )
         self.offset = 0
         self.user_turns = 0
         self.message_count = 0
@@ -318,6 +328,8 @@ class _SessionAccum:
         elif entry_type == "assistant":
             msg = entry.get("message", {})
             msg_id = msg.get("id", "") if isinstance(msg, dict) else ""
+            if msg_id and msg_id in self._replayed_assistant_ids:
+                return
             msg_model = msg.get("model", "") if isinstance(msg, dict) else ""
             if msg_model and msg_model != "<synthetic>":
                 self.model = msg_model
@@ -814,17 +826,24 @@ class ClaudeCodeCollector(BaseCollector):
         # v7: usage buckets now record the real cwd instead of the on-disk
         # projects/ dir. Bumping the key forces a one-time re-parse so already
         # synced sessions get their project_path corrected without --rebuild.
-        sync_prefix = "cc_jsonl:v7:"
+        # v8: subagent JSONL files may replay parent assistant messages with
+        # identical message ids; parse a project tree once and skip replayed
+        # assistant usage across sibling files.
+        sync_prefix = "cc_jsonl:v8:"
 
         for project_dir in projects_dir.iterdir():
             if not project_dir.is_dir():
                 continue
 
             try:
-                jsonl_files = list(project_dir.rglob("*.jsonl"))
+                jsonl_files = sorted(
+                    project_dir.rglob("*.jsonl"),
+                    key=lambda path: (len(path.relative_to(project_dir).parts), str(path)),
+                )
             except OSError:
                 continue
 
+            seen_assistant_ids: set[str] = set()
             for jsonl_file in jsonl_files:
                 sync_key = f"{sync_prefix}{jsonl_file}"
                 prev_state = db.get_sync_state(sync_key)
@@ -847,10 +866,15 @@ class ClaudeCodeCollector(BaseCollector):
                 project_path = real_cwd if real_cwd else str(project_dir)
 
                 # Build an accumulator starting from the previous offset
-                accum = _SessionAccum(jsonl_file, project_path=project_path)
+                accum = _SessionAccum(
+                    jsonl_file,
+                    project_path=project_path,
+                    replayed_assistant_ids=seen_assistant_ids,
+                )
                 # First pass: read everything from scratch to get full picture
                 # (we need totals, not deltas, for upsert)
                 accum.read_new_lines()
+                seen_assistant_ids.update(accum.assistant_message_dates)
 
                 if accum.user_turns == 0:
                     # Mark as processed even if empty
