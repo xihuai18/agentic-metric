@@ -267,7 +267,7 @@ def get_remote_specs() -> list[RemoteSpec]:
     return remotes
 
 # Refresh intervals (seconds). Defaults can be overridden in CONFIG_FILE:
-#   { "intervals": { "live_refresh": 1, "data_sync": 300, "auto_refresh": 30 } }
+#   { "intervals": { "data_sync": 300, "auto_refresh": 30 } }
 def _interval(name: str, default: int) -> int:
     section = _load_config().get("intervals")
     if isinstance(section, dict):
@@ -277,6 +277,5 @@ def _interval(name: str, default: int) -> int:
     return default
 
 
-LIVE_REFRESH_INTERVAL = _interval("live_refresh", 1)  # running sessions
 DATA_SYNC_INTERVAL = _interval("data_sync", 300)  # history sync to sqlite
 AUTO_REFRESH_INTERVAL = _interval("auto_refresh", 30)  # TUI auto-refresh mode (toggled with R)

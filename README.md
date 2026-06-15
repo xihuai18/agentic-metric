@@ -12,18 +12,17 @@ A local and SSH remote monitoring tool for AI coding agents — like `top`, but 
 **Supported platforms: Linux, macOS, and Windows.**
 
 **All data stays under your control. No telemetry is sent anywhere.** By default
-the tool only reads local agent data files (`~/.claude/`, `~/.codex/`) and
-process info. If SSH remotes are configured, it reads those remote agent data
-files over SSH and caches a local copy for aggregation.
+the tool only reads local agent data files (`~/.claude/`, `~/.codex/`). If SSH
+remotes are configured, it reads those remote agent data files over SSH and
+caches a local copy for aggregation.
 
 ![Agentic Metric TUI](agentic-metric-screenshot.png)
 
 ## Features
 
-- **Live monitoring** — Detect running agent processes, incremental JSONL session parsing
 - **Cost estimation** — Per-model pricing table with CLI management, calculates API-equivalent costs; supports long-context and cache-duration pricing
 - **Unified report** — One `report` command for today / week / month / custom date range, with agent × provider × model breakdown, top projects, cost drivers, and hourly/daily/weekly heatmaps
-- **TUI dashboard** — Terminal UI with live refresh, stacked summary cells, heatmap strip, 30-day cost chart, and agent → provider → model breakdown
+- **TUI dashboard** — Terminal UI with auto-refresh, stacked summary cells, heatmap strip, 30-day cost chart, and agent → provider → model breakdown
 - **Multi-agent** — Plugin architecture; supports Claude Code and Codex today, extensible
 
 ## Agent Data Coverage
@@ -41,7 +40,6 @@ files over SSH and caches a local copy for aggregation.
 | Message count | ✓ | ✓ |
 | First/last prompt | ✓ | ✓ |
 | Cost estimation | ✓ | ✓ |
-| Live active status | ✓ | ✓ |
 
 > ¹ Codex exposes cache-read tokens only; cache-write is not reported. Codex's
 > `input_tokens` already includes cached tokens, so the collector stores
@@ -166,7 +164,7 @@ Shown in the footer as: `PgUp/PgDn Range · ←→ View · . Now · r Auto-refre
 | `PageUp` / `PageDown` | Range | Move time range earlier / later |
 | `.` | Now | Jump back to "now" (reset offset) |
 | `↑` / `↓` | — | Scroll the breakdown panel |
-| `r` | Auto-refresh | Toggle fast auto-refresh ("live" sync); pauses the slow periodic sync while active |
+| `r` | Auto-refresh | Toggle fast auto-refresh; pauses the slow periodic sync while active |
 | `p` | Pricing | Open the read-only pricing view (flags unknown models in range) |
 | `?` | Help | Show the keybinding cheatsheet |
 | `q` | Quit | Quit |
@@ -179,7 +177,7 @@ panel shows provider totals over the longer trend window.
 Refresh intervals can be overridden in the config file (`$DATA/agentic_metric/config.json`):
 
 ```json
-{ "intervals": { "live_refresh": 1, "data_sync": 300, "auto_refresh": 30 } }
+{ "intervals": { "data_sync": 300, "auto_refresh": 30 } }
 ```
 
 ## Builtin Model Pricing
@@ -246,15 +244,13 @@ Run `agentic-metric pricing list` for the full table including your overrides.
 src/agentic_metric/
 ├── cli.py              # Typer CLI commands and Rich report rendering
 ├── config.py           # Platform paths, collector roots, SSH remote specs
-├── models.py           # Data classes (LiveSession, TodayOverview, DailyTrend)
 ├── pricing.py          # Builtin + user pricing, cost estimation engine
 ├── formatting.py       # Pure formatting helpers (cost/tokens, source/host labels)
 ├── collectors/
 │   ├── __init__.py     # Collector registry and base class
-│   ├── claude_code.py  # Claude Code JSONL parser and process detector
-│   ├── codex.py        # Codex JSONL parser and process detector
-│   ├── remote.py       # SSH-backed wrapper: mirror a remote root, then parse
-│   └── _process.py     # Cross-platform process detection (psutil/tasklist)
+│   ├── claude_code.py  # Claude Code JSONL history parser
+│   ├── codex.py        # Codex JSONL history parser
+│   └── remote.py       # SSH-backed wrapper: mirror a remote root, then parse
 ├── store/
 │   ├── __init__.py
 │   ├── database.py     # SQLite database (sessions, session_usage buckets)
@@ -270,11 +266,11 @@ src/agentic_metric/
 
 ### Data flow
 
-1. **Collectors** read agent data files (`~/.claude/`, `~/.codex/`) and emit `LiveSession` objects.
+1. **Collectors** read agent data files (`~/.claude/`, `~/.codex/`) and sync session history into the database.
 2. **Database** stores sessions and per-day `session_usage` buckets in SQLite.
 3. **Aggregator** runs SQL queries for reports (range totals, heatmaps, breakdowns by agent/model/project).
-4. **CLI** renders Rich tables and panels. **TUI** uses Textual for a live dashboard.
-5. **Pricing** engine calculates costs per-event (long-context aware) or per-session.
+4. **CLI** renders Rich tables and panels. **TUI** uses Textual for the dashboard.
+5. **Pricing** engine calculates costs per-event (long-context aware).
 
 ## Data Sources
 
@@ -288,9 +284,7 @@ Paths differ by platform. `$DATA` refers to:
 |-------|------|------|
 | Claude Code | `~/.claude/projects/` | JSONL sessions, token usage, model, branch |
 | Claude Code | `~/.claude/stats-cache.json` | Daily activity stats |
-| Claude Code | Process detection | Running status, working directory |
 | Codex | `~/.codex/sessions/` | JSONL sessions, token usage, model |
-| Codex | Process detection | Running status, working directory |
 
 By default, Claude Code honors `CLAUDE_CONFIG_DIR` and Codex honors
 `CODEX_HOME`. To scan multiple roots, assign a provider explicitly, or include

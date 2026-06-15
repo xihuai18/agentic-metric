@@ -184,18 +184,14 @@ def _render_histogram(
     rows are filled from the bottom — never by partial-height glyphs (``▁▂▄``),
     which some fonts center vertically and make look like they float.
 
-    Heights and colors are normalized over the *non-zero data range*
-    (``min``→``max`` maps to ``1``→``rows``) rather than ``0``→``max``. Activity
-    that clusters in a high, narrow band (typical for daily/hourly cost) would
-    otherwise round to the same one or two heights; spreading it over the full
-    range makes the differences visible. Absolute totals live in the peak/total
-    captions.
+    Both bar height (filled rows) and color intensity are proportional to the
+    peak (``value / max``), so a bar honestly represents its value relative to
+    the busiest bucket: taller is always brighter, never the reverse. Color has
+    finer granularity than the row count, so it still separates bars that round
+    to the same height. Absolute totals live in the peak/total captions.
     """
     bar_w, gap_w, strip_width = _histogram_layout(len(values), available)
-    nonzero = [v for v in values if v > 0]
-    v_min = min(nonzero) if nonzero else 0.0
-    v_max = max(nonzero) if nonzero else 0.0
-    span = v_max - v_min
+    v_max = max(values) if values else 0
     highlight_flags = highlighted or [False] * len(values)
     highlight_index = next((i for i, flag in enumerate(highlight_flags) if flag), None)
 
@@ -205,9 +201,9 @@ def _render_histogram(
             filled = 0
             style = colors[0]
         else:
-            norm = (value - v_min) / span if span > 0 else 1.0
-            filled = 1 + int(round(norm * (rows - 1)))
-            color_idx = max(1, min(len(colors) - 1, 1 + int(round(norm * (len(colors) - 2)))))
+            ratio = value / v_max
+            filled = max(1, min(rows, int(round(ratio * rows))))
+            color_idx = max(1, min(len(colors) - 1, int(round(ratio * (len(colors) - 1)))))
             style = colors[color_idx]
         for row, line in enumerate(lines):  # row 0 = top
             if idx:
@@ -238,7 +234,6 @@ class SummaryCell(Static):
         self.requests = 0
         self.tokens = 0
         self.cache_pct: int | None = None
-        self.active = 0
         self.prev_cost: float | None = None
         self.prev_cost_unknown = False
         self.focused_view = False
@@ -253,7 +248,7 @@ class SummaryCell(Static):
 
     def update_data(
         self, cost: float, sessions: int, tokens: int,
-        active: int = 0, prev_cost: float | None = None,
+        prev_cost: float | None = None,
         cost_unknown: bool = False,
         prev_cost_unknown: bool = False,
         turns: int = 0,
@@ -267,7 +262,6 @@ class SummaryCell(Static):
         self.requests = requests
         self.tokens = tokens
         self.cache_pct = cache_pct
-        self.active = active
         self.prev_cost = prev_cost
         self.prev_cost_unknown = prev_cost_unknown
         self.refresh()
@@ -301,7 +295,6 @@ class SummaryCell(Static):
     def _stats_lines(self, available: int) -> list[tuple[tuple[str, str], ...]]:
         """Return pre-wrapped stats rows that fit within the summary cell."""
         width = available if available > 0 else 36
-        live = f"● {self.active} live" if self.active else ""
 
         def parts(*, compact: bool) -> list[tuple[str, str]]:
             return [
@@ -323,25 +316,13 @@ class SummaryCell(Static):
 
         for compact in (False, True):
             inline = joined_line(parts(compact=compact))
-            if live:
-                inline_with_live = inline + [("  ", "white"), (live, "bold bright_green")]
-                if line_len(inline_with_live) <= width:
-                    return [tuple(inline_with_live)]
             if line_len(inline) <= width:
-                rows = [tuple(inline)]
-                if live:
-                    rows.append(((live, "bold bright_green"),))
-                return rows
+                return [tuple(inline)]
 
         compact_parts = parts(compact=True)
         first = joined_line(compact_parts[:2])
         second = [compact_parts[2]]
-        if live and line_len(second + [("  ", "white"), (live, "bold bright_green")]) <= width:
-            second.extend([("  ", "white"), (live, "bold bright_green")])
-        rows = [tuple(first), tuple(second)]
-        if live and len(rows[-1]) == 1:
-            rows.append(((live, "bold bright_green"),))
-        return rows
+        return [tuple(first), tuple(second)]
 
     def render(self) -> Text:
         # Use ANSI named colors so we inherit the terminal's palette.

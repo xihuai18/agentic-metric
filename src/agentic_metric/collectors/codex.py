@@ -1,16 +1,13 @@
-"""Codex CLI collector: parse session JSONL files + live process monitoring."""
+"""Codex CLI collector: parse session JSONL files into history."""
 
 from __future__ import annotations
 
 import hashlib
 import json
-import platform
-import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from pathlib import Path
 
 from ..config import CODEX_SESSIONS_DIR
-from ..models import LiveSession
 from ..pricing import estimate_cost
 from ..usage import (
     estimate_token_usage_cost,
@@ -18,10 +15,6 @@ from ..usage import (
     normalize_openai_usage,
 )
 from . import BaseCollector
-from ._process import get_running_cwds, normalize_cwd_key
-
-
-_RECENT_ACTIVITY_SECONDS = 300
 
 
 # ── Incremental JSONL accumulator ────────────────────────────────────────
@@ -41,7 +34,6 @@ class _SessionAccum:
         "file_path",
         "project_path",
         "session_id",
-        "pid",
         "offset",
         "user_turns",
         "message_count",
@@ -92,14 +84,12 @@ class _SessionAccum:
         self,
         file_path: Path,
         project_path: str,
-        pid: int = 0,
         provider: str = "",
         data_root: str = "",
     ) -> None:
         self.file_path = file_path
         self.project_path = project_path
         self.session_id = ""
-        self.pid = pid
         self.offset = 0
         self.user_turns = 0
         self.message_count = 0
@@ -588,236 +578,6 @@ class _SessionAccum:
         if total is not None:
             self.fork_baseline_total_tokens = total
 
-    def to_live_session(self) -> LiveSession:
-        return LiveSession(
-            session_id=self.session_id or self.file_path.stem,
-            agent_type="codex",
-            project_path=self.project_path,
-            provider=self.provider,
-            data_root=self.data_root,
-            git_branch=self.git_branch,
-            model=self.model,
-            message_count=self.message_count,
-            user_turns=self.user_turns,
-            input_tokens=self.input_tokens,
-            output_tokens=self.output_tokens,
-            cache_read_tokens=self.cache_read,
-            cache_creation_tokens=self.cache_create,
-            cache_creation_1h_tokens=0,
-            started=self.first_ts,
-            last_active=self.last_ts,
-            first_prompt=self.first_prompt,
-            last_prompt=self.last_prompt,
-            pid=self.pid,
-            today_input_tokens=self.today_input_tokens,
-            today_output_tokens=self.today_output_tokens,
-            today_cache_read_tokens=self.today_cache_read,
-            today_cache_creation_tokens=self.today_cache_create,
-            today_cache_creation_1h_tokens=0,
-            today_user_turns=self.today_user_turns,
-            today_message_count=self.today_message_count,
-        )
-
-
-# ── Live monitor ─────────────────────────────────────────────────────────
-
-
-class _LiveMonitor:
-    """Monitors running Codex sessions with incremental JSONL parsing.
-
-    Uses process detection to find running ``codex`` processes, then
-    matches their CWDs to today's session files under
-    ``~/.codex/sessions/YYYY/MM/DD/``.
-    """
-
-    def __init__(
-        self,
-        sessions_dir: Path | None = None,
-        provider: str = "",
-        data_root: str = "",
-    ) -> None:
-        self.sessions_dir = sessions_dir
-        self.provider = provider.strip()
-        self.data_root = data_root
-        self._accums: dict[Path, _SessionAccum] = {}
-
-    def _sessions_dir(self) -> Path:
-        return self.sessions_dir or CODEX_SESSIONS_DIR
-
-    def refresh(self) -> list[LiveSession]:
-        """Return currently running sessions."""
-        pid_cwds: dict[int, str] = get_running_cwds("codex", exact=True)
-        if not pid_cwds:
-            if platform.system() == "Windows":
-                return self._refresh_recent_files()
-            return []
-
-        cwd_to_pids: dict[str, list[int]] = {}
-        cwd_display: dict[str, str] = {}
-        for pid, cwd in pid_cwds.items():
-            key = normalize_cwd_key(cwd)
-            if not key:
-                continue
-            cwd_to_pids.setdefault(key, []).append(pid)
-            cwd_display.setdefault(key, cwd)
-        if not cwd_to_pids:
-            return []
-
-        today = date.today()
-        candidate_files: dict[Path, float] = {}
-        sessions_dir = self._sessions_dir()
-        for day_offset in range(3):
-            day = today - timedelta(days=day_offset)
-            day_dir = sessions_dir / str(day.year) / f"{day.month:02d}" / f"{day.day:02d}"
-            if not day_dir.is_dir():
-                continue
-            try:
-                for jsonl_file in day_dir.glob("rollout-*.jsonl"):
-                    candidate_files[jsonl_file] = jsonl_file.stat().st_mtime
-            except OSError:
-                continue
-
-        for jsonl_file in list(self._accums):
-            if not jsonl_file.exists():
-                continue
-            try:
-                candidate_files[jsonl_file] = jsonl_file.stat().st_mtime
-            except OSError:
-                continue
-
-        cwd_to_files = self._files_by_active_cwd(candidate_files, cwd_to_pids)
-        missing_cwds = set(cwd_to_pids) - set(cwd_to_files)
-        if missing_cwds and sessions_dir.exists():
-            try:
-                for jsonl_file in sessions_dir.rglob("rollout-*.jsonl"):
-                    if jsonl_file in candidate_files:
-                        continue
-                    cwd = normalize_cwd_key(self._read_cwd(jsonl_file))
-                    if cwd not in missing_cwds:
-                        continue
-                    try:
-                        candidate_files[jsonl_file] = jsonl_file.stat().st_mtime
-                    except OSError:
-                        continue
-            except OSError:
-                pass
-            cwd_to_files = self._files_by_active_cwd(candidate_files, cwd_to_pids)
-
-        if not cwd_to_files:
-            return []
-
-        results: list[LiveSession] = []
-        active_files: set[Path] = set()
-
-        for cwd, pids in cwd_to_pids.items():
-            files = cwd_to_files.get(cwd, [])
-            if not files:
-                continue
-            for idx, jsonl_file in enumerate(files[: max(1, len(pids))]):
-                if jsonl_file in active_files:
-                    continue
-                active_files.add(jsonl_file)
-
-                pid = pids[idx] if idx < len(pids) else 0
-                accum = self._accums.get(jsonl_file)
-                if accum is None:
-                    accum = _SessionAccum(
-                        jsonl_file,
-                        cwd_display.get(cwd, cwd),
-                        pid=pid,
-                        provider=self.provider,
-                        data_root=self.data_root,
-                    )
-                    self._accums[jsonl_file] = accum
-                else:
-                    accum.pid = pid
-
-                accum.read_new_lines()
-                if accum.user_turns > 0 and accum.matches_configured_provider():
-                    results.append(accum.to_live_session())
-
-        # Prune stale accumulators
-        stale = [k for k in self._accums if k not in active_files]
-        for k in stale:
-            del self._accums[k]
-
-        results.sort(key=lambda s: s.last_active, reverse=True)
-        return results
-
-    def _refresh_recent_files(self) -> list[LiveSession]:
-        """Windows fallback when process CWD lookup is unavailable."""
-        sessions_dir = self._sessions_dir()
-        if not sessions_dir.exists():
-            return []
-        cutoff = time.time() - _RECENT_ACTIVITY_SECONDS
-        candidates: list[tuple[float, Path]] = []
-        try:
-            for jsonl_file in sessions_dir.rglob("rollout-*.jsonl"):
-                try:
-                    mtime = jsonl_file.stat().st_mtime
-                    if mtime >= cutoff:
-                        candidates.append((mtime, jsonl_file))
-                except OSError:
-                    continue
-        except OSError:
-            return []
-
-        results: list[LiveSession] = []
-        active_files: set[Path] = set()
-        for _mtime, jsonl_file in sorted(candidates, key=lambda item: item[0], reverse=True):
-            active_files.add(jsonl_file)
-            accum = self._accums.get(jsonl_file)
-            if accum is None:
-                accum = _SessionAccum(
-                    jsonl_file,
-                    project_path="",
-                    provider=self.provider,
-                    data_root=self.data_root,
-                )
-                self._accums[jsonl_file] = accum
-            accum.read_new_lines()
-            if accum.user_turns > 0 and accum.matches_configured_provider():
-                results.append(accum.to_live_session())
-
-        stale = [k for k in self._accums if k not in active_files]
-        for k in stale:
-            del self._accums[k]
-        results.sort(key=lambda s: s.last_active, reverse=True)
-        return results
-
-    @staticmethod
-    def _files_by_active_cwd(
-        candidate_files: dict[Path, float],
-        cwd_to_pids: dict[str, list[int]],
-    ) -> dict[str, list[Path]]:
-        """Group candidate JSONL files by active process CWD, newest first."""
-        cwd_to_files: dict[str, list[Path]] = {}
-        jsonl_files = sorted(candidate_files, key=lambda f: candidate_files[f], reverse=True)
-        for jsonl_file in jsonl_files:
-            cwd = normalize_cwd_key(_LiveMonitor._read_cwd(jsonl_file))
-            if not cwd or cwd not in cwd_to_pids:
-                continue
-            cwd_to_files.setdefault(cwd, []).append(jsonl_file)
-        return cwd_to_files
-
-    @staticmethod
-    def _read_cwd(jsonl_file: Path) -> str:
-        """Extract cwd from the session_meta entry in a JSONL file."""
-        try:
-            with open(jsonl_file) as f:
-                for i, line in enumerate(f):
-                    if i > 10:
-                        break
-                    try:
-                        entry = json.loads(line)
-                        if entry.get("type") == "session_meta":
-                            return entry.get("payload", {}).get("cwd", "")
-                    except json.JSONDecodeError:
-                        continue
-        except OSError:
-            pass
-        return ""
-
 
 # ── Collector implementation ─────────────────────────────────────────────
 
@@ -825,8 +585,7 @@ class _LiveMonitor:
 class CodexCollector(BaseCollector):
     """Collector for OpenAI Codex CLI agent data.
 
-    - Live sessions: process detection + incremental JSONL parsing
-    - History sync: walk all session JSONL files
+    History sync: walk all session JSONL files.
     """
 
     agent_type = "codex"
@@ -841,17 +600,9 @@ class CodexCollector(BaseCollector):
         self.provider = provider.strip()
         self.data_root = data_root
         self.agent_type = "codex"
-        self._monitor = _LiveMonitor(
-            sessions_dir,
-            provider=self.provider,
-            data_root=self.data_root,
-        )
 
     def _sessions_dir(self) -> Path:
         return self.sessions_dir or CODEX_SESSIONS_DIR
-
-    def get_live_sessions(self) -> list[LiveSession]:
-        return self._monitor.refresh()
 
     def sync_history(self, db) -> None:
         """Sync Codex session history into the database."""

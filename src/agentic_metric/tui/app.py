@@ -14,10 +14,9 @@ from textual.widgets import Footer, Header
 from textual.widgets._footer import FooterKey
 
 from ..collectors import CollectorRegistry, create_default_registry
-from ..config import AUTO_REFRESH_INTERVAL, DATA_SYNC_INTERVAL, LIVE_REFRESH_INTERVAL
+from ..config import AUTO_REFRESH_INTERVAL, DATA_SYNC_INTERVAL
 from ..formatting import cache_hit_rate as _cache_hit_rate
 from ..formatting import source_label as _source_label
-from ..models import LiveSession
 from ..store.aggregator import (
     get_heatmap,
     get_range_by_agent_model,
@@ -168,7 +167,6 @@ class AgenticMetricApp(App):
         self._collectors: CollectorRegistry = collectors or create_default_registry()
         self._sync_on_mount = sync_on_mount
         self._show_clock = show_clock
-        self._live_sessions: list[LiveSession] = []
         self._today_sessions: list[dict] = []
         self._focus: str = "today"
         self._offset: int = 0  # 0 = current period; N = N units in the past
@@ -197,7 +195,6 @@ class AgenticMetricApp(App):
         self.sub_title = "syncing…" if self._sync_on_mount else "demo data"
         self._populate_all()
         if self._sync_on_mount:
-            self.set_interval(LIVE_REFRESH_INTERVAL, self._tick_live)
             self._sync_timer = self.set_interval(DATA_SYNC_INTERVAL, self._tick_sync)
             self.run_worker(
                 self._initial_sync_worker,
@@ -280,7 +277,6 @@ class AgenticMetricApp(App):
         self.query_one("#heatmap-panel", Vertical).border_title = title
 
     def _populate_summary(self) -> None:
-        active_count = self._count_active()
         for kind, cell_id in (
             ("today", "#cell-today"),
             ("week", "#cell-week"),
@@ -308,7 +304,6 @@ class AgenticMetricApp(App):
             cell.label = _summary_label(kind, label, cell_offset)
             cell.update_data(
                 cost, sess, tokens,
-                active=active_count if kind == "today" and cell_offset == 0 else 0,
                 prev_cost=prev_cost,
                 cost_unknown=cost_unknown,
                 prev_cost_unknown=prev_cost_unknown,
@@ -444,43 +439,6 @@ class AgenticMetricApp(App):
             f"By host → agent → provider → model — {label} ({frm} → {to})"
         )
         self.query_one("#breakdown-body", Breakdown).update_data(groups, total_cost)
-
-    # ── Counters ──────────────────────────────────────────────────────
-
-    def _count_active(self) -> int:
-        return sum(
-            1 for s in self._live_sessions
-            if s.user_turns > 0 or s.output_tokens > 0
-        )
-
-    # ── Live refresh (1 s) ────────────────────────────────────────────
-
-    def _tick_live(self) -> None:
-        self.run_worker(self._live_worker, thread=True, exclusive=True, group="live")
-
-    async def _live_worker(self) -> None:
-        try:
-            sessions = self._collectors.get_live_sessions()
-        except Exception:
-            sessions = []
-        self.call_from_thread(self._on_live_update, sessions)
-
-    def _on_live_update(self, sessions: list[LiveSession]) -> None:
-        self._live_sessions = sessions
-        # Only the TODAY cell's active count needs refreshing each second.
-        if self._focus == "today" and self._offset > 0:
-            return
-        cell = self.query_one("#cell-today", SummaryCell)
-        cell.update_data(
-            cell.cost, cell.sessions, cell.tokens,
-            active=self._count_active(),
-            prev_cost=cell.prev_cost,
-            cost_unknown=cell.cost_unknown,
-            prev_cost_unknown=cell.prev_cost_unknown,
-            turns=cell.turns,
-            requests=cell.requests,
-            cache_pct=cell.cache_pct,
-        )
 
     # ── Periodic sync (5 min) ─────────────────────────────────────────
 

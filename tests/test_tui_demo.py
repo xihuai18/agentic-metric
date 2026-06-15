@@ -15,7 +15,6 @@ from rich.console import Console
 from rich.terminal_theme import MONOKAI
 
 from agentic_metric.collectors import CollectorRegistry
-from agentic_metric.models import LiveSession
 from agentic_metric.store.database import Database
 from agentic_metric.tui.app import AgenticMetricApp
 
@@ -34,35 +33,7 @@ class DemoDateTime(datetime):
 
 
 class DemoCollectors(CollectorRegistry):
-    """Deterministic live sessions for the screenshot demo."""
-
-    def get_live_sessions(self) -> list[LiveSession]:
-        return [
-            LiveSession(
-                session_id="live-codex-demo",
-                agent_type="codex",
-                provider="openai",
-                data_root="/demo/.codex",
-                project_path="/workspace/web-app",
-                model="gpt-5.3-codex",
-                message_count=22,
-                user_turns=9,
-                output_tokens=11_400,
-                last_active="2026-06-14T16:29:30+08:00",
-            ),
-            LiveSession(
-                session_id="live-claude-demo",
-                agent_type="claude_code",
-                provider="anthropic",
-                data_root="ssh://orion/home/dev/.claude",
-                project_path="/workspace/ml-pipeline",
-                model="claude-opus-4-8",
-                message_count=16,
-                user_turns=7,
-                output_tokens=8_300,
-                last_active="2026-06-14T16:28:10+08:00",
-            ),
-        ]
+    """Deterministic collector registry for the screenshot demo."""
 
     def sync_all(self, db) -> None:
         return None
@@ -382,7 +353,6 @@ async def _render_demo_png(tmp_path: Path) -> Path:
     app.ansi_theme_dark = MONOKAI
     try:
         async with app.run_test(size=(132, 58), notifications=False) as pilot:
-            app._on_live_update(app._collectors.get_live_sessions())
             await pilot.pause()
             lines = _capture_screen_lines(app)
     finally:

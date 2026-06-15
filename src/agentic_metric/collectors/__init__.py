@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from ..models import LiveSession
-
 
 class BaseCollector(ABC):
     """Abstract base class for agent collectors."""
@@ -14,10 +12,6 @@ class BaseCollector(ABC):
     @abstractmethod
     def agent_type(self) -> str:
         """Unique identifier for this agent type (e.g., 'claude_code')."""
-
-    @abstractmethod
-    def get_live_sessions(self) -> list[LiveSession]:
-        """Return currently active sessions."""
 
     @abstractmethod
     def sync_history(self, db) -> None:
@@ -35,17 +29,6 @@ class CollectorRegistry:
 
     def get_all(self) -> list[BaseCollector]:
         return list(self._collectors)
-
-    def get_live_sessions(self) -> list[LiveSession]:
-        """Get live sessions from all registered collectors."""
-        sessions: list[LiveSession] = []
-        for collector in self._collectors:
-            try:
-                sessions.extend(collector.get_live_sessions())
-            except Exception:
-                pass
-        sessions.sort(key=lambda s: s.last_active, reverse=True)
-        return sessions
 
     def sync_all(self, db) -> None:
         """Sync all collectors' history into the database."""

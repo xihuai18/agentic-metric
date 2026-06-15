@@ -12,17 +12,16 @@
 **支持平台:Linux、macOS 和 Windows。**
 
 **所有数据都在你的控制范围内,不会发送遥测。** 默认情况下工具仅读取本机的
-agent 数据文件(`~/.claude/`、`~/.codex/`)和进程信息;如果配置了 SSH
+agent 数据文件(`~/.claude/`、`~/.codex/`);如果配置了 SSH
 远程,会通过 SSH 读取远程 agent 数据文件,并缓存到本机后参与汇总。
 
 ![Agentic Metric TUI](agentic-metric-screenshot.png)
 
 ## 功能
 
-- **实时监控** — 检测运行中的 agent 进程,增量解析 JSONL 会话数据
 - **成本估算** — 基于各模型定价表计算 API 等效成本,支持 CLI 管理定价;支持长上下文和缓存时长定价
 - **统一的用量报告** — 单个 `report` 命令覆盖今日 / 本周 / 本月 / 自定义区间,含 agent × provider × model 明细、项目排行、cost drivers、小时/天/周热图
-- **TUI 仪表盘** — 终端图形界面,实时刷新,含汇总卡片、热图条、30 天成本柱图、agent → provider → model 分解
+- **TUI 仪表盘** — 终端图形界面,自动刷新,含汇总卡片、热图条、30 天成本柱图、agent → provider → model 分解
 - **多 Agent 支持** — 插件架构;目前支持 Claude Code 和 Codex,可扩展
 
 ## 各 Agent 指标覆盖情况
@@ -40,7 +39,6 @@ agent 数据文件(`~/.claude/`、`~/.codex/`)和进程信息;如果配置了 SS
 | 消息总数 | ✓ | ✓ |
 | 首条/末条 prompt | ✓ | ✓ |
 | 成本估算 | ✓ | ✓ |
-| 实时活跃状态 | ✓ | ✓ |
 
 > ¹ Codex 仅暴露 cache-read tokens,cache-write 不上报。OpenAI 的 `input_tokens`
 > 字段本身包含了已缓存部分,collector 存储时会扣掉 `cached_input_tokens`,
@@ -152,7 +150,7 @@ agentic-metric pricing cache reset claude-sonnet-4                # 删除覆盖
 | `PageUp` / `PageDown` | Range | 时间范围往前 / 往后 |
 | `.` | Now | 回到"现在"(清空 offset) |
 | `↑` / `↓` | — | 滚动明细面板 |
-| `r` | Auto-refresh | 切换快速自动刷新("实时"同步);开启时暂停慢速周期 sync |
+| `r` | Auto-refresh | 切换快速自动刷新;开启时暂停慢速周期 sync |
 | `p` | Pricing | 打开只读价格视图(高亮当前范围内的未知模型) |
 | `?` | Help | 显示快捷键速查表 |
 | `q` | Quit | 退出 |
@@ -164,7 +162,7 @@ agentic-metric pricing cache reset claude-sonnet-4                # 删除覆盖
 刷新间隔可在配置文件(`$DATA/agentic_metric/config.json`)覆盖:
 
 ```json
-{ "intervals": { "live_refresh": 1, "data_sync": 300, "auto_refresh": 30 } }
+{ "intervals": { "data_sync": 300, "auto_refresh": 30 } }
 ```
 
 ## 内置模型定价
@@ -230,15 +228,13 @@ agentic-metric pricing cache reset claude-sonnet-4                # 删除覆盖
 src/agentic_metric/
 ├── cli.py              # Typer CLI 命令和 Rich 报告渲染
 ├── config.py           # 平台路径、collector roots、SSH 远程配置
-├── models.py           # 数据类(LiveSession, TodayOverview, DailyTrend)
 ├── pricing.py          # 内置 + 用户定价,成本估算引擎
 ├── formatting.py       # 纯格式化辅助(成本 / token、source / host 标签)
 ├── collectors/
 │   ├── __init__.py     # Collector 注册中心和基类
-│   ├── claude_code.py  # Claude Code JSONL 解析器和进程检测
-│   ├── codex.py        # Codex JSONL 解析器和进程检测
-│   ├── remote.py       # SSH 封装:把远程 root 镜像到本地缓存后解析
-│   └── _process.py     # 跨平台进程检测(psutil / tasklist)
+│   ├── claude_code.py  # Claude Code JSONL 历史解析器
+│   ├── codex.py        # Codex JSONL 历史解析器
+│   └── remote.py       # SSH 封装:把远程 root 镜像到本地缓存后解析
 ├── store/
 │   ├── __init__.py
 │   ├── database.py     # SQLite 数据库(sessions, session_usage 分桶表)
@@ -254,11 +250,11 @@ src/agentic_metric/
 
 ### 数据流
 
-1. **Collectors** 读取 agent 数据文件(`~/.claude/`、`~/.codex/`),产出 `LiveSession` 对象。
+1. **Collectors** 读取 agent 数据文件(`~/.claude/`、`~/.codex/`),将会话历史同步到数据库。
 2. **Database** 将 sessions 和按日拆分的 `session_usage` 桶存入 SQLite。
 3. **Aggregator** 执行 SQL 查询生成报告(区间汇总、热图、agent/model/project 分解)。
-4. **CLI** 使用 Rich 渲染表格和面板。**TUI** 使用 Textual 提供实时仪表盘。
-5. **Pricing** 引擎按事件计算成本(支持长上下文)或按会话汇总计算。
+4. **CLI** 使用 Rich 渲染表格和面板。**TUI** 使用 Textual 提供仪表盘。
+5. **Pricing** 引擎按事件计算成本(支持长上下文)。
 
 ## 数据来源
 
@@ -272,9 +268,7 @@ src/agentic_metric/
 |-------|---------|---------|
 | Claude Code | `~/.claude/projects/` | JSONL 会话、token 用量、模型、分支 |
 | Claude Code | `~/.claude/stats-cache.json` | 每日活动统计 |
-| Claude Code | 进程检测 | 运行状态、工作目录 |
 | Codex | `~/.codex/sessions/` | JSONL 会话、token 用量、模型 |
-| Codex | 进程检测 | 运行状态、工作目录 |
 
 默认情况下,Claude Code 支持 `CLAUDE_CONFIG_DIR`,Codex 支持 `CODEX_HOME`,
 collector 会读取这些环境变量。需要同时扫描多个目录、手动指定 provider,

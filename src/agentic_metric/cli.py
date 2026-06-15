@@ -671,13 +671,11 @@ def _build_heatmap_panel(
         "bold bright_green",
     ]
     levels = len(styles)
-    # Normalize heights/colors over the non-zero data range (min→max maps to
-    # 1→bar_rows) so activity clustered in a high, narrow band still spreads
-    # across the full height instead of all rounding to the same bar.
+    # Both bar height (filled rows) and color intensity are proportional to the
+    # peak (value/max): a bar represents its value relative to the busiest
+    # bucket, and color (finer than the row count) separates same-height bars.
     _nonzero = [c for c in ((b.get("cost") or 0) for b in buckets) if c > 0]
-    v_min = min(_nonzero) if _nonzero else 0.0
     v_max = max(_nonzero) if _nonzero else 0.0
-    span = v_max - v_min
 
     n = len(buckets)
     if n >= 20:
@@ -716,9 +714,9 @@ def _build_heatmap_panel(
         if cost <= 0 or v_max <= 0:
             filled, lvl = 0, 0
         else:
-            norm = (cost - v_min) / span if span > 0 else 1.0
-            filled = 1 + int(round(norm * (bar_rows - 1)))
-            lvl = max(1, min(levels - 1, 1 + int(round(norm * (levels - 2)))))
+            ratio = cost / v_max
+            filled = max(1, min(bar_rows, int(round(ratio * bar_rows))))
+            lvl = max(1, min(levels - 1, int(round(ratio * (levels - 1)))))
         style = styles[lvl]
         for r, line in enumerate(rows_text):  # r = 0 is the top row
             lit = (bar_rows - r) <= filled

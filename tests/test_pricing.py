@@ -12,7 +12,6 @@ from agentic_metric.pricing import (
     disable_builtin_long_context,
     enable_builtin_long_context,
     estimate_cost,
-    estimate_session_cost,
     get_all_pricing,
     get_cache_write_1h_price,
     get_long_context_rules,
@@ -25,7 +24,6 @@ from agentic_metric.pricing import (
     set_user_long_context_pricing,
     set_user_pricing,
 )
-from agentic_metric.models import LiveSession
 
 
 def _reset_cache():
@@ -225,33 +223,15 @@ def test_aggregate_callers_can_disable_long_context_surcharge(tmp_path):
     _reset_cache()
 
 
-def test_live_session_estimate_does_not_apply_long_context_surcharge(tmp_path):
+def test_estimate_cost_prices_cache_creation_1h_tokens(tmp_path):
     with _patch_empty_user_pricing(tmp_path):
-        session = LiveSession(
-            session_id="s",
-            agent_type="codex",
-            project_path="/tmp/project",
-            model="gpt-5.4",
-            input_tokens=300_000,
-            output_tokens=1_000,
-        )
-        cost = estimate_session_cost(session)
-        expected = (300_000 * 2.5 + 1_000 * 15.0) / 1_000_000
-        assert abs(cost - expected) < 0.001
-    _reset_cache()
-
-
-def test_live_session_estimate_prices_cache_creation_1h_tokens(tmp_path):
-    with _patch_empty_user_pricing(tmp_path):
-        session = LiveSession(
-            session_id="s",
-            agent_type="claude_code",
-            project_path="/tmp/project",
-            model="claude-opus-4-8",
+        cost = estimate_cost(
+            "claude-opus-4-8",
             cache_creation_tokens=1_000_000,
             cache_creation_1h_tokens=1_000_000,
+            apply_long_context=False,
         )
-        assert estimate_session_cost(session) == 10.0
+        assert cost == 10.0
     _reset_cache()
 
 

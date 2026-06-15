@@ -9,12 +9,11 @@ from unittest.mock import Mock, patch
 from agentic_metric.collectors import CollectorRegistry, BaseCollector, create_default_registry
 from agentic_metric.collectors.claude_code import (
     ClaudeCodeCollector,
-    _LiveMonitor as ClaudeLiveMonitor,
+    _read_cwd as claude_read_cwd,
     _SessionAccum as ClaudeSessionAccum,
 )
 from agentic_metric.collectors.codex import (
     CodexCollector,
-    _LiveMonitor as CodexLiveMonitor,
     _SessionAccum as CodexSessionAccum,
 )
 from agentic_metric.collectors.remote import (
@@ -25,8 +24,6 @@ from agentic_metric.collectors.remote import (
     _ssh_command,
 )
 from agentic_metric.config import RemoteCollectorRoot, RemoteSpec, get_remote_specs
-from agentic_metric.collectors._process import find_pids, get_pid_cwd, normalize_cwd_key
-from agentic_metric.models import LiveSession
 from agentic_metric.pricing import estimate_cost
 from agentic_metric.store.database import Database
 
@@ -35,17 +32,6 @@ class MockCollector(BaseCollector):
     @property
     def agent_type(self) -> str:
         return "mock"
-
-    def get_live_sessions(self) -> list[LiveSession]:
-        return [
-            LiveSession(
-                session_id="test-1",
-                agent_type="mock",
-                project_path="/test/project",
-                user_turns=5,
-                output_tokens=1000,
-            )
-        ]
 
     def sync_history(self, db) -> None:
         pass
@@ -57,15 +43,6 @@ def test_registry_register():
     registry.register(collector)
     assert len(registry.get_all()) == 1
     assert registry.get_all()[0].agent_type == "mock"
-
-
-def test_registry_get_live_sessions():
-    registry = CollectorRegistry()
-    registry.register(MockCollector())
-    sessions = registry.get_live_sessions()
-    assert len(sessions) == 1
-    assert sessions[0].session_id == "test-1"
-    assert sessions[0].agent_type == "mock"
 
 
 def test_default_registry_uses_configured_roots(tmp_path):
@@ -175,29 +152,7 @@ def test_remote_manifest_command_supports_gnu_and_bsd_stat():
     assert "stat -c" not in cmd
 
 
-def test_live_session_total_tokens():
-    s = LiveSession(
-        session_id="x",
-        agent_type="test",
-        project_path="/test",
-        input_tokens=100,
-        output_tokens=200,
-    )
-    assert s.total_tokens == 300
-
-
-def test_live_session_duration():
-    s = LiveSession(
-        session_id="x",
-        agent_type="test",
-        project_path="/test",
-        started="2025-01-01T10:00:00Z",
-        last_active="2025-01-01T10:30:00Z",
-    )
-    assert abs(s.duration_minutes - 30.0) < 0.1
-
-
-def test_codex_session_meta_provider_sets_agent_type():
+def test_codex_session_meta_provider_sets_provider():
     accum = CodexSessionAccum(Path("/tmp/fake.jsonl"), project_path="/test")
     accum._process_entry({
         "type": "session_meta",
@@ -208,9 +163,7 @@ def test_codex_session_meta_provider_sets_agent_type():
         },
     })
 
-    live = accum.to_live_session()
-    assert live.agent_type == "codex"
-    assert live.provider == "custom"
+    assert accum.provider == "custom"
 
 
 def test_codex_configured_provider_overrides_session_provider():
@@ -228,9 +181,7 @@ def test_codex_configured_provider_overrides_session_provider():
         },
     })
 
-    live = accum.to_live_session()
-    assert live.agent_type == "codex"
-    assert live.provider == "openai"
+    assert accum.provider == "openai"
 
 
 def test_codex_history_sync_skips_mismatched_configured_provider(tmp_path):
@@ -927,12 +878,9 @@ def test_codex_last_token_usage_ignores_anthropic_cache_creation_1h_shape():
     }, ts="2026-04-24T10:00:00Z")
 
     rows = accum.usage_bucket_rows()
-    live = accum.to_live_session()
     assert accum.cache_create == 40
     assert sum(r["cache_creation_tokens"] for r in rows) == 40
     assert sum(r.get("cache_creation_1h_tokens", 0) for r in rows) == 0
-    assert live.cache_creation_tokens == 40
-    assert live.cache_creation_1h_tokens == 0
     expected = estimate_cost(
         "gpt-5.5",
         input_tokens=1_000,
@@ -1889,10 +1837,10 @@ def test_claude_read_cwd_uses_utf8(tmp_path):
         return real_open(file, *args, **kwargs)
 
     with patch("builtins.open", strict_locale_open):
-        assert ClaudeLiveMonitor._read_cwd(session_file) == cwd
+        assert claude_read_cwd(session_file) == cwd
 
 
-def test_codex_cross_day_live_session_uses_today_counters(tmp_path):
+def test_codex_cross_day_session_tracks_today_counters(tmp_path):
     class FakeDate(date):
         @classmethod
         def today(cls):
@@ -1950,14 +1898,13 @@ def test_codex_cross_day_live_session_uses_today_counters(tmp_path):
     with patch("agentic_metric.collectors.codex.date", FakeDate):
         accum.read_new_lines()
 
-    live = accum.to_live_session()
-    assert live.input_tokens == 1200
-    assert live.output_tokens == 150
-    assert live.cache_read_tokens == 300
-    assert live.today_input_tokens == 400
-    assert live.today_output_tokens == 50
-    assert live.today_cache_read_tokens == 100
-    assert live.today_user_turns == 1
+    assert accum.input_tokens == 1200
+    assert accum.output_tokens == 150
+    assert accum.cache_read == 300
+    assert accum.today_input_tokens == 400
+    assert accum.today_output_tokens == 50
+    assert accum.today_cache_read == 100
+    assert accum.today_user_turns == 1
 
     buckets = {r["usage_date"]: r for r in accum.usage_bucket_rows()}
     assert buckets["2026-04-23"]["message_count"] == 1
@@ -2142,126 +2089,6 @@ def test_codex_forked_compatible_session_keeps_separate_input_semantics(tmp_path
     assert accum.input_tokens == 300
     assert accum.cache_read == 100
     assert accum.output_tokens == 20
-
-
-def test_codex_live_monitor_finds_older_active_session(tmp_path):
-    class FakeDate(date):
-        @classmethod
-        def today(cls):
-            return cls(2026, 4, 24)
-
-    sessions_root = tmp_path / "sessions"
-    old_dir = sessions_root / "2026" / "04" / "20"
-    old_dir.mkdir(parents=True)
-    rollout = old_dir / "rollout-old.jsonl"
-    lines = [
-        {
-            "timestamp": "2026-04-20T10:00:00Z",
-            "type": "session_meta",
-            "payload": {"id": "old-sid", "cwd": "/tmp/project"},
-        },
-        {
-            "timestamp": "2026-04-20T10:00:01Z",
-            "type": "event_msg",
-            "payload": {"type": "user_message", "message": "still running"},
-        },
-    ]
-    rollout.write_text("".join(json.dumps(line) + "\n" for line in lines))
-
-    monitor = CodexLiveMonitor()
-    with (
-        patch("agentic_metric.collectors.codex.CODEX_SESSIONS_DIR", sessions_root),
-        patch("agentic_metric.collectors.codex.get_running_cwds", return_value={123: "/tmp/project"}),
-        patch("agentic_metric.collectors.codex.date", FakeDate),
-    ):
-        sessions = monitor.refresh()
-
-    assert len(sessions) == 1
-    assert sessions[0].session_id == "old-sid"
-
-
-def test_windows_cwd_normalization_matches_codex_live_session(tmp_path):
-    class FakeDate(date):
-        @classmethod
-        def today(cls):
-            return cls(2026, 4, 24)
-
-    with patch("agentic_metric.collectors._process.platform.system", return_value="Windows"):
-        assert normalize_cwd_key(r"C:\Users\Leo\Repo") == normalize_cwd_key("c:/users/leo/repo")
-
-    sessions_root = tmp_path / "sessions"
-    old_dir = sessions_root / "2026" / "04" / "24"
-    old_dir.mkdir(parents=True)
-    rollout = old_dir / "rollout-win.jsonl"
-    lines = [
-        {
-            "timestamp": "2026-04-24T10:00:00Z",
-            "type": "session_meta",
-            "payload": {"id": "win-sid", "cwd": r"C:\Users\Leo\Repo"},
-        },
-        {
-            "timestamp": "2026-04-24T10:00:01Z",
-            "type": "event_msg",
-            "payload": {"type": "user_message", "message": "still running"},
-        },
-    ]
-    rollout.write_text("".join(json.dumps(line) + "\n" for line in lines))
-
-    monitor = CodexLiveMonitor()
-    with (
-        patch("agentic_metric.collectors.codex.CODEX_SESSIONS_DIR", sessions_root),
-        patch("agentic_metric.collectors.codex.get_running_cwds", return_value={123: "c:/users/leo/repo"}),
-        patch("agentic_metric.collectors.codex.date", FakeDate),
-        patch("agentic_metric.collectors._process.platform.system", return_value="Windows"),
-    ):
-        sessions = monitor.refresh()
-
-    assert len(sessions) == 1
-    assert sessions[0].session_id == "win-sid"
-
-
-def test_get_pid_cwd_falls_back_when_psutil_cwd_fails():
-    import agentic_metric.collectors._process as proc
-
-    class FakeAccessDenied(Exception):
-        pass
-
-    class FakePsutil:
-        NoSuchProcess = RuntimeError
-        AccessDenied = FakeAccessDenied
-        ZombieProcess = RuntimeError
-
-        class Process:
-            def __init__(self, pid):
-                self.pid = pid
-
-            def cwd(self):
-                raise FakeAccessDenied()
-
-    with (
-        patch.object(proc, "psutil", FakePsutil),
-        patch("agentic_metric.collectors._process.platform.system", return_value="Linux"),
-        patch("agentic_metric.collectors._process.Path.resolve", return_value=Path("/tmp/fallback")),
-    ):
-        assert get_pid_cwd(123) == "/tmp/fallback"
-
-
-def test_find_pids_uses_windows_tasklist_fallback():
-    import subprocess
-    import agentic_metric.collectors._process as proc
-
-    result = subprocess.CompletedProcess(
-        ["tasklist"],
-        0,
-        stdout='"codex.exe","123","Console","1","10,000 K"\n"other.exe","999","Console","1","1,000 K"\n',
-        stderr="",
-    )
-    with (
-        patch.object(proc, "psutil", None),
-        patch("agentic_metric.collectors._process.platform.system", return_value="Windows"),
-        patch("agentic_metric.collectors._process.subprocess.run", return_value=result),
-    ):
-        assert find_pids("codex", exact=True) == [123]
 
 
 def test_codex_history_sync_detects_same_size_file_edits(tmp_path):

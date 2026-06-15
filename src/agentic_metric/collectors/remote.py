@@ -13,7 +13,6 @@ import subprocess
 import tarfile
 
 from ..config import DATA_DIR, RemoteSpec
-from ..models import LiveSession
 from . import BaseCollector
 from .claude_code import ClaudeCodeCollector
 from .codex import CodexCollector
@@ -87,10 +86,6 @@ class RemoteHistoryCollector(BaseCollector):
     @property
     def agent_type(self) -> str:
         return self._agent_type
-
-    def get_live_sessions(self) -> list[LiveSession]:
-        # Remote live process inspection is intentionally not attempted.
-        return []
 
     def sync_history(self, db) -> None:
         try:

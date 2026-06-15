@@ -2020,14 +2020,13 @@ def test_tui_summary_stats_wrap_on_whole_segments():
         1_200_000_000,
         requests=6_319,
         turns=1_280,
-        active=2,
         cache_pct=94,
     )
 
     lines = ["".join(text for text, _style in row) for row in cell._stats_lines(28)]
     assert lines == [
         "195 sess · 6.3K req",
-        "1.3K turns  ● 2 live",
+        "1.3K turns",
     ]
 
 

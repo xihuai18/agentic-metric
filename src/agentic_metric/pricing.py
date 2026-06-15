@@ -686,20 +686,3 @@ def estimate_cost(
         + cache_creation_1h_tokens * get_cache_write_1h_price(model, p_in)
     ) / 1_000_000
     return cost
-
-
-def estimate_session_cost(session) -> float | None:
-    """Estimate cost for a LiveSession object.
-
-    LiveSession counters are session aggregates, so request-size rates cannot
-    be inferred here.
-    """
-    return estimate_cost(
-        model=session.model,
-        input_tokens=session.input_tokens,
-        output_tokens=session.output_tokens,
-        cache_read_tokens=session.cache_read_tokens,
-        cache_creation_tokens=session.cache_creation_tokens,
-        cache_creation_1h_tokens=getattr(session, "cache_creation_1h_tokens", 0),
-        apply_long_context=False,
-    )

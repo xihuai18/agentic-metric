@@ -1,23 +1,16 @@
-"""Claude Code collector: parse local JSONL/JSON files + live process monitoring."""
+"""Claude Code collector: parse local JSONL/JSON files into history."""
 
 from __future__ import annotations
 
 import json
-import platform
 import re
-import time
 from datetime import datetime
 from pathlib import Path
 
 from ..config import PROJECTS_DIR
-from ..models import LiveSession
 from ..pricing import estimate_cost
 from ..usage import estimate_token_usage_cost, normalize_anthropic_usage
 from . import BaseCollector
-from ._process import get_running_cwds, normalize_cwd_key
-
-
-_RECENT_ACTIVITY_SECONDS = 300
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -50,14 +43,12 @@ class _SessionAccum:
     """Accumulator for incremental parsing of a single session .jsonl file.
 
     Tracks byte offset so repeated calls only parse newly appended data.
-    Builds LiveSession objects with agent_type='claude_code'.
     """
 
     __slots__ = (
         "file_path",
         "project_path",
         "session_id",
-        "pid",
         "_replayed_assistant_ids",
         "offset",
         "user_turns",
@@ -93,13 +84,11 @@ class _SessionAccum:
         self,
         file_path: Path,
         project_path: str,
-        pid: int = 0,
         replayed_assistant_ids: set[str] | None = None,
     ) -> None:
         self.file_path = file_path
         self.project_path = project_path
         self.session_id = file_path.stem
-        self.pid = pid
         self._replayed_assistant_ids = (
             replayed_assistant_ids if replayed_assistant_ids is not None else set()
         )
@@ -511,238 +500,27 @@ class _SessionAccum:
             self.today_cache_create += cw
             self.today_cache_create_1h += cw_1h
 
-    def to_live_session(self) -> LiveSession:
-        return LiveSession(
-            session_id=self.session_id,
-            agent_type="claude_code",
-            project_path=self.project_path,
-            git_branch=self.git_branch,
-            model=self.model,
-            message_count=self.message_count,
-            user_turns=self.user_turns,
-            input_tokens=self.input_tokens,
-            output_tokens=self.output_tokens,
-            cache_read_tokens=self.cache_read,
-            cache_creation_tokens=self.cache_create,
-            cache_creation_1h_tokens=self.cache_create_1h,
-            started=self.first_ts,
-            last_active=self.last_ts,
-            first_prompt=self.first_prompt,
-            last_prompt=self.last_prompt,
-            pid=self.pid,
-            today_input_tokens=self.today_input_tokens,
-            today_output_tokens=self.today_output_tokens,
-            today_cache_read_tokens=self.today_cache_read,
-            today_cache_creation_tokens=self.today_cache_create,
-            today_cache_creation_1h_tokens=self.today_cache_create_1h,
-            today_user_turns=self.today_user_turns,
-            today_message_count=self.today_message_count,
-        )
+
+# ── CWD resolution ────────────────────────────────────────────────────────
 
 
-# ── Live monitor ─────────────────────────────────────────────────────────
-
-
-class _LiveMonitor:
-    """Monitors running Claude Code sessions with incremental JSONL parsing.
-
-    Uses process detection to find running ``claude`` processes, maps their
-    CWDs to PROJECTS_DIR subdirectories, then incrementally parses the
-    most-recently-modified .jsonl file for each active project.
-
-    Designed for ~1 s refresh cadence: first call does full parse,
-    subsequent calls only read newly appended bytes.
-    """
-
-    def __init__(
-        self,
-        projects_dir: Path | None = None,
-        provider: str = "",
-        data_root: str = "",
-    ) -> None:
-        self.projects_dir = projects_dir
-        self.provider = provider.strip()
-        self.data_root = data_root
-        # cwd -> project_dir mapping (rebuilt when unknown cwds appear)
-        self._cwd_map: dict[str, Path] = {}
-        self._cwd_map_built = False
-        # file_path -> accumulator (persists across refreshes)
-        self._accums: dict[Path, _SessionAccum] = {}
-
-    def _projects_dir(self) -> Path:
-        return self.projects_dir or PROJECTS_DIR
-
-    def refresh(self) -> list[LiveSession]:
-        """Return currently running sessions. Fast on repeated calls."""
-        pid_cwds: dict[int, str] = get_running_cwds("claude", exact=True)
-        if not pid_cwds:
-            if platform.system() == "Windows":
-                return self._refresh_recent_files()
-            return []
-
-        cwd_display: dict[str, str] = {}
-        cwd_set: set[str] = set()
-        for cwd in pid_cwds.values():
-            key = normalize_cwd_key(cwd)
-            if not key:
-                continue
-            cwd_set.add(key)
-            cwd_display.setdefault(key, cwd)
-        if not cwd_set:
-            return []
-
-        # Rebuild cwd map if we see unknown cwds
-        if not self._cwd_map_built or not cwd_set.issubset(self._cwd_map.keys()):
-            self._build_cwd_map()
-
-        # Build cwd -> list of pids (multiple sessions may share a cwd)
-        cwd_to_pids: dict[str, list[int]] = {}
-        for pid, cwd in pid_cwds.items():
-            key = normalize_cwd_key(cwd)
-            if key:
-                cwd_to_pids.setdefault(key, []).append(pid)
-
-        results: list[LiveSession] = []
-        active_files: set[Path] = set()
-
-        for cwd in cwd_set:
-            project_dir = self._cwd_map.get(cwd)
-            if not project_dir:
-                continue
-
-            # Find most recently modified .jsonl files
-            try:
-                jsonl_files = sorted(
-                    project_dir.glob("*.jsonl"),
-                    key=lambda f: f.stat().st_mtime,
-                    reverse=True,
-                )
-            except OSError:
-                continue
-            if not jsonl_files:
-                continue
-
-            # Pick as many JSONL files as there are active PIDs for this CWD
-            pids = cwd_to_pids.get(cwd, [])
-            num_sessions = max(1, len(pids))
-
-            for idx, jf in enumerate(jsonl_files[:num_sessions]):
-                if jf in active_files:
+def _read_cwd(jsonl_file: Path) -> str:
+    """Extract the cwd field from the first few lines of a JSONL file."""
+    try:
+        with open(jsonl_file, encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                if i > 10:
+                    break
+                try:
+                    entry = json.loads(line)
+                    cwd = entry.get("cwd", "")
+                    if cwd:
+                        return cwd
+                except json.JSONDecodeError:
                     continue
-                active_files.add(jf)
-
-                pid = pids[idx] if idx < len(pids) else 0
-
-                # Get or create accumulator
-                accum = self._accums.get(jf)
-                if accum is None:
-                    accum = _SessionAccum(jf, cwd_display.get(cwd, cwd), pid=pid)
-                    self._accums[jf] = accum
-                else:
-                    # Update pid in case it changed across refreshes
-                    accum.pid = pid
-
-                accum.read_new_lines()
-                if accum.user_turns > 0:
-                    live = accum.to_live_session()
-                    live.provider = self.provider
-                    live.data_root = self.data_root
-                    results.append(live)
-
-        # Prune stale accumulators
-        stale = [k for k in self._accums if k not in active_files]
-        for k in stale:
-            del self._accums[k]
-
-        results.sort(key=lambda s: s.last_active, reverse=True)
-        return results
-
-    def _refresh_recent_files(self) -> list[LiveSession]:
-        """Windows fallback when process CWD lookup is unavailable."""
-        projects_dir = self._projects_dir()
-        if not projects_dir.exists():
-            return []
-        cutoff = time.time() - _RECENT_ACTIVITY_SECONDS
-        candidates: list[tuple[float, Path, str]] = []
-        try:
-            project_dirs = [p for p in projects_dir.iterdir() if p.is_dir()]
-        except OSError:
-            return []
-        for project_dir in project_dirs:
-            try:
-                for jsonl_file in project_dir.glob("*.jsonl"):
-                    try:
-                        mtime = jsonl_file.stat().st_mtime
-                        if mtime >= cutoff:
-                            candidates.append((mtime, jsonl_file, self._read_cwd(jsonl_file) or str(project_dir)))
-                    except OSError:
-                        continue
-            except OSError:
-                continue
-
-        results: list[LiveSession] = []
-        active_files: set[Path] = set()
-        for _mtime, jsonl_file, cwd in sorted(candidates, key=lambda item: item[0], reverse=True):
-            active_files.add(jsonl_file)
-            accum = self._accums.get(jsonl_file)
-            if accum is None:
-                accum = _SessionAccum(jsonl_file, cwd)
-                self._accums[jsonl_file] = accum
-            accum.read_new_lines()
-            if accum.user_turns > 0:
-                live = accum.to_live_session()
-                live.provider = self.provider
-                live.data_root = self.data_root
-                results.append(live)
-
-        stale = [k for k in self._accums if k not in active_files]
-        for k in stale:
-            del self._accums[k]
-        results.sort(key=lambda s: s.last_active, reverse=True)
-        return results
-
-    def _build_cwd_map(self) -> None:
-        """Map real CWDs to PROJECTS_DIR subdirectories by reading JSONL headers."""
-        self._cwd_map.clear()
-        projects_dir = self._projects_dir()
-        if not projects_dir.exists():
-            return
-        for project_dir in projects_dir.iterdir():
-            if not project_dir.is_dir():
-                continue
-            try:
-                jsonl_files = sorted(
-                    project_dir.glob("*.jsonl"),
-                    key=lambda f: f.stat().st_mtime,
-                    reverse=True,
-                )
-            except OSError:
-                continue
-            if not jsonl_files:
-                continue
-            real_cwd = self._read_cwd(jsonl_files[0])
-            if real_cwd:
-                self._cwd_map[normalize_cwd_key(real_cwd)] = project_dir
-        self._cwd_map_built = True
-
-    @staticmethod
-    def _read_cwd(jsonl_file: Path) -> str:
-        """Extract the cwd field from the first few lines of a JSONL file."""
-        try:
-            with open(jsonl_file, encoding="utf-8") as f:
-                for i, line in enumerate(f):
-                    if i > 10:
-                        break
-                    try:
-                        entry = json.loads(line)
-                        cwd = entry.get("cwd", "")
-                        if cwd:
-                            return cwd
-                    except json.JSONDecodeError:
-                        continue
-        except (OSError, UnicodeDecodeError):
-            pass
-        return ""
+    except (OSError, UnicodeDecodeError):
+        pass
+    return ""
 
 
 # ── Collector implementation ─────────────────────────────────────────────
@@ -751,8 +529,7 @@ class _LiveMonitor:
 class ClaudeCodeCollector(BaseCollector):
     """Collector for Claude Code agent data.
 
-    - Live sessions: process detection + incremental JSONL parsing
-    - History sync: stats-cache.json, sessions-index.json, and JSONL token data
+    History sync: sessions-index.json + per-session JSONL token data.
     """
 
     agent_type = "claude_code"
@@ -767,23 +544,13 @@ class ClaudeCodeCollector(BaseCollector):
         self.provider = provider.strip()
         self.data_root = data_root
         self.agent_type = "claude_code"
-        self._monitor = _LiveMonitor(
-            projects_dir,
-            provider=self.provider,
-            data_root=self.data_root,
-        )
-
-    def get_live_sessions(self) -> list[LiveSession]:
-        """Return currently active Claude Code sessions."""
-        return self._monitor.refresh()
 
     def sync_history(self, db) -> None:
         """Sync Claude Code history into the database.
 
-        Parses three data sources:
-        1. ``stats-cache.json`` -- daily_stats and model_daily_usage
-        2. ``sessions-index.json`` -- session metadata (per project)
-        3. ``.jsonl`` files -- per-session token data (incremental via sync_state)
+        Parses two data sources:
+        1. ``sessions-index.json`` -- session metadata (per project)
+        2. ``.jsonl`` files -- per-session token data (incremental via sync_state)
         """
         self._sync_sessions_index(db)
         self._sync_jsonl_tokens(db)
@@ -888,7 +655,7 @@ class ClaudeCodeCollector(BaseCollector):
                 # both the session row and its usage buckets record the actual
                 # project, not the on-disk projects/ dir (which is a local cache
                 # path for SSH-backed remotes).
-                real_cwd = _LiveMonitor._read_cwd(jsonl_file)
+                real_cwd = _read_cwd(jsonl_file)
                 project_path = real_cwd if real_cwd else str(project_dir)
 
                 # Build an accumulator starting from the previous offset
