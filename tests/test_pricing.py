@@ -109,6 +109,14 @@ def test_no_family_fallback_gpt5():
     assert p == (2.5, 15.0, 0.25, 0.0)
 
 
+def test_gpt_56_family_pricing(tmp_path):
+    with _patch_empty_user_pricing(tmp_path):
+        assert get_pricing("gpt-5.6") == (5.0, 30.0, 0.50, 6.25)
+        assert get_pricing("gpt-5.6-sol") == (5.0, 30.0, 0.50, 6.25)
+        assert get_pricing("gpt-5.6-terra") == (2.5, 15.0, 0.25, 3.125)
+        assert get_pricing("gpt-5.6-luna") == (1.0, 6.0, 0.10, 1.25)
+
+
 def test_longest_prefix_match():
     """gpt-5.4-mini must match its own entry, not gpt-5.4."""
     p = get_pricing("gpt-5.4-mini")
@@ -194,6 +202,33 @@ def test_gpt_55_long_context_uses_long_context_rate(tmp_path):
         expected = (272_001 * 10.0 + 1_000 * 45.0 + 10_000 * 1.0) / 1_000_000
         assert abs(cost - expected) < 0.001
     _reset_cache()
+
+
+@pytest.mark.parametrize(
+    ("model", "prices"),
+    [
+        ("gpt-5.6", (10.0, 45.0, 1.0, 12.5)),
+        ("gpt-5.6-sol", (10.0, 45.0, 1.0, 12.5)),
+        ("gpt-5.6-terra", (5.0, 22.5, 0.5, 6.25)),
+        ("gpt-5.6-luna", (2.0, 9.0, 0.2, 2.5)),
+    ],
+)
+def test_gpt_56_long_context_uses_model_rate(tmp_path, model, prices):
+    with _patch_empty_user_pricing(tmp_path):
+        cost = estimate_cost(
+            model,
+            input_tokens=272_001,
+            output_tokens=1_000,
+            cache_read_tokens=10_000,
+            cache_creation_tokens=2_000,
+        )
+        expected = (
+            272_001 * prices[0]
+            + 1_000 * prices[1]
+            + 10_000 * prices[2]
+            + 2_000 * prices[3]
+        ) / 1_000_000
+        assert abs(cost - expected) < 0.001
 
 
 def test_builtin_long_context_uses_highest_matching_tier(tmp_path):

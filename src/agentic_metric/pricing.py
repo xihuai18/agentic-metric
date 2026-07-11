@@ -13,15 +13,18 @@ log = logging.getLogger(__name__)
 PriceTuple = tuple[float, float, float, float]
 
 # (input, output, cache_read, cache_write) — USD per million tokens.
-# Core OpenAI / Anthropic / Google Gemini prices were verified against
-# official pricing docs on 2026-04-25, with Claude Fable 5 verified
+# Core Anthropic / Google Gemini prices were verified against official pricing
+# docs on 2026-04-25, with GPT-5.6 pricing verified against OpenAI's official
+# pricing and model docs on 2026-07-11, Claude Fable 5 verified
 # against Anthropic's pricing docs on 2026-06-12, Claude Sonnet 5
 # standard pricing verified against Anthropic's pricing docs on
 # 2026-07-01, Claude Opus 4.8 verified against Anthropic's
 # 2026-05-28 launch note, and Gemini 3.5 Flash verified against
 # Google AI Dev pricing on 2026-06-05:
-#   https://openai.com/api/pricing/
-#   https://developers.openai.com/api/docs/models/gpt-5.4/
+#   https://developers.openai.com/api/docs/pricing/
+#   https://developers.openai.com/api/docs/models/gpt-5.6-sol/
+#   https://developers.openai.com/api/docs/models/gpt-5.6-terra/
+#   https://developers.openai.com/api/docs/models/gpt-5.6-luna/
 #   https://platform.claude.com/docs/en/docs/about-claude/pricing
 #   https://ai.google.dev/gemini-api/docs/pricing
 # Cache-write uses the 5-minute rate for Anthropic unless a collector observes
@@ -50,6 +53,9 @@ _BUILTIN_PRICING: dict[str, PriceTuple] = {
     "claude-3-opus":         (15.0, 75.0, 1.50, 18.75),
     "claude-3-haiku":        (0.25, 1.25, 0.03,  0.30),
     # ── OpenAI ──
+    "gpt-5.6-sol":           (5.0,  30.0,  0.50,  6.25),
+    "gpt-5.6-terra":         (2.5,  15.0,  0.25,  3.125),
+    "gpt-5.6-luna":          (1.0,   6.0,  0.10,  1.25),
     "gpt-5.5":               (5.0,  30.0,  0.50,  0.0),
     "gpt-5.4-mini":          (0.75,   4.5, 0.075, 0.0),
     "gpt-5.4-nano":          (0.20,  1.25, 0.02,  0.0),
@@ -83,6 +89,7 @@ _MODEL_ALIASES: dict[str, str] = {
     "claude-4.5-sonnet-thinking": "claude-sonnet-4-5",
     "claude-4.5-opus-high-thinking": "claude-opus-4-5",
     "codex-auto-review": "gpt-5.3-codex",
+    "gpt-5.6": "gpt-5.6-sol",
 }
 
 # Internal placeholder/system responses that should never be billed as a model.
@@ -99,12 +106,30 @@ _UNKNOWN_MODEL_PREFIXES = (
     "gpt-5-pro",
 )
 
-_PRICING_FINGERPRINT_VERSION = 14
+_PRICING_FINGERPRINT_VERSION = 15
 
 # Long-context pricing applies per request/prompt, not per stored hour/session.
 # Collectors pass single-event usage into ``estimate_cost`` before aggregating
 # buckets; aggregate-only callers get a best-effort fallback.
 _LONG_CONTEXT_RULES: list[dict[str, object]] = [
+    {
+        "prefixes": ("gpt-5.6-sol",),
+        "tiers": (
+            {"threshold": 272_000, "prices": (10.0, 45.0, 1.0, 12.5)},
+        ),
+    },
+    {
+        "prefixes": ("gpt-5.6-terra",),
+        "tiers": (
+            {"threshold": 272_000, "prices": (5.0, 22.5, 0.50, 6.25)},
+        ),
+    },
+    {
+        "prefixes": ("gpt-5.6-luna",),
+        "tiers": (
+            {"threshold": 272_000, "prices": (2.0, 9.0, 0.20, 2.50)},
+        ),
+    },
     {
         "prefixes": ("gpt-5.5",),
         "tiers": (
