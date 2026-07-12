@@ -56,7 +56,20 @@ _USAGE_SOURCE = """(
 
 def _usage_source(db: Database) -> str:
     """Return per-bucket usage plus a sessions fallback for pending re-syncs."""
-    return _USAGE_SOURCE
+    pending = db.conn.execute(
+        """SELECT 1
+           FROM sessions AS s
+           WHERE NOT EXISTS (
+               SELECT 1
+               FROM session_usage AS u
+               WHERE u.session_id = s.session_id
+                 AND u.agent_type = s.agent_type
+                 AND u.provider = s.provider
+                 AND u.data_root = s.data_root
+           )
+           LIMIT 1"""
+    ).fetchone()
+    return _USAGE_SOURCE if pending else "session_usage"
 
 
 def _shifted_month(now: datetime, offset: int) -> tuple[int, int]:

@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from unittest.mock import patch
 
 from rich.console import Console
+from textual.geometry import Size
 
 from agentic_metric import cli as cli_module
 from agentic_metric.formatting import cache_hit_rate, cache_hit_rate_band, token_summary
@@ -60,6 +61,31 @@ def test_database_creation():
     assert "sessions" in names
     assert "session_usage" in names
     assert "sync_state" in names
+    db.close()
+
+
+def test_usage_source_skips_session_fallback_when_every_session_has_buckets():
+    db = _make_db()
+    db.upsert_session(
+        "s1",
+        "codex",
+        provider="openai",
+        data_root="/tmp/.codex",
+        started_at="2026-07-13T00:00:00Z",
+    )
+
+    assert "UNION ALL" in aggregator_module._usage_source(db)
+
+    db.replace_session_usage(
+        "s1",
+        "codex",
+        [{"usage_date": "2026-07-13", "usage_hour": 8, "model": "gpt-5.4"}],
+        provider="openai",
+        data_root="/tmp/.codex",
+    )
+    db.commit()
+
+    assert aggregator_module._usage_source(db) == "session_usage"
     db.close()
 
 
@@ -1442,6 +1468,61 @@ def test_tui_heatmap_renders_current_range_provider_rollup():
     assert "ichat · $3.00 (75.0%)" in rendered
     assert "openai · $1.00 (25.0%)" in rendered
     assert "anthropic" not in rendered
+
+
+def test_tui_heatmap_reports_enough_height_for_all_rendered_rows():
+    widget = PeriodicHeatmap()
+    widget.update_data(
+        [{"label": "00", "cost": 4.0, "tokens": 420}],
+        totals={
+            "estimated_cost_usd": 4.0,
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "cache_read_tokens": 300,
+            "cache_creation_tokens": 0,
+            "unknown_cost_count": 0,
+        },
+        providers=[
+            {"provider": "ichat", "estimated_cost_usd": 3.0, "unknown_cost_count": 0},
+            {"provider": "openai", "estimated_cost_usd": 1.0, "unknown_cost_count": 0},
+        ],
+        projects=[
+            {
+                "project_path": f"/workspace/project-{index}",
+                "data_root": "/tmp/.codex",
+                "estimated_cost_usd": 1.0,
+                "unknown_cost_count": 0,
+            }
+            for index in range(3)
+        ],
+        total_cost=4.0,
+    )
+
+    assert widget.get_content_height(Size(120, 40), Size(120, 40), 120) >= 18
+
+
+def test_tui_sync_keeps_cached_data_visible_and_reports_progress(monkeypatch):
+    from agentic_metric.tui.app import AgenticMetricApp
+
+    db = _make_db()
+    app = AgenticMetricApp(db=db, sync_on_mount=False)
+    workers = []
+    monkeypatch.setattr(app, "run_worker", lambda worker, **kwargs: workers.append(worker))
+    monkeypatch.setattr(app, "_populate_all", lambda: None)
+
+    app._tick_sync()
+
+    assert app.sub_title == "syncing… · showing cached data"
+    assert app._sync_in_progress is True
+    assert len(workers) == 1
+
+    app._tick_sync()
+    assert len(workers) == 1
+
+    app._on_sync_done()
+    assert app.sub_title.startswith("synced ")
+    assert app._sync_in_progress is False
+    db.close()
 
 
 def test_tui_heatmap_provider_rollup_handles_unknown_cost():

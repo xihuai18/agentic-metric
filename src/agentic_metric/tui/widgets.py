@@ -221,6 +221,9 @@ def _render_histogram(
 # ── Widgets ───────────────────────────────────────────────────────────
 
 
+_HEATMAP_HISTOGRAM_ROWS = 8
+
+
 class SummaryCell(Static):
     """One column in the top summary row: TODAY / WEEK / MONTH."""
 
@@ -464,6 +467,7 @@ class PeriodicHeatmap(Static):
             available=available,
             colors=colors,
             highlighted=[bool(b.get("_highlighted")) for b in points],
+            rows=_HEATMAP_HISTOGRAM_ROWS,
         )
 
         buckets = self._buckets
@@ -528,6 +532,32 @@ class PeriodicHeatmap(Static):
             body.extend(lists)
 
         return Group(*body)
+
+    def get_content_height(self, container: Size, viewport: Size, width: int) -> int:
+        """Reserve every rendered row so Textual does not clip the lower details."""
+        if not self._buckets:
+            return 1
+
+        height = _HEATMAP_HISTOGRAM_ROWS + 2  # histogram axis + peak row
+        if _token_summary_block(self._totals) is not None:
+            height += 2
+
+        detail_rows = 0
+        providers = _top_providers_block(
+            self._providers,
+            self._total_cost,
+            total_unknown=_has_unknown_cost(self._totals),
+        )
+        projects = _top_projects_block(
+            self._projects,
+            self._total_cost,
+            total_unknown=_has_unknown_cost(self._totals),
+        )
+        detail_rows += len(providers or ())
+        detail_rows += len(projects or ())
+        if detail_rows:
+            height += 1 + detail_rows
+        return height
 
 
 class TrendBlocks(Static):

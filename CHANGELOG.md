@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.7.6 (2026-07-13)
+
+### Improvements
+
+- **Responsive cached-data startup**: the TUI renders the local database first
+  and shows `syncing… · showing cached data` while collectors refresh in the
+  background. Overlapping periodic and auto-refresh syncs are skipped.
+- **Faster dashboard queries**: aggregate reads bypass the expensive session
+  fallback union when every session already has hourly usage buckets.
+
+### Fixes
+
+- **Complete heatmap details**: the hourly panel now reports its full rendered
+  height, so the axis, peak, provider, and top-project rows are not clipped.
+
 ## v0.7.0 (2026-06-14)
 
 ### Changes

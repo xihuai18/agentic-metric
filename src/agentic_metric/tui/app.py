@@ -172,6 +172,7 @@ class AgenticMetricApp(App):
         self._offset: int = 0  # 0 = current period; N = N units in the past
         self._auto_refresh_timer: Timer | None = None
         self._sync_timer: Timer | None = None
+        self._sync_in_progress = False
 
     # ── Layout ────────────────────────────────────────────────────────
 
@@ -192,16 +193,11 @@ class AgenticMetricApp(App):
 
     def on_mount(self) -> None:
         self._today_sessions = get_today_sessions(self._db)
-        self.sub_title = "syncing…" if self._sync_on_mount else "demo data"
+        self.sub_title = "demo data"
         self._populate_all()
         if self._sync_on_mount:
             self._sync_timer = self.set_interval(DATA_SYNC_INTERVAL, self._tick_sync)
-            self.run_worker(
-                self._initial_sync_worker,
-                thread=True,
-                exclusive=True,
-                group="sync",
-            )
+            self._start_sync(self._initial_sync_worker)
 
     async def _initial_sync_worker(self) -> None:
         db = Database()
@@ -442,8 +438,16 @@ class AgenticMetricApp(App):
 
     # ── Periodic sync (5 min) ─────────────────────────────────────────
 
+    def _start_sync(self, worker) -> None:
+        """Keep cached data visible while one background sync is running."""
+        if self._sync_in_progress:
+            return
+        self._sync_in_progress = True
+        self.sub_title = "syncing… · showing cached data"
+        self.run_worker(worker, thread=True, exclusive=True, group="sync")
+
     def _tick_sync(self) -> None:
-        self.run_worker(self._sync_worker, thread=True, exclusive=True, group="sync")
+        self._start_sync(self._sync_worker)
 
     async def _sync_worker(self) -> None:
         db = Database()
@@ -455,6 +459,7 @@ class AgenticMetricApp(App):
         self.call_from_thread(self._on_sync_done)
 
     def _on_sync_done(self) -> None:
+        self._sync_in_progress = False
         self._today_sessions = get_today_sessions(self._db)
         sync_errors = self._collectors.get_sync_errors()
         suffix = f" · {len(sync_errors)} remote skipped" if sync_errors else ""
