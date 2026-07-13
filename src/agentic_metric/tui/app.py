@@ -10,7 +10,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.timer import Timer
-from textual.widgets import Footer, Header
+from textual.widgets import Footer, Header, LoadingIndicator, Static
 from textual.widgets._footer import FooterKey
 
 from ..collectors import CollectorRegistry, create_default_registry
@@ -25,6 +25,7 @@ from ..store.aggregator import (
     get_range_totals,
     get_today_sessions,
     get_trend,
+    get_unpriced_models,
     get_trend_provider_totals,
     resolve_range,
 )
@@ -173,40 +174,50 @@ class AgenticMetricApp(App):
         self._auto_refresh_timer: Timer | None = None
         self._sync_timer: Timer | None = None
         self._sync_in_progress = False
+        self._initial_sync_pending = sync_on_mount
+        self._unpriced_models: list[str] = []
+        self._last_pricing_warning: tuple[str, ...] = ()
 
     # ── Layout ────────────────────────────────────────────────────────
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=self._show_clock)
-        with Horizontal(id="summary-row"):
-            yield SummaryCell("TODAY", id="cell-today")
-            yield SummaryCell("WEEK", id="cell-week")
-            yield SummaryCell("MONTH", id="cell-month")
-        with Vertical(id="heatmap-panel"):
-            yield PeriodicHeatmap(id="heatmap")
-        with Vertical(id="chart-panel"):
-            yield TrendBlocks(id="chart")
-        with Vertical(id="breakdown-panel"):
-            with VerticalScroll(id="breakdown-scroll"):
-                yield Breakdown(id="breakdown-body")
+
+        loading_page = Vertical(id="loading-page")
+        loading_page.display = self._initial_sync_pending
+        with loading_page:
+            yield LoadingIndicator(id="loading-indicator")
+            yield Static("Syncing usage data", id="loading-title")
+            yield Static("Building your dashboard…", id="loading-detail")
+
+        dashboard = Vertical(id="dashboard")
+        dashboard.display = not self._initial_sync_pending
+        with dashboard:
+            with Horizontal(id="summary-row"):
+                yield SummaryCell("TODAY", id="cell-today")
+                yield SummaryCell("WEEK", id="cell-week")
+                yield SummaryCell("MONTH", id="cell-month")
+            with Vertical(id="heatmap-panel"):
+                yield PeriodicHeatmap(id="heatmap")
+            with Vertical(id="chart-panel"):
+                yield TrendBlocks(id="chart")
+            with Vertical(id="breakdown-panel"):
+                with VerticalScroll(id="breakdown-scroll"):
+                    yield Breakdown(id="breakdown-body")
         yield _AutoAwareFooter()
 
     def on_mount(self) -> None:
-        self._today_sessions = get_today_sessions(self._db)
-        self.sub_title = "demo data"
-        self._populate_all()
         if self._sync_on_mount:
             self._sync_timer = self.set_interval(DATA_SYNC_INTERVAL, self._tick_sync)
             self._start_sync(self._initial_sync_worker)
+        else:
+            self._today_sessions = get_today_sessions(self._db)
+            self.sub_title = "demo data"
+            self._populate_all()
+            self._refresh_pricing_warning()
 
     async def _initial_sync_worker(self) -> None:
-        db = Database()
-        try:
-            self._collectors.sync_all(db)
-            db.commit()
-        finally:
-            db.close()
-        self.call_from_thread(self._on_sync_done)
+        self._run_sync()
 
     def on_unmount(self) -> None:
         if self._auto_refresh_timer is not None:
@@ -215,6 +226,10 @@ class AgenticMetricApp(App):
         self._db.close()
 
     # ── Rendering ─────────────────────────────────────────────────────
+
+    def _set_initial_loading(self, loading: bool) -> None:
+        self.query_one("#loading-page", Vertical).display = loading
+        self.query_one("#dashboard", Vertical).display = not loading
 
     def _populate_all(self) -> None:
         self._populate_summary()
@@ -443,28 +458,94 @@ class AgenticMetricApp(App):
         if self._sync_in_progress:
             return
         self._sync_in_progress = True
-        self.sub_title = "syncing… · showing cached data"
+        if self._initial_sync_pending:
+            self.sub_title = "syncing usage data…"
+        else:
+            self.sub_title = "syncing… · showing cached data"
         self.run_worker(worker, thread=True, exclusive=True, group="sync")
 
     def _tick_sync(self) -> None:
         self._start_sync(self._sync_worker)
 
     async def _sync_worker(self) -> None:
-        db = Database()
+        self._run_sync()
+
+    def _run_sync(self) -> None:
+        db = None
+        error = ""
         try:
+            db = Database()
             self._collectors.sync_all(db)
             db.commit()
+        except Exception as exc:
+            error = str(exc)
         finally:
-            db.close()
-        self.call_from_thread(self._on_sync_done)
+            if db is not None:
+                try:
+                    db.close()
+                except Exception as exc:
+                    error = error or str(exc)
+        if error:
+            self.call_from_thread(self._on_sync_failed, error)
+        else:
+            self.call_from_thread(self._on_sync_done)
+
+    def _refresh_pricing_warning(self) -> None:
+        models = tuple(get_unpriced_models(self._db))
+        self._unpriced_models = list(models)
+        if models and models != self._last_pricing_warning:
+            self.notify(
+                f"Cost totals exclude: {', '.join(models)}. Press p for setup instructions.",
+                title="Pricing missing",
+                severity="warning",
+                timeout=10,
+                markup=False,
+            )
+        self._last_pricing_warning = models
+
+    def _finish_initial_sync(self) -> None:
+        if self._initial_sync_pending:
+            self._initial_sync_pending = False
+            self._set_initial_loading(False)
 
     def _on_sync_done(self) -> None:
         self._sync_in_progress = False
         self._today_sessions = get_today_sessions(self._db)
-        sync_errors = self._collectors.get_sync_errors()
-        suffix = f" · {len(sync_errors)} remote skipped" if sync_errors else ""
-        self.sub_title = f"synced {datetime.now().strftime('%H:%M:%S')}{suffix}"
         self._populate_all()
+        self._refresh_pricing_warning()
+
+        sync_errors = self._collectors.get_sync_errors()
+        status = "sync incomplete" if sync_errors else "synced"
+        error_suffix = f" · {len(sync_errors)} errors" if sync_errors else ""
+        pricing_suffix = " · pricing missing (p)" if self._unpriced_models else ""
+        self.sub_title = (
+            f"{status} {datetime.now().strftime('%H:%M:%S')}"
+            f"{error_suffix}{pricing_suffix}"
+        )
+        if sync_errors:
+            self.notify(
+                "\n".join(sync_errors),
+                title="Sync incomplete",
+                severity="warning",
+                timeout=10,
+                markup=False,
+            )
+        self._finish_initial_sync()
+
+    def _on_sync_failed(self, error: str) -> None:
+        self._sync_in_progress = False
+        self._today_sessions = get_today_sessions(self._db)
+        self._populate_all()
+        self._refresh_pricing_warning()
+        self.sub_title = "sync failed · showing cached data"
+        self.notify(
+            error,
+            title="Sync failed",
+            severity="error",
+            timeout=10,
+            markup=False,
+        )
+        self._finish_initial_sync()
 
     # ── Actions ───────────────────────────────────────────────────────
 
@@ -511,17 +592,8 @@ class AgenticMetricApp(App):
         self.query_one("#breakdown-scroll", VerticalScroll).scroll_page_down(animate=False)
 
     def action_show_pricing(self) -> None:
-        """Open the read-only pricing view, flagging unknown models in range."""
-        _label, frm, to = resolve_range(self._focus, offset=self._offset)
-        rows = get_range_by_agent_model(self._db, frm, to)
-        unknown: list[str] = []
-        for r in rows:
-            if not _has_unknown_cost(r):
-                continue
-            name = (r.get("raw_model") or r.get("model") or "").strip()
-            if name and name not in unknown:
-                unknown.append(name)
-        self.push_screen(PricingScreen(unknown))
+        """Open the read-only pricing view, flagging unpriced models."""
+        self.push_screen(PricingScreen(self._unpriced_models))
 
     def action_show_help(self) -> None:
         """Open the keybinding cheatsheet."""

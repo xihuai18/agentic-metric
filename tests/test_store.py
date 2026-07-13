@@ -4,12 +4,13 @@ import json
 import sqlite3
 import tempfile
 import asyncio
+import threading
 import pytest
 from typer.testing import CliRunner
 from datetime import datetime, timedelta
 from unittest.mock import patch
 
-from rich.console import Console
+from rich.console import Console, Group
 from textual.geometry import Size
 
 from agentic_metric import cli as cli_module
@@ -28,6 +29,8 @@ from agentic_metric.store.aggregator import (
     get_range_daily,
     get_range_totals,
     get_today_sessions,
+    get_trend,
+    get_unpriced_models,
 )
 from agentic_metric.formatting import fmt_cost as cli_fmt_cost
 from agentic_metric.tui.app import _summary_label
@@ -1090,6 +1093,7 @@ def test_unknown_model_cost_stays_null_and_surfaces_as_unknown(tmp_path):
 
         project_rows = get_range_by_project(db, "2026-04-24", "2026-04-24", limit=1)
         assert project_rows[0]["unknown_cost_count"] == 1
+        assert get_unpriced_models(db) == ["gpt-5.4-pro"]
 
         db.close()
     pricing._user_cache = None
@@ -1300,7 +1304,8 @@ def test_tui_breakdown_renders_all_models_for_scrollable_panel():
     rendered = console.export_text()
     assert "known-4" in rendered
     assert "Unknown" in rendered
-    assert "?" in rendered
+    assert "?" not in rendered
+    assert "—" in rendered
     assert "more models" not in rendered
 
 
@@ -1470,6 +1475,46 @@ def test_tui_heatmap_renders_current_range_provider_rollup():
     assert "anthropic" not in rendered
 
 
+def test_week_and_month_trends_use_one_aggregate_query(monkeypatch):
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 7, 14, 12, 0, 0)
+
+    db = _make_db()
+    for usage_date, cost in (
+        ("2026-06-01", 1.0),
+        ("2026-06-30", 2.0),
+        ("2026-07-13", 3.0),
+    ):
+        db.replace_session_usage(
+            usage_date,
+            "codex",
+            [{
+                "usage_date": usage_date,
+                "usage_hour": 10,
+                "model": "gpt-5.4",
+                "estimated_cost_usd": cost,
+            }],
+        )
+    db.commit()
+    monkeypatch.setattr(aggregator_module, "datetime", FixedDateTime)
+
+    statements = []
+    db.conn.set_trace_callback(statements.append)
+    week = get_trend(db, "week", 3)
+    week_selects = [sql for sql in statements if sql.lstrip().upper().startswith("SELECT")]
+    statements.clear()
+    month = get_trend(db, "month", 3)
+    month_selects = [sql for sql in statements if sql.lstrip().upper().startswith("SELECT")]
+
+    assert week == [("06-29", 2.0), ("07-06", 0.0), ("07-13", 3.0)]
+    assert month == [("26-05", 0.0), ("26-06", 3.0), ("26-07", 3.0)]
+    assert len(week_selects) == 2  # usage-source probe + aggregate
+    assert len(month_selects) == 2
+    db.close()
+
+
 def test_tui_heatmap_reports_enough_height_for_all_rendered_rows():
     widget = PeriodicHeatmap()
     widget.update_data(
@@ -1525,6 +1570,112 @@ def test_tui_sync_keeps_cached_data_visible_and_reports_progress(monkeypatch):
     db.close()
 
 
+def test_tui_initial_sync_shows_loading_page_until_dashboard_is_ready(
+    monkeypatch, tmp_path
+):
+    from agentic_metric.store.database import Database as RealDatabase
+    from agentic_metric.tui.app import AgenticMetricApp
+
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingCollectors:
+        def sync_all(self, db) -> None:
+            started.set()
+            assert release.wait(timeout=5)
+
+        def get_sync_errors(self) -> list[str]:
+            return []
+
+    monkeypatch.setattr(
+        "agentic_metric.tui.app.Database",
+        lambda *args, **kwargs: RealDatabase(db_path=str(tmp_path / "sync.db")),
+    )
+
+    async def run() -> None:
+        db = RealDatabase(db_path=str(tmp_path / "app.db"))
+        app = AgenticMetricApp(db=db, collectors=BlockingCollectors())
+        async with app.run_test(headless=True, size=(120, 36)) as pilot:
+            assert await asyncio.to_thread(started.wait, 1)
+            assert app.query_one("#loading-page").display is True
+            assert app.query_one("#dashboard").display is False
+
+            release.set()
+            for _ in range(20):
+                await pilot.pause()
+                if not app._sync_in_progress:
+                    break
+
+            assert app.query_one("#loading-page").display is False
+            assert app.query_one("#dashboard").display is True
+
+    asyncio.run(run())
+
+
+def test_tui_pricing_warning_is_deduplicated(monkeypatch, tmp_path):
+    from agentic_metric.store.database import Database as RealDatabase
+    from agentic_metric.tui.app import AgenticMetricApp
+
+    db = RealDatabase(db_path=str(tmp_path / "app.db"))
+    db.replace_session_usage(
+        "unpriced",
+        "codex",
+        [{
+            "usage_date": "2026-07-14",
+            "usage_hour": 10,
+            "model": "future-model",
+            "input_tokens": 100,
+        }],
+    )
+    db.commit()
+    app = AgenticMetricApp(db=db, sync_on_mount=False)
+    notices = []
+    monkeypatch.setattr(app, "notify", lambda message, **kwargs: notices.append((message, kwargs)))
+
+    app._refresh_pricing_warning()
+    app._refresh_pricing_warning()
+
+    assert app._unpriced_models == ["future-model"]
+    assert len(notices) == 1
+    assert "future-model" in notices[0][0]
+    assert notices[0][1]["title"] == "Pricing missing"
+    db.close()
+
+
+def test_tui_initial_sync_failure_reveals_cached_dashboard(monkeypatch, tmp_path):
+    from agentic_metric.store.database import Database as RealDatabase
+    from agentic_metric.tui.app import AgenticMetricApp
+
+    class FailingCollectors:
+        def sync_all(self, db) -> None:
+            raise RuntimeError("sync exploded")
+
+        def get_sync_errors(self) -> list[str]:
+            return []
+
+    monkeypatch.setattr(
+        "agentic_metric.tui.app.Database",
+        lambda *args, **kwargs: RealDatabase(db_path=str(tmp_path / "sync.db")),
+    )
+
+    async def run() -> None:
+        db = RealDatabase(db_path=str(tmp_path / "app.db"))
+        app = AgenticMetricApp(db=db, collectors=FailingCollectors())
+        async with app.run_test(
+            headless=True, size=(120, 36), notifications=False
+        ) as pilot:
+            for _ in range(20):
+                await pilot.pause()
+                if not app._sync_in_progress:
+                    break
+
+            assert app.query_one("#loading-page").display is False
+            assert app.query_one("#dashboard").display is True
+            assert app.sub_title == "sync failed · showing cached data"
+
+    asyncio.run(run())
+
+
 def test_tui_heatmap_provider_rollup_handles_unknown_cost():
     widget = PeriodicHeatmap()
     widget.update_data(
@@ -1545,7 +1696,7 @@ def test_tui_heatmap_provider_rollup_handles_unknown_cost():
     console.print(widget.render())
     rendered = console.export_text()
     assert "ichat · $3.00" in rendered
-    assert "custom · ?" in rendered
+    assert "custom · —" in rendered
     assert "(100.0%)" not in rendered
 
 
@@ -1816,6 +1967,69 @@ def test_report_header_shows_provider_rollup_in_default_view(monkeypatch):
     assert "By provider" not in rendered
 
 
+def test_cli_sync_status_only_animates_on_interactive_output(monkeypatch):
+    events = []
+
+    class Status:
+        def __enter__(self):
+            events.append("enter")
+
+        def __exit__(self, *args):
+            events.append("exit")
+
+    class FakeConsole:
+        is_terminal = True
+
+        def status(self, message, *, spinner):
+            events.append((message, spinner))
+            return Status()
+
+    monkeypatch.setattr(cli_module, "console", FakeConsole())
+    with cli_module._sync_status("Syncing usage data…"):
+        events.append("work")
+    assert events == [
+        ("Syncing usage data…", "dots"),
+        "enter",
+        "work",
+        "exit",
+    ]
+
+    events.clear()
+    with cli_module._sync_status("Syncing usage data…", enabled=False):
+        events.append("work")
+    assert events == ["work"]
+
+
+def test_sync_command_reports_partial_failure(monkeypatch, tmp_path):
+    class FailingRegistry:
+        def sync_all(self, db) -> None:
+            return None
+
+        def get_sync_errors(self) -> list[str]:
+            return ["codex /tmp/root: collector failed"]
+
+        def get_all(self) -> list:
+            return []
+
+    from agentic_metric.store.database import Database as RealDatabase
+
+    monkeypatch.setattr(
+        "agentic_metric.collectors.create_default_registry",
+        lambda: FailingRegistry(),
+    )
+    monkeypatch.setattr(
+        "agentic_metric.store.database.Database",
+        lambda: RealDatabase(db_path=str(tmp_path / "sync.db")),
+    )
+
+    result = CliRunner().invoke(cli_app, ["sync"])
+
+    assert result.exit_code == 1
+    assert "Sync incomplete" in result.output
+    assert "collector failed" in result.output
+    assert "Sync complete" not in result.output
+
+
 def test_unknown_models_note_lists_distinct_models():
     note = cli_module._build_unknown_models_note([
         {"model": "Unknown", "raw_model": "gpt-6", "unknown_cost_count": 2},
@@ -1828,11 +2042,50 @@ def test_unknown_models_note_lists_distinct_models():
     buf = _io.StringIO()
     _C(file=buf, width=100, no_color=True).print(note)
     text = buf.getvalue()
-    assert "Unknown models" in text
-    assert text.count("gpt-6") == 1  # deduplicated
+    assert "Pricing missing" in text
+    assert "Cost totals exclude unpriced models" in text
+    assert text.count("gpt-6") == 2  # warning list + setup command
     assert "pricing set" in text
     # No unknowns → no note
     assert cli_module._build_unknown_models_note([{"model": "gpt-5.5", "unknown_cost_count": 0}]) is None
+
+
+def test_cli_mixed_pricing_keeps_costs_numeric_and_warns_once():
+    rows = [
+        {
+            "agent_type": "codex",
+            "provider": "openai",
+            "data_root": "/tmp/codex",
+            "model": "gpt-5.4",
+            "raw_model": "gpt-5.4",
+            "input_tokens": 100,
+            "estimated_cost_usd": 5.0,
+            "unknown_cost_count": 0,
+        },
+        {
+            "agent_type": "codex",
+            "provider": "openai",
+            "data_root": "/tmp/codex",
+            "model": "Unknown",
+            "raw_model": "future-model",
+            "input_tokens": 200,
+            "estimated_cost_usd": 0.0,
+            "unknown_cost_count": 1,
+        },
+    ]
+    table = cli_module._build_by_agent_model_table(rows)
+    note = cli_module._build_unknown_models_note(rows)
+    from rich.console import Console as _C
+    import io as _io
+    buf = _io.StringIO()
+    _C(file=buf, width=120, no_color=True).print(Group(table, note))
+    text = buf.getvalue()
+
+    assert "$5.00" in text
+    assert "future-model" in text
+    assert "—" in text
+    assert "?" not in text
+    assert text.count("Pricing missing") == 1
 
 
 def test_breakdown_table_rolls_up_models_past_limit():
@@ -2164,17 +2417,13 @@ def test_tui_summary_follows_focused_time_offset(monkeypatch, tmp_path):
     from agentic_metric.tui.app import AgenticMetricApp
     from agentic_metric.store.database import Database as RealDatabase
 
-    async def no_initial_sync(self):
-        return None
-
-    monkeypatch.setattr(AgenticMetricApp, "_initial_sync_worker", no_initial_sync)
     monkeypatch.setattr(
         "agentic_metric.tui.app.Database",
         lambda *args, **kwargs: RealDatabase(db_path=str(tmp_path / "data.db")),
     )
 
     async def run() -> None:
-        app = AgenticMetricApp()
+        app = AgenticMetricApp(sync_on_mount=False)
         async with app.run_test(headless=True, size=(120, 36)) as pilot:
             def labels() -> list[str]:
                 return [
@@ -2274,12 +2523,12 @@ def test_pricing_set_commands_missing_args_exit_nonzero():
         assert "Usage:" in result.output
 
 
-def test_cost_format_shows_known_amount_plus_unknown_marker():
-    assert cli_fmt_cost(12.34, unknown=True) == "$12.34 + ?"
-    assert tui_fmt_cost(12.34, unknown=True) == "$12.34 + ?"
-    assert cli_fmt_cost(0.1234, unknown=True) == "$0.123 + ?"
-    assert tui_fmt_cost(0.1234, unknown=True) == "$0.123 + ?"
-    assert cli_fmt_cost(0.0, unknown=True) == "?"
-    assert tui_fmt_cost(0.0, unknown=True) == "?"
-    assert cli_fmt_cost(None, unknown=True) == "?"
-    assert tui_fmt_cost(None, unknown=True) == "?"
+def test_cost_format_keeps_unknown_state_out_of_numeric_values():
+    assert cli_fmt_cost(12.34, unknown=True) == "$12.34"
+    assert tui_fmt_cost(12.34, unknown=True) == "$12.34"
+    assert cli_fmt_cost(0.1234, unknown=True) == "$0.123"
+    assert tui_fmt_cost(0.1234, unknown=True) == "$0.123"
+    assert cli_fmt_cost(0.0, unknown=True) == "—"
+    assert tui_fmt_cost(0.0, unknown=True) == "—"
+    assert cli_fmt_cost(None, unknown=True) == "—"
+    assert tui_fmt_cost(None, unknown=True) == "—"

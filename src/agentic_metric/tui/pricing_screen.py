@@ -44,9 +44,13 @@ class PricingScreen(ModalScreen):
         ]
 
         if self._unknown:
-            unk = Text("  Unknown models: ", style="bright_yellow")
-            unk.append(", ".join(self._unknown), style="bold bright_magenta")
-            blocks.append(unk)
+            missing = Text("  Pricing missing: ", style="bright_yellow")
+            missing.append(", ".join(self._unknown), style="bold bright_magenta")
+            blocks.append(missing)
+            blocks.append(Text(
+                "  Cost totals exclude these models until pricing is set.",
+                style="white",
+            ))
             blocks.append(Text(
                 "  set with: agentic-metric pricing set <model> -i <input> -o <output>",
                 style="white",

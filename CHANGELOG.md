@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.7.7 (2026-07-14)
+
+### Improvements
+
+- **Clear synchronization states**: first-run TUI sync now uses a dedicated
+  loading page, while interactive CLI syncs show a spinner.
+- **Missing-pricing guidance**: unpriced models keep their usage metrics but are
+  excluded from cost totals; CLI and TUI now list affected models outside the
+  numeric cost fields.
+- **Faster reports and trends**: default reports skip unused drill-down queries,
+  and week/month trend buckets are aggregated with one query per chart.
+
+### Fixes
+
+- **Visible sync failures**: collector errors are no longer silently reported as
+  success, and a failed initial TUI sync falls back to the cached dashboard.
+
 ## v0.7.6 (2026-07-13)
 
 ### Improvements

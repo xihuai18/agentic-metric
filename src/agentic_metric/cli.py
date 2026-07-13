@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 import json
 import time
@@ -93,6 +94,15 @@ def _cache_pct_text(cache_pct: float) -> Text:
     return Text(f"{cache_pct:.0f}%", style=_cache_pct_style(cache_pct))
 
 
+@contextmanager
+def _sync_status(message: str, *, enabled: bool = True):
+    if enabled and console.is_terminal:
+        with console.status(message, spinner="dots"):
+            yield
+    else:
+        yield
+
+
 # Boxed panels (header + heatmap) share one width: capped, but adapting
 # down to narrower terminals.
 MAX_PANEL_WIDTH = 100
@@ -169,6 +179,7 @@ def sync(
     """Force sync all collectors to the database."""
     from .collectors import create_default_registry
     from .config import DB_PATH
+    from .store import aggregator
     from .store.database import Database
 
     if rebuild:
@@ -186,23 +197,35 @@ def sync(
     registry = create_default_registry()
 
     action = "Rebuilding and syncing" if rebuild else "Syncing"
-    console.print(f"[{C_SUBTEXT}]{action} all collectors…[/]")
-    registry.sync_all(db)
+    with _sync_status(f"{action} all collectors…"):
+        registry.sync_all(db)
+        db.commit()
+    sync_errors = registry.get_sync_errors()
+    unpriced_models = aggregator.get_unpriced_models(db)
     db.close()
+
+    if sync_errors:
+        console.print(f"[bold {C_YELLOW}]Sync incomplete[/]")
+        for error in sync_errors:
+            console.print(Text(f"  • {error}", style=C_YELLOW))
+        pricing_note = _build_pricing_missing_note(unpriced_models)
+        if pricing_note is not None:
+            console.print(pricing_note)
+        raise typer.Exit(1)
 
     console.print(f"[bold {C_GREEN}]✓ Sync complete[/]")
     for c in registry.get_all():
         provider = getattr(c, "provider", "") or "—"
         data_root = _shorten_home(getattr(c, "data_root", "") or "") or "—"
-        last_error = getattr(c, "last_error", "")
         console.print(
             f"  [{C_MUTED}]•[/] "
             f"[{C_MAUVE}]{c.agent_type}[/]  "
             f"[{C_SKY}]{provider}[/]  "
             f"[{C_MUTED}]{data_root}[/]"
         )
-        if last_error:
-            console.print(f"    [{C_YELLOW}]remote sync skipped: {last_error}[/]")
+    pricing_note = _build_pricing_missing_note(unpriced_models)
+    if pricing_note is not None:
+        console.print(pricing_note)
 
 
 # ── report ─────────────────────────────────────────────────────────
@@ -273,22 +296,34 @@ def report(
             console.print(f"[{C_YELLOW}]Pricing changed; syncing history to refresh event-level costs.[/]")
         if db.pricing_changed or not no_sync:
             registry = create_default_registry()
-            registry.sync_all(db)
+            with _sync_status("Syncing usage data…", enabled=not json_):
+                registry.sync_all(db)
+                db.commit()
             sync_errors = registry.get_sync_errors()
-            db.commit()
 
+        detailed = full or json_
         totals = aggregator.get_range_totals(db, frm, to)
-        by_host = aggregator.get_range_by_host(db, frm, to)
-        by_agent_type = aggregator.get_range_by_agent_type(db, frm, to)
         by_provider = aggregator.get_range_by_provider(db, frm, to)
-        by_model = aggregator.get_range_by_model(db, frm, to)
-        by_agent = aggregator.get_range_by_agent(db, frm, to)
         by_agent_model = aggregator.get_range_by_agent_model(db, frm, to)
-        by_provider_model = aggregator.get_range_by_provider_model(db, frm, to)
-        by_agent_type_model = aggregator.get_range_by_agent_type_model(db, frm, to)
         by_project = aggregator.get_range_by_project(db, frm, to, limit=limit)
-        by_project_agent = aggregator.get_range_by_project_agent(db, frm, to, limit=limit)
-        by_project_model = aggregator.get_range_by_project_model(db, frm, to, limit=limit)
+        by_host = aggregator.get_range_by_host(db, frm, to) if detailed else []
+        by_agent_type = aggregator.get_range_by_agent_type(db, frm, to) if detailed else []
+        by_model = aggregator.get_range_by_model(db, frm, to) if detailed else []
+        by_agent = aggregator.get_range_by_agent(db, frm, to) if detailed else []
+        by_provider_model = (
+            aggregator.get_range_by_provider_model(db, frm, to) if detailed else []
+        )
+        by_agent_type_model = (
+            aggregator.get_range_by_agent_type_model(db, frm, to) if detailed else []
+        )
+        by_project_agent = (
+            aggregator.get_range_by_project_agent(db, frm, to, limit=limit)
+            if detailed else []
+        )
+        by_project_model = (
+            aggregator.get_range_by_project_model(db, frm, to, limit=limit)
+            if detailed else []
+        )
         # Periodic breakdown (hourly/daily/weekly) — only when the range
         # corresponds to a named focus.
         focus_kind = None
@@ -316,8 +351,9 @@ def report(
             )
         else:
             if sync_errors:
+                console.print(f"[bold {C_YELLOW}]Sync incomplete[/]")
                 for err in sync_errors:
-                    console.print(f"[{C_YELLOW}]remote sync skipped: {err}[/]")
+                    console.print(Text(f"  • {err}", style=C_YELLOW))
             _print_report(
                 label, frm, to, totals,
                 by_host, by_agent_type, by_provider, by_model,
@@ -570,6 +606,9 @@ def _print_report(
 
     console.print()
     console.print(header_panel)
+    unknown_note = _build_unknown_models_note(by_agent_model)
+    if unknown_note is not None:
+        console.print(unknown_note)
     if heatmap_renderable is not None:
         console.print(heatmap_renderable)
 
@@ -577,40 +616,46 @@ def _print_report(
         if t is not None:
             console.print(t)
 
-    unknown_note = _build_unknown_models_note(by_agent_model)
-    if unknown_note is not None:
-        console.print(unknown_note)
-
     console.print()
 
 
-def _build_unknown_models_note(by_agent_model: list[dict]) -> Group | None:
-    """Hint the user how to price models whose cost is shown as '?'."""
-    seen: list[str] = []
-    for r in by_agent_model:
-        if not _has_unknown_cost(r):
+def _build_unknown_models_note(by_agent_model: list[dict]) -> Panel | None:
+    """Explain why displayed cost totals may exclude some model usage."""
+    models: list[str] = []
+    for row in by_agent_model:
+        if not _has_unknown_cost(row):
             continue
-        name = (r.get("raw_model") or r.get("model") or "").strip()
-        if name and name not in seen:
-            seen.append(name)
-    if not seen:
-        return None
+        name = (row.get("raw_model") or row.get("model") or "").strip()
+        if name and name not in models:
+            models.append(name)
+    return _build_pricing_missing_note(models)
 
+
+def _build_pricing_missing_note(models: list[str]) -> Panel | None:
+    if not models:
+        return None
     lines: list[Text] = [
         Text.assemble(
-            ("Unknown models", f"bold {C_YELLOW}"),
-            (" — cost shown as ", C_MUTED),
-            ("?", f"bold {C_YELLOW}"),
-            (". Set pricing (USD per 1M tokens):", C_MUTED),
-        )
+            ("Cost totals exclude unpriced models: ", C_MUTED),
+            (", ".join(models), f"bold {C_MAUVE}"),
+        ),
+        Text("Set pricing (USD per 1M tokens):", style=C_MUTED),
     ]
-    for name in seen:
+    for name in models:
         lines.append(Text.assemble(
             ("  agentic-metric pricing set ", C_MUTED),
             (name, C_MAUVE),
             (" -i <input> -o <output>", C_MUTED),
         ))
-    return Group(*lines)
+    return Panel(
+        Group(*lines),
+        title="Pricing missing",
+        title_align="left",
+        box=box.ROUNDED,
+        border_style=C_YELLOW,
+        width=_panel_width(),
+        padding=(0, 1),
+    )
 
 
 def _build_provider_rollup_block(

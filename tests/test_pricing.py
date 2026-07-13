@@ -7,7 +7,6 @@ import pytest
 
 from agentic_metric.pricing import (
     PRICING,
-    _BUILTIN_PRICING,
     _load_user_pricing,
     disable_builtin_long_context,
     enable_builtin_long_context,
@@ -87,7 +86,7 @@ def test_unknown_model_with_positive_usage_has_unknown_cost(caplog):
     caplog.set_level("WARNING", logger="agentic_metric.pricing")
 
     assert estimate_cost("unknown-model-xyz", input_tokens=1) is None
-    assert "Unknown model 'unknown-model-xyz'" in caplog.text
+    assert "Unknown model" not in caplog.text
 
 
 def test_no_family_fallback_claude():

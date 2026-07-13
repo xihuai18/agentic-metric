@@ -21,8 +21,8 @@ caches a local copy for aggregation.
 ## Features
 
 - **Cost estimation** — Per-model pricing table with CLI management, calculates API-equivalent costs; supports long-context and cache-duration pricing
-- **Unified report** — One `report` command for today / week / month / custom date range, with agent × provider × model breakdown, top projects, cost drivers, and hourly/daily/weekly heatmaps
-- **TUI dashboard** — Terminal UI with auto-refresh, stacked summary cells, heatmap strip, 30-day cost chart, and agent → provider → model breakdown
+- **Unified report** — One `report` command for today / week / month / custom date range, with agent × provider × model breakdown, top projects, and hourly/daily heatmaps
+- **TUI dashboard** — Terminal UI with auto-refresh, stacked summary cells, heatmap strip, adaptive 14-day / 12-week / 12-month cost trends, and agent → provider → model breakdown
 - **Multi-agent** — Plugin architecture; supports Claude Code and Codex today, extensible
 
 ## Agent Data Coverage
@@ -97,8 +97,8 @@ agentic-metric pricing               # Manage model pricing
 `report` shows a header with total cost / sessions / turns / tokens / cache-hit
 rate, a delta vs. the previous equivalent period, a compact provider cost
 rollup, a heatmap strip (hours for
-`--today`, days for `--week`, weeks for `--month`), plus a default `agent × provider × model`
-breakdown, top projects, top cost drivers, and optional extra drill-down tables.
+`--today`, days for `--week` and `--month`), plus a default `agent × provider × model`
+breakdown, top projects, and optional extra drill-down tables.
 
 ### Pricing Management
 
@@ -141,8 +141,10 @@ agentic-metric pricing cache set claude-sonnet-4 --write-1h 6    # Set 1h cache 
 agentic-metric pricing cache reset claude-sonnet-4                # Remove override
 ```
 
-Unknown models are not priced by default. They are displayed as `Unknown` with
-cost `?` until you add explicit pricing with `agentic-metric pricing set`.
+Unknown models are not priced by default. Their usage and tokens remain in the
+report, but cost totals exclude them until you add explicit pricing with
+`agentic-metric pricing set`. The CLI and TUI show a `Pricing missing` warning
+with the affected model names instead of mixing `?` into numeric cost fields.
 Provider speed/priority modes are not shown or priced separately because the
 local history files do not expose reliable non-standard markers.
 
@@ -165,7 +167,7 @@ Shown in the footer as: `PgUp/PgDn Range · ←→ View · . Now · r Auto-refre
 | `.` | Now | Jump back to "now" (reset offset) |
 | `↑` / `↓` | — | Scroll the breakdown panel |
 | `r` | Auto-refresh | Toggle fast auto-refresh; pauses the slow periodic sync while active |
-| `p` | Pricing | Open the read-only pricing view (flags unknown models in range) |
+| `p` | Pricing | Open the read-only pricing view (flags models with missing prices) |
 | `?` | Help | Show the keybinding cheatsheet |
 | `q` | Quit | Quit |
 
@@ -263,7 +265,7 @@ src/agentic_metric/
     ├── app.py            # Textual TUI application
     ├── widgets.py        # Custom TUI widgets (summary cells, heatmap, trend)
     ├── help_screen.py    # Keybinding cheatsheet modal
-    ├── pricing_screen.py # Read-only pricing view (flags unknown models)
+    ├── pricing_screen.py # Read-only pricing view (flags missing prices)
     └── styles.tcss       # Textual CSS
 ```
 

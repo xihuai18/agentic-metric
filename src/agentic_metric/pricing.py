@@ -522,11 +522,7 @@ def get_pricing(model: str) -> tuple[float, float, float, float] | None:
 
     if model and model not in _warned_models:
         _warned_models.add(model)
-        log.warning(
-            "Unknown model %r — cost will be shown as '?'. "
-            "Run 'agentic-metric pricing set' to configure pricing.",
-            model,
-        )
+        log.debug("Unknown model %r has no configured pricing", model)
     return None
 
 

@@ -45,6 +45,29 @@ def test_registry_register():
     assert registry.get_all()[0].agent_type == "mock"
 
 
+def test_registry_reports_collector_exceptions_and_rolls_back():
+    class FailingCollector(BaseCollector):
+        @property
+        def agent_type(self) -> str:
+            return "failing"
+
+        def sync_history(self, db) -> None:
+            db.conn.execute(
+                "INSERT INTO sync_state (key, value) VALUES ('partial', 'written')"
+            )
+            raise RuntimeError("collector failed")
+
+    db = Database(db_path=":memory:")
+    registry = CollectorRegistry()
+    registry.register(FailingCollector())
+
+    registry.sync_all(db)
+
+    assert db.get_sync_state("partial") is None
+    assert registry.get_sync_errors() == ["failing: collector failed"]
+    db.close()
+
+
 def test_default_registry_uses_configured_roots(tmp_path):
     config_file = tmp_path / "config.json"
     config_file.write_text(json.dumps({

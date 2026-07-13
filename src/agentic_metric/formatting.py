@@ -8,10 +8,10 @@ from pathlib import Path
 
 def fmt_cost(cost: float | None, *, unknown: bool = False) -> str:
     cost_value = 0.0 if cost is None else cost
-    if unknown and cost_value > 0:
-        return f"{fmt_cost(cost_value)} + ?"
-    if unknown or cost is None:
-        return "?"
+    if unknown and cost_value <= 0:
+        return "—"
+    if cost is None:
+        return "—"
     if cost_value >= 1.0:
         return f"${cost_value:,.2f}"
     return f"${cost_value:.3f}"

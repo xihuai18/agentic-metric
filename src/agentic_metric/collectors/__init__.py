@@ -23,6 +23,7 @@ class CollectorRegistry:
 
     def __init__(self) -> None:
         self._collectors: list[BaseCollector] = []
+        self._sync_errors: list[str] = []
 
     def register(self, collector: BaseCollector) -> None:
         self._collectors.append(collector)
@@ -30,25 +31,29 @@ class CollectorRegistry:
     def get_all(self) -> list[BaseCollector]:
         return list(self._collectors)
 
+    @staticmethod
+    def _label(collector: BaseCollector) -> str:
+        agent_type = getattr(collector, "agent_type", "collector")
+        data_root = getattr(collector, "data_root", "")
+        return f"{agent_type} {data_root}".strip()
+
     def sync_all(self, db) -> None:
         """Sync all collectors' history into the database."""
+        self._sync_errors = []
         for collector in self._collectors:
             try:
                 collector.sync_history(db)
-            except Exception:
-                pass
+            except Exception as exc:
+                db.conn.rollback()
+                self._sync_errors.append(f"{self._label(collector)}: {exc}")
 
     def get_sync_errors(self) -> list[str]:
         """Return collector sync errors that were captured during sync."""
-        errors: list[str] = []
+        errors = list(self._sync_errors)
         for collector in self._collectors:
             last_error = getattr(collector, "last_error", "")
-            if not last_error:
-                continue
-            agent_type = getattr(collector, "agent_type", "collector")
-            data_root = getattr(collector, "data_root", "")
-            label = f"{agent_type} {data_root}".strip()
-            errors.append(f"{label}: {last_error}")
+            if last_error:
+                errors.append(f"{self._label(collector)}: {last_error}")
         return errors
 
 

@@ -20,8 +20,8 @@ agent 数据文件(`~/.claude/`、`~/.codex/`);如果配置了 SSH
 ## 功能
 
 - **成本估算** — 基于各模型定价表计算 API 等效成本,支持 CLI 管理定价;支持长上下文和缓存时长定价
-- **统一的用量报告** — 单个 `report` 命令覆盖今日 / 本周 / 本月 / 自定义区间,含 agent × provider × model 明细、项目排行、cost drivers、小时/天/周热图
-- **TUI 仪表盘** — 终端图形界面,自动刷新,含汇总卡片、热图条、30 天成本柱图、agent → provider → model 分解
+- **统一的用量报告** — 单个 `report` 命令覆盖今日 / 本周 / 本月 / 自定义区间,含 agent × provider × model 明细、项目排行和小时/天热图
+- **TUI 仪表盘** — 终端图形界面,自动刷新,含汇总卡片、热图条、自适应 14 天 / 12 周 / 12 月成本趋势和 agent → provider → model 分解
 - **多 Agent 支持** — 插件架构;目前支持 Claude Code 和 Codex,可扩展
 
 ## 各 Agent 指标覆盖情况
@@ -93,8 +93,8 @@ agentic-metric pricing               # 管理模型定价
 | `--no-sync` | 跳过查询前的 collector 同步 |
 
 `report` 会输出:总成本 / sessions / 用户轮次 / tokens / 缓存命中率的汇总条,
-与上一同类周期的差额、provider 成本汇总,一个热图条(`--today` 按小时、`--week` 按日、`--month`
-按周),默认展示 agent × provider × model 明细、项目排行、cost drivers,并可按需展开额外明细表。
+与上一同类周期的差额、provider 成本汇总,一个热图条(`--today` 按小时、`--week` 和 `--month`
+按日),默认展示 agent × provider × model 明细、项目排行,并可按需展开额外明细表。
 
 ### 定价管理
 
@@ -131,7 +131,7 @@ agentic-metric pricing cache set claude-sonnet-4 --write-1h 6    # 设置 1 小�
 agentic-metric pricing cache reset claude-sonnet-4                # 删除覆盖
 ```
 
-未知模型不会自动套用默认价或模型族价格。界面会显示为 `Unknown`,费用显示为 `?`,直到你用 `agentic-metric pricing set` 添加明确价格。
+未知模型不会自动套用默认价或模型族价格。它们的用量和 tokens 仍会纳入报告,但在你用 `agentic-metric pricing set` 添加明确价格前不会计入费用总额。CLI 和 TUI 会集中显示 `Pricing missing` 提示及模型名称,不会在费用数字里混入 `?`。
 
 定价变更后,命令会自动重新同步历史数据,从原始 JSONL 数据重新计算事件级成本(如长上下文请求)。
 
@@ -151,7 +151,7 @@ agentic-metric pricing cache reset claude-sonnet-4                # 删除覆盖
 | `.` | Now | 回到"现在"(清空 offset) |
 | `↑` / `↓` | — | 滚动明细面板 |
 | `r` | Auto-refresh | 切换快速自动刷新;开启时暂停慢速周期 sync |
-| `p` | Pricing | 打开只读价格视图(高亮当前范围内的未知模型) |
+| `p` | Pricing | 打开只读价格视图(标出缺少价格的模型) |
 | `?` | Help | 显示快捷键速查表 |
 | `q` | Quit | 退出 |
 
@@ -247,7 +247,7 @@ src/agentic_metric/
     ├── app.py            # Textual TUI 应用
     ├── widgets.py        # 自定义 TUI 组件(汇总卡片、热图、趋势)
     ├── help_screen.py    # 快捷键速查表弹窗
-    ├── pricing_screen.py # 只读定价视图(标记未知模型)
+    ├── pricing_screen.py # 只读定价视图(标出缺少价格的模型)
     └── styles.tcss       # Textual CSS
 ```
 

@@ -45,6 +45,38 @@ FooterKey.-auto-on {
     }
 }
 
+/* ─── Initial sync ─── */
+
+#loading-page {
+    height: 1fr;
+    align: center middle;
+}
+
+#loading-indicator {
+    width: 16;
+    height: 1;
+    margin-bottom: 1;
+    color: $warning;
+}
+
+#loading-title {
+    width: auto;
+    height: 1;
+    color: $text;
+    text-style: bold;
+}
+
+#loading-detail {
+    width: auto;
+    height: 1;
+    margin-top: 1;
+    color: $text-muted;
+}
+
+#dashboard {
+    height: 1fr;
+}
+
 /* ─── Top summary row: 3 cells side by side ─── */
 
 #summary-row {

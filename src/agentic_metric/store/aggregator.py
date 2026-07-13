@@ -229,6 +229,19 @@ def resolve_range(kind: str, offset: int = 0) -> tuple[str, str, str]:
     raise ValueError(f"Unknown range kind: {kind}")
 
 
+def get_unpriced_models(db: Database) -> list[str]:
+    """Return model ids whose usage has no configured price."""
+    usage = _usage_source(db)
+    rows = db.conn.execute(
+        f"""SELECT DISTINCT model
+            FROM {usage}
+            WHERE estimated_cost_usd IS NULL
+              AND model != ''
+            ORDER BY model"""
+    ).fetchall()
+    return [str(row["model"]) for row in rows]
+
+
 def get_range_totals(db: Database, from_date: str, to_date: str) -> dict:
     """Return summary totals for sessions within ``[from_date, to_date]`` inclusive."""
     usage = _usage_source(db)
@@ -867,25 +880,24 @@ def get_trend(db: Database, unit: str, count: int) -> list[tuple[str, float]]:
         return list(zip(labels, [seen.get(k, 0.0) for k in keys]))
 
     if unit == "week":
-        # Each bucket is a Monday-aligned week. Build Mondays oldest → newest.
         this_monday = today - timedelta(days=today.weekday())
         mondays = [this_monday - timedelta(weeks=i) for i in range(count - 1, -1, -1)]
-        buckets: list[tuple[str, str]] = []
-        for m in mondays:
-            sunday = m + timedelta(days=6)
-            buckets.append((m.strftime("%Y-%m-%d"), sunday.strftime("%Y-%m-%d")))
         labels = [m.strftime("%m-%d") for m in mondays]
-
-        result: list[tuple[str, float]] = []
-        for (wk_from, wk_to), label in zip(buckets, labels):
-            row = db.conn.execute(
-                f"""SELECT COALESCE(SUM(estimated_cost_usd), 0) AS cost
-                   FROM {usage}
-                   WHERE usage_date BETWEEN ? AND ?""",
-                (wk_from, wk_to),
-            ).fetchone()
-            result.append((label, row["cost"] if row else 0.0))
-        return result
+        from_d = mondays[0].strftime("%Y-%m-%d")
+        to_d = (this_monday + timedelta(days=6)).strftime("%Y-%m-%d")
+        rows = db.conn.execute(
+            f"""SELECT date(
+                          usage_date,
+                          printf('-%d days', (CAST(strftime('%w', usage_date) AS INTEGER) + 6) % 7)
+                      ) AS bucket,
+                      COALESCE(SUM(estimated_cost_usd), 0) AS cost
+               FROM {usage}
+               WHERE usage_date BETWEEN ? AND ?
+               GROUP BY bucket""",
+            (from_d, to_d),
+        ).fetchall()
+        seen = {row["bucket"]: row["cost"] for row in rows}
+        return list(zip(labels, [seen.get(m.strftime("%Y-%m-%d"), 0.0) for m in mondays]))
 
     if unit == "month":
         # Build (year, month) pairs oldest → newest.
@@ -900,17 +912,19 @@ def get_trend(db: Database, unit: str, count: int) -> list[tuple[str, float]]:
         months.reverse()
         labels = [f"{y % 100:02d}-{m:02d}" for (y, m) in months]
 
-        result = []
-        for label, (y, m) in zip(labels, months):
-            start, end = _month_bounds_for(y, m)
-            row = db.conn.execute(
-                f"""SELECT COALESCE(SUM(estimated_cost_usd), 0) AS cost
-                   FROM {usage}
-                   WHERE usage_date BETWEEN ? AND ?""",
-                (start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")),
-            ).fetchone()
-            result.append((label, row["cost"] if row else 0.0))
-        return result
+        start, _ = _month_bounds_for(*months[0])
+        _, end = _month_bounds_for(*months[-1])
+        rows = db.conn.execute(
+            f"""SELECT substr(usage_date, 1, 7) AS bucket,
+                      COALESCE(SUM(estimated_cost_usd), 0) AS cost
+               FROM {usage}
+               WHERE usage_date BETWEEN ? AND ?
+               GROUP BY bucket""",
+            (start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")),
+        ).fetchall()
+        seen = {row["bucket"]: row["cost"] for row in rows}
+        keys = [f"{y:04d}-{m:02d}" for y, m in months]
+        return list(zip(labels, [seen.get(key, 0.0) for key in keys]))
 
     raise ValueError(f"Unknown trend unit: {unit}")
 
