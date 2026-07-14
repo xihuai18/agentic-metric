@@ -533,13 +533,13 @@ def _print_report(
     )
     header_items: list[object] = [header_text, Text(""), stats]
     if provider_rollup is not None:
-        header_items.extend([Text(""), provider_rollup])
+        header_items.append(provider_rollup)
 
     header_panel = Panel(
         Group(*header_items),
         box=box.ROUNDED,
         border_style=C_SURFACE1,
-        padding=(1, 2),
+        padding=(0, 2),
         width=panel_width,
     )
 
@@ -664,7 +664,7 @@ def _build_provider_rollup_block(
     *,
     total_unknown: bool = False,
     limit: int = 4,
-) -> Text | None:
+) -> Text | Group | None:
     """Compact provider cost rollup for the report header."""
     entries = [r for r in by_provider if _has_cost_signal(r)][:limit]
     if not entries:
@@ -672,11 +672,17 @@ def _build_provider_rollup_block(
 
     all_entries = [r for r in by_provider if _has_cost_signal(r)]
     any_unknown = total_unknown or any(_has_unknown_cost(r) for r in all_entries)
+    narrow = _console_width() < 96
+    lines = [Text()] if narrow else []
+    line = lines[0] if narrow else Text()
+    line.append("Providers  " if narrow else "Providers ", style=C_MUTED)
+    label_width = len("Providers  ")
 
-    line = Text()
-    line.append("Providers ", style=C_MUTED)
     for i, row in enumerate(entries):
-        if i:
+        if narrow and i:
+            line = Text(" " * label_width)
+            lines.append(line)
+        elif i:
             line.append(" · ", style=C_MUTED)
         provider = _clip(str(row.get("provider") or "—"), 18)
         cost = row.get("estimated_cost_usd") or 0.0
@@ -692,7 +698,7 @@ def _build_provider_rollup_block(
     hidden = len(all_entries) - len(entries)
     if hidden > 0:
         line.append(f" · +{hidden} more", style=C_MUTED)
-    return line
+    return Group(*lines) if narrow else line
 
 
 def _build_heatmap_panel(
@@ -754,6 +760,12 @@ def _build_heatmap_panel(
     bar_rows = 4
     rows_text = [Text(" ") for _ in range(bar_rows)]
     row_labels = Text(" ")
+    label_indexes = {i for i in range(n) if i % label_every == 0}
+    if highlight is not None:
+        label_indexes.add(highlight)
+        if cell_w <= 2:
+            label_indexes.discard(highlight - 1)
+            label_indexes.discard(highlight + 1)
     for i, b in enumerate(buckets):
         cost = b.get("cost") or 0
         if cost <= 0 or v_max <= 0:
@@ -766,7 +778,7 @@ def _build_heatmap_panel(
         for r, line in enumerate(rows_text):  # r = 0 is the top row
             lit = (bar_rows - r) <= filled
             line.append(("█" if lit else " ") * cell_w, style=style if lit else "default")
-        if i % label_every == 0 or i == highlight:
+        if i in label_indexes:
             label_style = "bold reverse" if i == highlight else C_MUTED
             row_labels.append(b["label"][:cell_w].center(cell_w), style=label_style)
         else:
@@ -926,28 +938,35 @@ def _build_by_agent_model_table(rows: list[dict], *, limit: int = 8) -> Table | 
     nonzero = [r for r in rows if _has_cost_signal(r)]
     if not nonzero:
         return None
-    source_width = _scale_width(16, 34)
-    agent_width = _scale_width(8, 14)
-    provider_width = _scale_width(6, 12)
-    model_width = _scale_width(14, 32)
+    console_width = _console_width()
+    narrow = console_width < 96
+    ultra_narrow = console_width < 68
+    source_width = 14 if narrow else _scale_width(16, 34)
+    agent_width = 10 if narrow else _scale_width(8, 14)
+    provider_width = 10 if narrow else _scale_width(6, 12)
+    model_width = 24 if ultra_narrow else (18 if narrow else _scale_width(14, 32))
     tbl = Table(
         show_header=True,
         header_style=f"bold {C_SUBTEXT}",
         box=box.SIMPLE_HEAVY,
         pad_edge=False,
         border_style=C_SURFACE1,
-        title="By source × agent × provider × model",
+        title="Model usage" if ultra_narrow else "By source × agent × provider × model",
         title_style=f"bold {C_TEXT}",
         title_justify="left",
     )
-    tbl.add_column("Source", style=C_MUTED, overflow="ellipsis", no_wrap=True, max_width=source_width)
-    tbl.add_column("Ag", style=C_MAUVE, overflow="ellipsis", no_wrap=True, min_width=5, max_width=agent_width)
-    tbl.add_column("Prov", style=C_SKY, overflow="ellipsis", no_wrap=True, min_width=4, max_width=provider_width)
+    if not ultra_narrow:
+        tbl.add_column("Source", style=C_MUTED, overflow="ellipsis", no_wrap=True, max_width=source_width)
+        tbl.add_column("Agent" if narrow else "Ag", style=C_MAUVE, overflow="ellipsis", no_wrap=True, min_width=5, max_width=agent_width)
+        tbl.add_column("Provider" if narrow else "Prov", style=C_SKY, overflow="ellipsis", no_wrap=True, min_width=4, max_width=provider_width)
     tbl.add_column("Model", style=C_SKY, overflow="ellipsis", no_wrap=True, max_width=model_width)
-    tbl.add_column("In", justify="right", style=C_TEAL, no_wrap=True)
-    tbl.add_column("Out", justify="right", style=C_TEAL, no_wrap=True)
-    tbl.add_column("Cache", justify="right", style=C_GREEN, no_wrap=True)
-    tbl.add_column("C%", justify="right", no_wrap=True)
+    if narrow:
+        tbl.add_column("Tokens", justify="right", style=C_TEAL, no_wrap=True)
+    else:
+        tbl.add_column("In", justify="right", style=C_TEAL, no_wrap=True)
+        tbl.add_column("Out", justify="right", style=C_TEAL, no_wrap=True)
+        tbl.add_column("Cache", justify="right", style=C_GREEN, no_wrap=True)
+        tbl.add_column("C%", justify="right", no_wrap=True)
     tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}", no_wrap=True, min_width=6)
 
     # Group consecutive rows by (agent, provider, root) and cap the model
@@ -967,17 +986,25 @@ def _build_by_agent_model_table(rows: list[dict], *, limit: int = 8) -> Table | 
             model_display = f"Unknown: {r['raw_model']}"
         data_root = r.get("data_root") or ""
         cp = _cache_hit_rate(r)
-        tbl.add_row(
-            _source_root_label(data_root, max_len=source_width) if show_group else "",
-            r["agent_type"] if show_group else "",
-            (r.get("provider") or "—") if show_group else "",
-            model_display,
-            _fmt_tokens(r.get("input_tokens") or 0),
-            _fmt_tokens(r.get("output_tokens") or 0),
-            _fmt_tokens(_cache_tokens(r)),
-            _cache_pct_text(cp),
-            _fmt_cost(r.get("estimated_cost_usd"), unknown=_has_unknown_cost(r)),
-        )
+        values = []
+        if not ultra_narrow:
+            values.extend((
+                _source_root_label(data_root, max_len=source_width) if show_group else "",
+                r["agent_type"] if show_group else "",
+                (r.get("provider") or "—") if show_group else "",
+            ))
+        values.append(model_display)
+        if narrow:
+            values.append(_fmt_tokens(_token_summary(r)["total_tokens"]))
+        else:
+            values.extend((
+                _fmt_tokens(r.get("input_tokens") or 0),
+                _fmt_tokens(r.get("output_tokens") or 0),
+                _fmt_tokens(_cache_tokens(r)),
+                _cache_pct_text(cp),
+            ))
+        values.append(_fmt_cost(r.get("estimated_cost_usd"), unknown=_has_unknown_cost(r)))
+        tbl.add_row(*values)
 
     for key in order:
         members = buckets[key]
@@ -995,15 +1022,22 @@ def _build_by_agent_model_table(rows: list[dict], *, limit: int = 8) -> Table | 
                 "unknown_cost_count": sum(m.get("unknown_cost_count") or 0 for m in hidden),
             }
             agg_cp = _cache_hit_rate(agg)
-            tbl.add_row(
-                "", "", "",
-                f"+{len(hidden)} more models",
-                _fmt_tokens(agg["input_tokens"]),
-                _fmt_tokens(agg["output_tokens"]),
-                _fmt_tokens(_cache_tokens(agg)),
-                _cache_pct_text(agg_cp),
-                _fmt_cost(agg["estimated_cost_usd"], unknown=_has_unknown_cost(agg)),
+            values = ([] if ultra_narrow else ["", "", ""]) + [
+                f"+{len(hidden)} more models"
+            ]
+            if narrow:
+                values.append(_fmt_tokens(_token_summary(agg)["total_tokens"]))
+            else:
+                values.extend((
+                    _fmt_tokens(agg["input_tokens"]),
+                    _fmt_tokens(agg["output_tokens"]),
+                    _fmt_tokens(_cache_tokens(agg)),
+                    _cache_pct_text(agg_cp),
+                ))
+            values.append(
+                _fmt_cost(agg["estimated_cost_usd"], unknown=_has_unknown_cost(agg))
             )
+            tbl.add_row(*values)
     return tbl
 
 
@@ -1066,7 +1100,10 @@ def _build_top_projects_table(rows: list[dict]) -> Table | None:
     nonzero = [r for r in rows if _has_cost_signal(r)]
     if not nonzero:
         return None
-    project_width = max(32, min(140, _console_width() - 44))
+    console_width = _console_width()
+    narrow = console_width < 96
+    ultra_narrow = console_width < 68
+    project_width = max(24, min(140, console_width - (32 if narrow else 44)))
     tbl = Table(
         show_header=True,
         header_style=f"bold {C_SUBTEXT}",
@@ -1078,11 +1115,16 @@ def _build_top_projects_table(rows: list[dict]) -> Table | None:
         title_justify="left",
     )
     tbl.add_column("Project", style=C_BLUE, overflow="ellipsis", no_wrap=True, max_width=project_width)
-    tbl.add_column("Sessions", justify="right", style=C_TEXT, no_wrap=True)
-    tbl.add_column("Input", justify="right", style=C_TEAL, no_wrap=True)
-    tbl.add_column("Output", justify="right", style=C_TEAL, no_wrap=True)
-    tbl.add_column("Cache", justify="right", style=C_GREEN, no_wrap=True)
-    tbl.add_column("C%", justify="right", no_wrap=True)
+    if not ultra_narrow:
+        tbl.add_column("Sessions", justify="right", style=C_TEXT, no_wrap=True)
+    if narrow:
+        tbl.add_column("Tokens", justify="right", style=C_TEAL, no_wrap=True)
+    else:
+        tbl.add_column("Input", justify="right", style=C_TEAL, no_wrap=True)
+        tbl.add_column("Output", justify="right", style=C_TEAL, no_wrap=True)
+        tbl.add_column("Cache", justify="right", style=C_GREEN, no_wrap=True)
+    if not ultra_narrow:
+        tbl.add_column("C%", justify="right", no_wrap=True)
     tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}", no_wrap=True, min_width=7)
     for r in nonzero:
         path = _source_prefixed_path(
@@ -1091,15 +1133,23 @@ def _build_top_projects_table(rows: list[dict]) -> Table | None:
             max_len=project_width,
         )
         cp = _cache_hit_rate(r)
-        tbl.add_row(
-            path,
-            f"{r['session_count']:,}",
-            _fmt_tokens(r.get("input_tokens") or 0),
-            _fmt_tokens(r.get("output_tokens") or 0),
-            _fmt_tokens(_cache_tokens(r)),
-            _cache_pct_text(cp),
-            _fmt_cost(r.get("estimated_cost_usd"), unknown=_has_unknown_cost(r)),
+        values = [path]
+        if not ultra_narrow:
+            values.append(f"{r['session_count']:,}")
+        if narrow:
+            values.append(_fmt_tokens(_token_summary(r)["total_tokens"]))
+        else:
+            values.extend((
+                _fmt_tokens(r.get("input_tokens") or 0),
+                _fmt_tokens(r.get("output_tokens") or 0),
+                _fmt_tokens(_cache_tokens(r)),
+            ))
+        if not ultra_narrow:
+            values.append(_cache_pct_text(cp))
+        values.append(
+            _fmt_cost(r.get("estimated_cost_usd"), unknown=_has_unknown_cost(r))
         )
+        tbl.add_row(*values)
     return tbl
 
 
@@ -1244,15 +1294,14 @@ def _token_summary_block(totals: dict) -> Group | None:
         line_total.append(f"{cache_pct:.0f}%", style=_cache_pct_style(cache_pct))
 
     line_split = Text()
-    line_split.append("Token ", style=C_MUTED)
-    line_split.append("input ", style=C_MUTED)
+    line_split.append("In ", style=C_MUTED)
     line_split.append(_fmt_tokens(input_t), style=C_TEAL)
-    line_split.append("  ·  output ", style=C_MUTED)
+    line_split.append("  ·  Out ", style=C_MUTED)
     line_split.append(_fmt_tokens(output_t), style=C_TEAL)
-    line_split.append("  ·  cache read ", style=C_MUTED)
+    line_split.append("  ·  Read ", style=C_MUTED)
     line_split.append(_fmt_tokens(cache_r), style=C_GREEN)
     if cache_w:
-        line_split.append("  ·  cache write ", style=C_MUTED)
+        line_split.append("  ·  Write ", style=C_MUTED)
         line_split.append(_fmt_tokens(cache_w), style=C_GREEN)
 
     return Group(line_total, line_split)

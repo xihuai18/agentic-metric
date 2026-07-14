@@ -147,12 +147,12 @@ class AgenticMetricApp(App):
         # and the active one is highlighted via `-auto-on` in styles.tcss.
         Binding("r", "auto_refresh_on", "Auto-refresh"),
         Binding("r", "auto_refresh_off", "Auto-refresh"),
+        Binding("q", "quit", "Quit"),
         # ── Other ──
         Binding("p", "show_pricing", "Pricing"),
         Binding("question_mark,?", "show_help", "Help", key_display="?"),
         # Keep Ctrl+C from quitting so a stray copy shortcut doesn't kill the app.
         Binding("ctrl+c", "noop", show=False, priority=True),
-        Binding("q", "quit", "Quit"),
     ]
 
     def __init__(

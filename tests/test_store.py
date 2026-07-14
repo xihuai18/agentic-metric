@@ -1676,6 +1676,43 @@ def test_tui_initial_sync_failure_reveals_cached_dashboard(monkeypatch, tmp_path
     asyncio.run(run())
 
 
+def test_tui_compact_token_summary_fits_ultra_narrow_panel():
+    from agentic_metric.tui.widgets import _token_summary_block
+
+    block = _token_summary_block({
+        "input_tokens": 191_400,
+        "output_tokens": 71_800,
+        "cache_read_tokens": 829_400,
+        "cache_creation_tokens": 55_800,
+    }, compact=True)
+    console = Console(record=True, width=52, color_system=None)
+    console.print(block)
+    lines = console.export_text().splitlines()
+
+    assert len(lines) == 2
+    assert lines[1].strip() == "In 191K · Out 72K · Read 829K · Write 56K"
+
+
+def test_tui_token_summary_uses_compact_labels():
+    from agentic_metric.tui.widgets import _token_summary_block
+
+    block = _token_summary_block({
+        "input_tokens": 191_400,
+        "output_tokens": 71_800,
+        "cache_read_tokens": 829_400,
+        "cache_creation_tokens": 55_800,
+    })
+    console = Console(record=True, width=74, color_system=None)
+    console.print(block)
+    lines = console.export_text().splitlines()
+
+    assert len(lines) == 2
+    assert "In 191.4K" in lines[1]
+    assert "Out 71.8K" in lines[1]
+    assert "Read 829.4K" in lines[1]
+    assert "Write 55.8K" in lines[1]
+
+
 def test_tui_heatmap_provider_rollup_handles_unknown_cost():
     widget = PeriodicHeatmap()
     widget.update_data(
@@ -1967,6 +2004,27 @@ def test_report_header_shows_provider_rollup_in_default_view(monkeypatch):
     assert "By provider" not in rendered
 
 
+def test_cli_narrow_provider_rollup_uses_one_provider_per_line(monkeypatch):
+    console = Console(record=True, width=80, color_system=None)
+    monkeypatch.setattr(cli_module, "console", console)
+    block = cli_module._build_provider_rollup_block(
+        [
+            {"provider": "openai", "estimated_cost_usd": 9.5},
+            {"provider": "anthropic", "estimated_cost_usd": 5.0},
+            {"provider": "bedrock", "estimated_cost_usd": 1.45},
+        ],
+        15.95,
+    )
+
+    console.print(block)
+    lines = console.export_text().splitlines()
+
+    assert len(lines) == 3
+    assert lines[0].startswith("Providers  openai")
+    assert lines[1].startswith("           anthropic")
+    assert lines[2].startswith("           bedrock")
+
+
 def test_cli_sync_status_only_animates_on_interactive_output(monkeypatch):
     events = []
 
@@ -2088,6 +2146,93 @@ def test_cli_mixed_pricing_keeps_costs_numeric_and_warns_once():
     assert text.count("Pricing missing") == 1
 
 
+def test_cli_heatmap_highlight_does_not_touch_neighbor_label(monkeypatch):
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 7, 14, 11, 0, 0)
+
+    monkeypatch.setattr(cli_module, "datetime", FixedDateTime)
+    console = Console(record=True, width=60, color_system=None)
+    monkeypatch.setattr(cli_module, "console", console)
+    buckets = [
+        {"label": f"{hour:02d}", "cost": float(hour), "tokens": hour * 100}
+        for hour in range(24)
+    ]
+
+    console.print(cli_module._build_heatmap_panel(
+        buckets,
+        "today",
+        {"input_tokens": 100},
+        [],
+        width=60,
+    ))
+    axis = next(
+        line for line in console.export_text().splitlines() if line.startswith("│  00")
+    )
+
+    assert "11" in axis
+    assert "1112" not in axis
+
+
+def test_cli_narrow_breakdown_keeps_readable_core_columns(monkeypatch):
+    console = Console(record=True, width=80, color_system=None)
+    monkeypatch.setattr(cli_module, "console", console)
+    rows = [{
+        "agent_type": "claude_code",
+        "provider": "anthropic",
+        "data_root": "ssh://dev/home/user/.claude",
+        "model": "claude-opus-4-8",
+        "raw_model": "claude-opus-4-8",
+        "input_tokens": 120_000,
+        "output_tokens": 30_000,
+        "cache_read_tokens": 500_000,
+        "cache_creation_tokens": 20_000,
+        "estimated_cost_usd": 12.34,
+        "unknown_cost_count": 0,
+    }]
+
+    console.print(cli_module._build_by_agent_model_table(rows))
+    text = console.export_text()
+
+    assert "Source" in text
+    assert "Agent" in text
+    assert "Provider" in text
+    assert "Model" in text
+    assert "Tokens" in text
+    assert "Cost" in text
+    assert "Input" not in text
+    assert "$12.34" in text
+
+
+def test_cli_ultra_narrow_breakdown_preserves_values(monkeypatch):
+    console = Console(record=True, width=60, color_system=None)
+    monkeypatch.setattr(cli_module, "console", console)
+    rows = [{
+        "agent_type": "claude_code",
+        "provider": "anthropic",
+        "data_root": "ssh://dev/home/user/.claude",
+        "model": "claude-opus-4-8",
+        "raw_model": "claude-opus-4-8",
+        "input_tokens": 120_000,
+        "output_tokens": 30_000,
+        "cache_read_tokens": 500_000,
+        "cache_creation_tokens": 20_000,
+        "estimated_cost_usd": 12.34,
+        "unknown_cost_count": 0,
+    }]
+
+    console.print(cli_module._build_by_agent_model_table(rows))
+    text = console.export_text()
+
+    assert "Model" in text
+    assert "Tokens" in text
+    assert "Cost" in text
+    assert "claude-opus-4-8" in text
+    assert "670.0K" in text
+    assert "$12.34" in text
+
+
 def test_breakdown_table_rolls_up_models_past_limit():
     rows = [
         {"agent_type": "codex", "provider": "openai", "data_root": "~/.codex",
@@ -2129,6 +2274,33 @@ def test_cli_breakdown_table_shows_remote_host():
     text = buf.getvalue()
     assert "Source" in text
     assert "dev:~/.codex" in text
+
+
+def test_cli_narrow_top_projects_keeps_total_tokens(monkeypatch):
+    console = Console(record=True, width=80, color_system=None)
+    monkeypatch.setattr(cli_module, "console", console)
+    table = cli_module._build_top_projects_table([{
+        "data_root": "/tmp/.codex",
+        "project_path": "/workspace/project",
+        "session_count": 2,
+        "input_tokens": 100_000,
+        "output_tokens": 20_000,
+        "cache_read_tokens": 300_000,
+        "cache_creation_tokens": 0,
+        "estimated_cost_usd": 4.0,
+        "unknown_cost_count": 0,
+    }])
+
+    console.print(table)
+    text = console.export_text()
+
+    assert "Project" in text
+    assert "Sessions" in text
+    assert "Tokens" in text
+    assert "C%" in text
+    assert "Cost" in text
+    assert "Input" not in text
+    assert "420.0K" in text
 
 
 def test_cli_top_projects_prefixes_remote_host():
@@ -2346,6 +2518,37 @@ def test_tui_summary_and_breakdown_render_cache_pct():
     assert "75%" in rendered         # cache hit rate
 
 
+def test_tui_summary_uses_ultra_compact_copy_at_60_columns(tmp_path):
+    from agentic_metric.store.database import Database as RealDatabase
+    from agentic_metric.tui.app import AgenticMetricApp
+
+    async def run() -> None:
+        app = AgenticMetricApp(
+            db=RealDatabase(db_path=str(tmp_path / "summary.db")),
+            sync_on_mount=False,
+            show_clock=False,
+        )
+        async with app.run_test(headless=True, size=(60, 40)) as pilot:
+            cell = app.query_one("#cell-today", SummaryCell)
+            cell.update_data(
+                15.95,
+                6,
+                1_100_000,
+                prev_cost=5.70,
+                requests=153,
+                turns=75,
+                cache_pct=77,
+            )
+            await pilot.pause()
+            rendered = cell.render().plain
+            assert "1.1M tok" in rendered
+            assert "77% cache" in rendered
+            assert "6s 153r 75t" in rendered
+            assert len(rendered.splitlines()) <= 7
+
+    asyncio.run(run())
+
+
 def test_tui_summary_stats_wrap_on_whole_segments():
     cell = SummaryCell("TODAY")
     cell.update_data(
@@ -2362,6 +2565,41 @@ def test_tui_summary_stats_wrap_on_whole_segments():
         "195 sess · 6.3K req",
         "1.3K turns",
     ]
+
+
+def test_tui_breakdown_uses_core_columns_on_narrow_screens():
+    widget = Breakdown()
+    widget.update_data([{
+        "host": "local",
+        "cost": 12.0,
+        "input": 100_000,
+        "output": 20_000,
+        "cache": 300_000,
+        "cache_read": 300_000,
+        "cache_write": 0,
+        "unknown_cost_count": 0,
+        "agents": [{
+            "agent": "codex",
+            "cost": 12.0,
+            "input": 100_000,
+            "output": 20_000,
+            "cache": 300_000,
+            "cache_read": 300_000,
+            "cache_write": 0,
+            "unknown_cost_count": 0,
+            "providers": [],
+        }],
+    }], 12.0)
+
+    rendered = widget._render_for_width(68).plain
+
+    assert "Cost" in rendered
+    assert "Tokens" in rendered
+    assert "Cache%" in rendered
+    assert "In" not in rendered
+    assert "Out" not in rendered
+    assert "420.0K" in rendered
+    assert all(len(line) <= 68 for line in rendered.splitlines())
 
 
 def test_tui_histograms_render_discrete_bars():

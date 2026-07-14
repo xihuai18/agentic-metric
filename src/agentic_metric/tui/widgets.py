@@ -333,27 +333,45 @@ class SummaryCell(Static):
             "bold black on bright_yellow" if self.focused_view else "bold bright_white"
         )
         cost_style = "bold bright_yellow reverse" if self.focused_view else "bold bright_yellow"
+        try:
+            avail = self.content_size.width
+        except Exception:
+            avail = 36
+        ultra_compact = 0 < avail <= 16
+
         t = Text()
         t.append(f" {self.label} ", style=label_style)
         t.append("\n\n")
-        t.append(fmt_cost(self.cost, unknown=self.cost_unknown), style=cost_style)
-        # Delta line (if we have a prev period)
+        cost = fmt_cost(self.cost, unknown=self.cost_unknown)
+        t.append(cost, style=cost_style)
         delta = self._delta()
         if delta:
-            t.append("  ")
+            separator = " " if ultra_compact else "  "
+            if ultra_compact and len(cost) + len(separator) + len(delta[0]) > avail:
+                separator = "\n"
+            t.append(separator)
             t.append(delta[0], style=delta[1])
         t.append("\n")
+
+        if ultra_compact:
+            t.append(f"{fmt_tokens(self.tokens)} tok", style="bold bright_cyan")
+            if self.cache_pct is not None:
+                t.append("\n")
+                t.append(f"{self.cache_pct}% cache", style=_cache_pct_style(self.cache_pct))
+            t.append("\n")
+            t.append(
+                f"{fmt_tokens(self.sessions)}s {fmt_tokens(self.requests)}r "
+                f"{fmt_tokens(self.turns)}t",
+                style="white",
+            )
+            return t
+
         t.append("Token ", style="white")
         t.append(fmt_tokens(self.tokens), style="bold bright_cyan")
         if self.cache_pct is not None:
             t.append("  ·  Cache % ", style="white")
             t.append(f"{self.cache_pct}%", style=_cache_pct_style(self.cache_pct))
         t.append("\n")
-        # Sessions / requests / turns — fit deliberately so labels never wrap.
-        try:
-            avail = self.content_size.width
-        except Exception:
-            avail = 36
         for row_idx, row in enumerate(self._stats_lines(avail)):
             if row_idx:
                 t.append("\n")
@@ -500,7 +518,7 @@ class PeriodicHeatmap(Static):
 
         body: list[Text | Group] = []
 
-        tsummary = _token_summary_block(self._totals)
+        tsummary = _token_summary_block(self._totals, compact=available < 60)
         if tsummary is not None:
             body.append(tsummary)
 
@@ -523,6 +541,7 @@ class PeriodicHeatmap(Static):
             self._projects,
             self._total_cost,
             total_unknown=_has_unknown_cost(self._totals),
+            available=available,
         )
         if projects_block is not None:
             lists.extend(projects_block)
@@ -539,7 +558,7 @@ class PeriodicHeatmap(Static):
             return 1
 
         height = _HEATMAP_HISTOGRAM_ROWS + 2  # histogram axis + peak row
-        if _token_summary_block(self._totals) is not None:
+        if _token_summary_block(self._totals, compact=width < 62) is not None:
             height += 2
 
         detail_rows = 0
@@ -552,6 +571,7 @@ class PeriodicHeatmap(Static):
             self._projects,
             self._total_cost,
             total_unknown=_has_unknown_cost(self._totals),
+            available=width,
         )
         detail_rows += len(providers or ())
         detail_rows += len(projects or ())
@@ -710,7 +730,7 @@ class TrendBlocks(Static):
         return summary
 
 
-def _token_summary_block(totals: dict) -> Group | None:
+def _token_summary_block(totals: dict, *, compact: bool = False) -> Group | None:
     """Two-line token block used at the top of the heatmap panel.
 
     Line 1: ``Token total N · Cache % P%``
@@ -736,17 +756,23 @@ def _token_summary_block(totals: dict) -> Group | None:
         line_total.append("  ·  Cache % ", style="white")
         line_total.append(f"{cache_pct:.0f}%", style=_cache_pct_style(cache_pct))
 
+    def token_fmt(value: int) -> str:
+        if compact and value >= 1_000:
+            return f"{value / 1_000:.0f}K"
+        return fmt_tokens(value)
     line_split = Text("  ")
-    line_split.append("Token ", style="white")
-    line_split.append("input ", style="white")
-    line_split.append(fmt_tokens(input_t), style="bright_cyan")
-    line_split.append("  ·  output ", style="white")
-    line_split.append(fmt_tokens(output_t), style="bright_cyan")
-    line_split.append("  ·  cache read ", style="white")
-    line_split.append(fmt_tokens(cache_r), style="bright_green")
+    line_split.append("In ", style="white")
+    line_split.append(token_fmt(input_t), style="bright_cyan")
+    line_split.append(" · " if compact else "  ·  ", style="white")
+    line_split.append("Out ", style="white")
+    line_split.append(token_fmt(output_t), style="bright_cyan")
+    line_split.append(" · " if compact else "  ·  ", style="white")
+    line_split.append("Read ", style="white")
+    line_split.append(token_fmt(cache_r), style="bright_green")
     if cache_w:
-        line_split.append("  ·  cache write ", style="white")
-        line_split.append(fmt_tokens(cache_w), style="bright_green")
+        line_split.append(" · " if compact else "  ·  ", style="white")
+        line_split.append("Write ", style="white")
+        line_split.append(token_fmt(cache_w), style="bright_green")
 
     return Group(line_total, line_split)
 
@@ -810,6 +836,7 @@ def _top_projects_block(
     *,
     total_unknown: bool = False,
     limit: int = 3,
+    available: int = 80,
 ) -> list[Text] | None:
     """Up to ``limit`` project rows. First row is labeled "Top projects"."""
     if not projects:
@@ -837,20 +864,24 @@ def _top_projects_block(
         else:
             line.append(" " * len(label_text), style="default")
         line.append("  ")
+        cost = fmt_cost(p.get("estimated_cost_usd"), unknown=unknown)
+        share_text = f" ({share:.1f}%)" if share is not None else ""
+        prefix_width = 2 + len(label_text) + 2
+        path_max = max(12, min(44, available - prefix_width - len(cost) - len(share_text) - 3))
         line.append(
             _source_prefixed_path(
                 p["project_path"] or "",
                 p.get("data_root") or "",
-                max_len=44,
+                max_len=path_max,
             ),
             style="bright_blue",
         )
         line.append(
-            f" · {fmt_cost(p.get('estimated_cost_usd'), unknown=unknown)}",
+            f" · {cost}",
             style="bold bright_yellow" if i == 0 else "bright_yellow",
         )
-        if share is not None:
-            line.append(f" ({share:.1f}%)", style="white")
+        if share_text:
+            line.append(share_text, style="white")
         lines.append(line)
     return lines
 
@@ -908,7 +939,9 @@ class Breakdown(Static):
     _W_OUT = 7
     _W_CACHED = 10
     _W_PCT = 6
+    _W_TOKENS = 8
     _VALUE_W = 1 + _W_COST + 1 + _W_SHARE + 1 + _W_IN + 1 + _W_OUT + 1 + _W_CACHED + 1 + _W_PCT
+    _COMPACT_VALUE_W = 1 + _W_COST + 1 + _W_TOKENS + 1 + _W_PCT
 
     @staticmethod
     def _truncate(text: str, width: int) -> str:
@@ -926,7 +959,6 @@ class Breakdown(Static):
             t.append(text, style=style)
         gap = width - used
         if gap <= 0:
-            t.append(" ", style="white")
             return
         # Fill the space between the label and the right-aligned value block
         # with a faint dot leader so wide panels stay justified instead of
@@ -938,17 +970,22 @@ class Breakdown(Static):
         else:
             t.append(" " * gap, style="white")
 
-    def _append_header(self, t: Text, label_width: int) -> None:
+    def _append_header(self, t: Text, label_width: int, *, compact: bool) -> None:
         """Column-title row so input/output/cache-read values stay labeled."""
         t.append(" " * label_width, style="white")
-        for title, width in (
-            ("Cost", self._W_COST),
-            ("%", self._W_SHARE),
-            ("In", self._W_IN),
-            ("Out", self._W_OUT),
-            ("Cache", self._W_CACHED),
-            ("Cache%", self._W_PCT),
-        ):
+        columns = (
+            (("Cost", self._W_COST), ("Tokens", self._W_TOKENS), ("Cache%", self._W_PCT))
+            if compact
+            else (
+                ("Cost", self._W_COST),
+                ("%", self._W_SHARE),
+                ("In", self._W_IN),
+                ("Out", self._W_OUT),
+                ("Cache", self._W_CACHED),
+                ("Cache%", self._W_PCT),
+            )
+        )
+        for title, width in columns:
             t.append(f" {title:>{width}}", style="bold white")
         t.append("\n")
 
@@ -961,15 +998,24 @@ class Breakdown(Static):
         cost_unknown: bool,
         share: str = "",
         cost_style: str = "bright_yellow",
+        compact: bool = False,
     ) -> None:
         cache_pct = _cache_hit_rate(row)
         pct_str = f"{cache_pct:.0f}%" if cache_pct >= 0 else ""
         pct_style = _cache_pct_style(cache_pct)
         t.append(f" {fmt_cost(cost, unknown=cost_unknown):>{self._W_COST}}", style=cost_style)
-        t.append(f" {share:>{self._W_SHARE}}", style="white")
-        t.append(f" {fmt_tokens(row.get('input') or 0):>{self._W_IN}}", style="bright_cyan")
-        t.append(f" {fmt_tokens(row.get('output') or 0):>{self._W_OUT}}", style="bright_cyan")
-        t.append(f" {fmt_tokens(row.get('cache') or 0):>{self._W_CACHED}}", style="bright_green")
+        if compact:
+            total_tokens = (
+                (row.get("input") or 0)
+                + (row.get("output") or 0)
+                + (row.get("cache") or 0)
+            )
+            t.append(f" {fmt_tokens(total_tokens):>{self._W_TOKENS}}", style="bright_cyan")
+        else:
+            t.append(f" {share:>{self._W_SHARE}}", style="white")
+            t.append(f" {fmt_tokens(row.get('input') or 0):>{self._W_IN}}", style="bright_cyan")
+            t.append(f" {fmt_tokens(row.get('output') or 0):>{self._W_OUT}}", style="bright_cyan")
+            t.append(f" {fmt_tokens(row.get('cache') or 0):>{self._W_CACHED}}", style="bright_green")
         t.append(f" {pct_str:>{self._W_PCT}}", style=pct_style)
         t.append("\n")
 
@@ -990,6 +1036,7 @@ class Breakdown(Static):
         base_bar: str,
         agent_last: bool,
         top_level: bool,
+        compact: bool,
     ) -> None:
         """Render one agent subtree (agent → provider → model)."""
         if top_level:
@@ -1015,6 +1062,7 @@ class Breakdown(Static):
             cost_unknown=agent_unknown,
             share=self._share(agent_cost, agent_unknown, total, total_unknown),
             cost_style="bold bright_yellow",
+            compact=compact,
         )
 
         providers = agent.get("providers") or [agent]
@@ -1046,6 +1094,7 @@ class Breakdown(Static):
                 cost_unknown=provider_unknown,
                 share=self._share(provider_cost, provider_unknown, total, total_unknown),
                 cost_style="bold bright_yellow",
+                compact=compact,
             )
 
             # The enclosing panel scrolls, so model rows can stay complete.
@@ -1076,6 +1125,7 @@ class Breakdown(Static):
                     cost_unknown=_has_unknown_cost(m),
                     share="",
                     cost_style="bright_yellow",
+                    compact=compact,
                 )
 
     def _render_for_width(self, width: int) -> Text:
@@ -1085,12 +1135,11 @@ class Breakdown(Static):
         total = max(self._total_cost, 1e-9)
         total_unknown = any(_has_unknown_cost(h) for h in self._groups)
         width = width or 120
-        # Right-align the value block to the panel edge (labels left, values
-        # right — justified across the full width) and truncate labels so the
-        # value columns never wrap onto a second line.
-        label_width = max(24, width - self._VALUE_W)
+        compact = width < self._VALUE_W + 24
+        value_width = self._COMPACT_VALUE_W if compact else self._VALUE_W
+        label_width = max(24, width - value_width)
         t = Text()
-        self._append_header(t, label_width)
+        self._append_header(t, label_width, compact=compact)
 
         # Fold the host level away when there is only one machine, so the
         # common local-only case stays a flat agent → provider → model tree.
@@ -1104,6 +1153,7 @@ class Breakdown(Static):
                         t, agent,
                         label_width=label_width, total=total, total_unknown=total_unknown,
                         base_bar="", agent_last=(a_index == len(agents) - 1), top_level=True,
+                        compact=compact,
                     )
                 continue
 
@@ -1121,12 +1171,14 @@ class Breakdown(Static):
                 cost_unknown=host_unknown,
                 share=self._share(host_cost, host_unknown, total, total_unknown),
                 cost_style="bold bright_yellow",
+                compact=compact,
             )
             for a_index, agent in enumerate(agents):
                 self._emit_agent(
                     t, agent,
                     label_width=label_width, total=total, total_unknown=total_unknown,
                     base_bar="", agent_last=(a_index == len(agents) - 1), top_level=False,
+                    compact=compact,
                 )
 
         return t
@@ -1142,7 +1194,7 @@ class Breakdown(Static):
         return len(self._render_for_width(width).plain.splitlines()) or 1
 
     def get_content_width(self, container: Size, viewport: Size) -> int:
-        return max(container.width, self._VALUE_W + 24)
+        return max(container.width, self._COMPACT_VALUE_W + 24)
 
 
 def _has_unknown_cost(row: dict | None) -> bool:

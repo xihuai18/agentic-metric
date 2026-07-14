@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.7.8 (2026-07-14)
+
+### Improvements
+
+- **Responsive terminal layouts**: CLI reports now preserve readable model,
+  project, token, and cost columns on narrow terminals while retaining the full
+  breakdown on wide screens.
+- **Polished TUI density**: compact summary cards, token labels, project rows,
+  and breakdown columns avoid wrapping from 60-column terminals upward.
+- **Clearer chart and navigation details**: heatmap labels avoid collisions, and
+  the footer prioritizes the quit key on constrained widths.
+
 ## v0.7.7 (2026-07-14)
 
 ### Improvements

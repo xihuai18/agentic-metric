@@ -88,7 +88,7 @@ FooterKey.-auto-on {
 
 SummaryCell {
     width: 1fr;
-    height: 1fr;
+    height: auto;
     margin: 0 1;
     padding: 0 2;
     border: round white;
