@@ -76,6 +76,7 @@ class _SessionAccum:
         "file_id",
         "file_mtime_ns",
         "assistant_message_dates",
+        "all_assistant_ids",
         "assistant_usage_by_id",
         "usage_buckets",
     )
@@ -118,6 +119,7 @@ class _SessionAccum:
         self.file_id: tuple[int, int] | None = None
         self.file_mtime_ns = -1
         self.assistant_message_dates: dict[str, tuple[str, int, str]] = {}
+        self.all_assistant_ids: set[str] = set()
         self.assistant_usage_by_id: dict[
             str,
             tuple[int, int, int, int, int, float | None, str, int, str],
@@ -190,6 +192,7 @@ class _SessionAccum:
         self.model = ""
         self.partial_line = b""
         self.assistant_message_dates.clear()
+        self.all_assistant_ids.clear()
         self.assistant_usage_by_id.clear()
         self.usage_buckets.clear()
         self._reset_today_counters(today_str)
@@ -331,6 +334,10 @@ class _SessionAccum:
         elif entry_type == "assistant":
             msg = entry.get("message", {})
             msg_id = msg.get("id", "") if isinstance(msg, dict) else ""
+            if not isinstance(msg_id, str):
+                msg_id = ""
+            if msg_id:
+                self.all_assistant_ids.add(msg_id)
             if msg_id and msg_id in self._replayed_assistant_ids:
                 return
             msg_model = msg.get("model", "") if isinstance(msg, dict) else ""
@@ -618,6 +625,7 @@ class ClaudeCodeCollector(BaseCollector):
         # v12: provider is part of the sessions/session_usage primary key;
         # reparse so every usage row has a matching session total row.
         sync_prefix = "cc_jsonl:v12:"
+        assistant_ids_prefix = "cc_assistant_ids:v12:"
 
         for project_dir in projects_dir.iterdir():
             if not project_dir.is_dir():
@@ -631,43 +639,50 @@ class ClaudeCodeCollector(BaseCollector):
             except OSError:
                 continue
 
-            seen_assistant_ids: set[str] = set()
+            file_states = []
             for jsonl_file in jsonl_files:
                 sync_key = f"{sync_prefix}{jsonl_file}"
-                prev_state = db.get_sync_state(sync_key)
-
                 try:
                     stat = jsonl_file.stat()
                 except OSError:
                     continue
-                file_size = stat.st_size
-                mtime_ns = stat.st_mtime_ns
+                state = _sync_state_value(stat.st_size, stat.st_mtime_ns)
+                unchanged = db.get_sync_state(sync_key) == state
+                file_states.append((jsonl_file, sync_key, state, unchanged))
 
+            if file_states and all(unchanged for _, _, _, unchanged in file_states):
+                continue
+
+            seen_assistant_ids: set[str] = set()
+            for jsonl_file, sync_key, state, unchanged in file_states:
                 reprocess_for_replay = False
-                if _sync_state_matches(prev_state, file_size, mtime_ns):
-                    assistant_ids = _read_assistant_ids(jsonl_file)
+                if unchanged:
+                    assistant_ids = _cached_assistant_ids(
+                        db,
+                        jsonl_file,
+                        f"{assistant_ids_prefix}{jsonl_file}",
+                        state,
+                    )
                     reprocess_for_replay = bool(seen_assistant_ids & assistant_ids)
                     if not reprocess_for_replay:
                         seen_assistant_ids.update(assistant_ids)
                         continue
 
-                # Resolve the real project path from the JSONL cwd up front so
-                # both the session row and its usage buckets record the actual
-                # project, not the on-disk projects/ dir (which is a local cache
-                # path for SSH-backed remotes).
                 real_cwd = _read_cwd(jsonl_file)
                 project_path = real_cwd if real_cwd else str(project_dir)
-
-                # Build an accumulator starting from the previous offset
                 accum = _SessionAccum(
                     jsonl_file,
                     project_path=project_path,
                     replayed_assistant_ids=seen_assistant_ids,
                 )
-                # First pass: read everything from scratch to get full picture
-                # (we need totals, not deltas, for upsert)
                 accum.read_new_lines()
                 seen_assistant_ids.update(accum.assistant_message_dates)
+                _store_assistant_ids(
+                    db,
+                    f"{assistant_ids_prefix}{jsonl_file}",
+                    state,
+                    accum.all_assistant_ids,
+                )
 
                 if accum.user_turns == 0:
                     if reprocess_for_replay:
@@ -682,8 +697,7 @@ class ClaudeCodeCollector(BaseCollector):
                             provider=self.provider,
                             data_root=self.data_root,
                         )
-                    # Mark as processed even if empty
-                    db.set_sync_state(sync_key, _sync_state_value(file_size, mtime_ns))
+                    db.set_sync_state(sync_key, state, commit=False)
                     continue
 
                 usage_rows = accum.usage_bucket_rows()
@@ -720,12 +734,43 @@ class ClaudeCodeCollector(BaseCollector):
                     data_root=self.data_root,
                 )
 
-                db.set_sync_state(sync_key, _sync_state_value(file_size, mtime_ns))
+                db.set_sync_state(sync_key, state, commit=False)
 
 
 def _sync_state_value(file_size: int, mtime_ns: int) -> str:
     """Return the on-disk sync stamp for a JSONL file."""
     return f"{file_size}:{mtime_ns}"
+
+
+def _cached_assistant_ids(
+    db,
+    jsonl_file: Path,
+    cache_key: str,
+    state: str,
+) -> set[str]:
+    cached = db.get_sync_state(cache_key)
+    if cached:
+        try:
+            payload = json.loads(cached)
+        except (json.JSONDecodeError, TypeError):
+            payload = None
+        if isinstance(payload, dict) and payload.get("state") == state:
+            ids = payload.get("ids")
+            if isinstance(ids, list) and all(isinstance(item, str) for item in ids):
+                return set(ids)
+
+    ids = _read_assistant_ids(jsonl_file)
+    _store_assistant_ids(db, cache_key, state, ids)
+    return ids
+
+
+def _store_assistant_ids(db, cache_key: str, state: str, ids: set[str]) -> None:
+    value = json.dumps(
+        {"state": state, "ids": sorted(ids)},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    db.set_sync_state(cache_key, value, commit=False)
 
 
 def _read_assistant_ids(jsonl_file: Path) -> set[str]:
@@ -742,7 +787,7 @@ def _read_assistant_ids(jsonl_file: Path) -> set[str]:
                     continue
                 msg = entry.get("message", {})
                 msg_id = msg.get("id", "") if isinstance(msg, dict) else ""
-                if msg_id:
+                if isinstance(msg_id, str) and msg_id:
                     ids.add(msg_id)
     except OSError:
         return ids

@@ -276,13 +276,16 @@ class Database:
         ).fetchone()
         return row["value"] if row else None
 
-    def set_sync_state(self, key: str, value: str) -> None:
+    def set_sync_state(
+        self, key: str, value: str, *, commit: bool = True
+    ) -> None:
         self._conn.execute(
             "INSERT INTO sync_state (key, value) VALUES (?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, value),
         )
-        self._conn.commit()
+        if commit:
+            self._conn.commit()
 
     def delete_sync_state_prefix(self, prefix: str) -> None:
         self._conn.execute(

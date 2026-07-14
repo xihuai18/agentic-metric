@@ -157,15 +157,19 @@ def _pricing_default(ctx: typer.Context) -> None:
 
 
 @app.command()
-def tui() -> None:
+def tui(
+    no_sync: bool = typer.Option(
+        False, "--no-sync", help="Show cached data without syncing collectors."
+    ),
+) -> None:
     """Launch the interactive TUI dashboard."""
-    _run_tui()
+    _run_tui(sync_on_mount=not no_sync)
 
 
-def _run_tui() -> None:
+def _run_tui(*, sync_on_mount: bool = True) -> None:
     """Launch the interactive TUI dashboard."""
     from .tui.app import AgenticMetricApp
-    AgenticMetricApp().run()
+    AgenticMetricApp(sync_on_mount=sync_on_mount).run()
 
 
 @app.command()

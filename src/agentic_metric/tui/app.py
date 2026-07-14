@@ -208,11 +208,20 @@ class AgenticMetricApp(App):
 
     def on_mount(self) -> None:
         if self._sync_on_mount:
+            cached = self._db.conn.execute(
+                "SELECT 1 FROM sessions LIMIT 1"
+            ).fetchone()
+            if cached is not None:
+                self._initial_sync_pending = False
+                self._set_initial_loading(False)
+                self._today_sessions = get_today_sessions(self._db)
+                self._populate_all()
+                self._refresh_pricing_warning()
             self._sync_timer = self.set_interval(DATA_SYNC_INTERVAL, self._tick_sync)
             self._start_sync(self._initial_sync_worker)
         else:
             self._today_sessions = get_today_sessions(self._db)
-            self.sub_title = "demo data"
+            self.sub_title = "cached data"
             self._populate_all()
             self._refresh_pricing_warning()
 

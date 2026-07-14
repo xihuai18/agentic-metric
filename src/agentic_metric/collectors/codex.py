@@ -660,11 +660,19 @@ class CodexCollector(BaseCollector):
                         provider=self.provider,
                         data_root=self.data_root,
                     )
-                db.set_sync_state(sync_key, _sync_state_value(file_size, mtime_ns))
+                db.set_sync_state(
+                    sync_key,
+                    _sync_state_value(file_size, mtime_ns),
+                    commit=False,
+                )
                 continue
 
             if accum.user_turns == 0:
-                db.set_sync_state(sync_key, _sync_state_value(file_size, mtime_ns))
+                db.set_sync_state(
+                    sync_key,
+                    _sync_state_value(file_size, mtime_ns),
+                    commit=False,
+                )
                 continue
 
             session_id = accum.session_id or jsonl_file.stem
@@ -701,7 +709,11 @@ class CodexCollector(BaseCollector):
                 data_root=self.data_root,
             )
 
-            db.set_sync_state(sync_key, _sync_state_value(file_size, mtime_ns))
+            db.set_sync_state(
+                sync_key,
+                _sync_state_value(file_size, mtime_ns),
+                commit=False,
+            )
 
 
 def _sync_key_identity(provider: str, data_root: str) -> str:

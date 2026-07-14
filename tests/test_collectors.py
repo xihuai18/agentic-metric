@@ -1656,10 +1656,14 @@ def test_claude_incremental_sync_uses_skipped_files_for_replay_dedupe(tmp_path):
         ClaudeCodeCollector().sync_history(db)
 
     # Change only the second file. The first file should be skipped by
-    # sync_state on the next sync, but its assistant ids must still seed the
-    # replay-dedupe set for the changed sibling.
+    # sync_state on the next sync, but its cached assistant ids must still seed
+    # the replay-dedupe set for the changed sibling without reopening the file.
     write_file(second, extra_input=5)
-    with patch("agentic_metric.collectors.claude_code.PROJECTS_DIR", projects):
+    with patch("agentic_metric.collectors.claude_code.PROJECTS_DIR", projects), \
+         patch(
+             "agentic_metric.collectors.claude_code._read_assistant_ids",
+             side_effect=AssertionError("assistant ids should come from cache"),
+         ):
         ClaudeCodeCollector().sync_history(db)
 
     row = db.conn.execute(
@@ -1740,6 +1744,54 @@ def test_claude_incremental_sync_rewrites_skipped_later_replay_file(tmp_path):
            WHERE agent_type = 'claude_code'"""
     ).fetchone()
     assert dict(totals) == {"input_tokens": 10, "output_tokens": 20}
+    db.close()
+
+
+def test_claude_history_sync_invalidates_cache_for_same_size_rewrite(tmp_path):
+    projects = tmp_path / "projects"
+    project_dir = projects / "-tmp-project"
+    project_dir.mkdir(parents=True)
+    session_file = project_dir / "session.jsonl"
+
+    def write_session(output_tokens: int) -> None:
+        lines = [
+            {
+                "timestamp": "2026-04-23T10:00:00Z",
+                "type": "user",
+                "cwd": "/tmp/project",
+                "message": {"content": "hello"},
+            },
+            {
+                "timestamp": "2026-04-23T10:00:01Z",
+                "type": "assistant",
+                "cwd": "/tmp/project",
+                "message": {
+                    "id": "msg-same-size",
+                    "model": "claude-opus-4-8",
+                    "usage": {"input_tokens": 10, "output_tokens": output_tokens},
+                },
+            },
+        ]
+        session_file.write_text("".join(json.dumps(line) + "\n" for line in lines))
+
+    db = Database(db_path=str(tmp_path / "data.db"))
+    collector = ClaudeCodeCollector(projects_dir=projects)
+    write_session(10)
+    collector.sync_history(db)
+    previous_mtime = session_file.stat().st_mtime_ns
+
+    write_session(99)
+    os.utime(
+        session_file,
+        ns=(previous_mtime + 1_000_000, previous_mtime + 1_000_000),
+    )
+    collector.sync_history(db)
+
+    row = db.conn.execute(
+        "SELECT output_tokens FROM sessions "
+        "WHERE session_id = 'session' AND agent_type = 'claude_code'"
+    ).fetchone()
+    assert row["output_tokens"] == 99
     db.close()
 
 

@@ -1570,6 +1570,48 @@ def test_tui_sync_keeps_cached_data_visible_and_reports_progress(monkeypatch):
     db.close()
 
 
+def test_tui_initial_sync_shows_cached_dashboard_while_refreshing(
+    monkeypatch, tmp_path
+):
+    from agentic_metric.store.database import Database as RealDatabase
+    from agentic_metric.tui.app import AgenticMetricApp
+
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingCollectors:
+        def sync_all(self, db) -> None:
+            started.set()
+            assert release.wait(timeout=5)
+
+        def get_sync_errors(self) -> list[str]:
+            return []
+
+    monkeypatch.setattr(
+        "agentic_metric.tui.app.Database",
+        lambda *args, **kwargs: RealDatabase(db_path=str(tmp_path / "sync.db")),
+    )
+
+    async def run() -> None:
+        db = RealDatabase(db_path=str(tmp_path / "app.db"))
+        db.upsert_session("cached", "codex", provider="openai", data_root="/tmp/.codex")
+        db.commit()
+        app = AgenticMetricApp(db=db, collectors=BlockingCollectors())
+        async with app.run_test(headless=True, size=(120, 36)) as pilot:
+            assert await asyncio.to_thread(started.wait, 1)
+            assert app.query_one("#loading-page").display is False
+            assert app.query_one("#dashboard").display is True
+            assert app.sub_title == "syncing… · showing cached data"
+
+            release.set()
+            for _ in range(20):
+                await pilot.pause()
+                if not app._sync_in_progress:
+                    break
+
+    asyncio.run(run())
+
+
 def test_tui_initial_sync_shows_loading_page_until_dashboard_is_ready(
     monkeypatch, tmp_path
 ):
@@ -2056,6 +2098,20 @@ def test_cli_sync_status_only_animates_on_interactive_output(monkeypatch):
     with cli_module._sync_status("Syncing usage data…", enabled=False):
         events.append("work")
     assert events == ["work"]
+
+
+def test_tui_no_sync_starts_with_cached_data_only(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        cli_module,
+        "_run_tui",
+        lambda *, sync_on_mount=True: calls.append(sync_on_mount),
+    )
+
+    result = CliRunner().invoke(cli_app, ["tui", "--no-sync"])
+
+    assert result.exit_code == 0
+    assert calls == [False]
 
 
 def test_sync_command_reports_partial_failure(monkeypatch, tmp_path):
