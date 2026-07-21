@@ -129,9 +129,35 @@ def openai_cache_writes_billed(model: str) -> bool:
     Models before the GPT-5.6 family have no cache-write fee: written tokens
     are simply paid at the normal input rate, so they must stay in the input
     bucket instead of moving to a zero-priced cache-write bucket.
+
+    Classification uses the standard/user price tuple. Priority-tier tuples
+    can disagree with a user override (for example a user zeroing the GPT-5.6
+    write price while the official priority table keeps one); the standard
+    tuple is the deliberate tiebreaker so bucket shapes do not depend on a
+    per-request tier marker.
     """
     pricing = get_pricing(model)
     return bool(pricing and pricing[3] > 0)
+
+
+def openai_cache_write_reading(usage: dict) -> tuple[int, bool] | None:
+    """Return one payload's cache-write reading as ``(tokens, is_subset)``.
+
+    Single source of truth for choosing between Codex's subset-shaped
+    ``cache_write_input_tokens`` (contained in ``input_tokens``) and the
+    gateway-style separate ``cache_creation_input_tokens``. A nonzero subset
+    reading wins so the event path and cumulative fallback never disagree on
+    dual-key payloads. Returns ``None`` when neither key is present, so
+    cumulative callers can distinguish "absent" from a valid zero reading.
+    """
+    subset = usage.get("cache_write_input_tokens")
+    separate = usage.get("cache_creation_input_tokens")
+    if subset is None and separate is None:
+        return None
+    subset_tokens = _nonnegative_int(subset)
+    if subset_tokens:
+        return (subset_tokens, True)
+    return (_nonnegative_int(separate), False)
 
 
 def normalize_openai_usage(
@@ -170,8 +196,7 @@ def normalize_openai_usage(
     raw_input = _nonnegative_int(usage.get("input_tokens"))
     cached = _nonnegative_int(usage.get("cached_input_tokens"))
     output = _nonnegative_int(usage.get("output_tokens"))
-    cache_write_subset = _nonnegative_int(usage.get("cache_write_input_tokens"))
-    cache_create_separate = _nonnegative_int(usage.get("cache_creation_input_tokens"))
+    write_tokens, write_is_subset = openai_cache_write_reading(usage) or (0, False)
     non_cached_input = openai_non_cached_input(
         usage,
         raw_input=raw_input,
@@ -179,11 +204,14 @@ def normalize_openai_usage(
         output_tokens=output,
         default_is_separate=default_input_tokens_are_separate,
     )
-    if cache_write_subset and (model is None or openai_cache_writes_billed(model)):
-        cache_write_5m_tokens = cache_write_subset
-        non_cached_input = max(non_cached_input - cache_write_subset, 0)
+    if not write_is_subset:
+        cache_write_5m_tokens = write_tokens
+    elif model is None or openai_cache_writes_billed(model):
+        cache_write_5m_tokens = write_tokens
+        non_cached_input = max(non_cached_input - write_tokens, 0)
     else:
-        cache_write_5m_tokens = cache_create_separate
+        # Unbilled subset writes stay in the input bucket at the input rate.
+        cache_write_5m_tokens = 0
     return TokenUsage(
         input_tokens=non_cached_input,
         output_tokens=output,

@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.8.1 (2026-07-21)
+
+### Fixes
+
+- **Consistent cache-write shape selection**: the Codex cumulative fallback
+  and fork baseline now share the event path's cache-write shape selection
+  (`openai_cache_write_reading`), so hypothetical dual-key payloads can no
+  longer double count subset writes, and forked sessions record the parent's
+  cache-write baseline even before the fork's model is known. No observed
+  history is affected; all real payloads carry `last_token_usage` and take
+  the per-request path.
+
 ## v0.8.0 (2026-07-21)
 
 ### Improvements

@@ -11,6 +11,7 @@ from ..config import CODEX_SESSIONS_DIR
 from ..pricing import estimate_cost
 from ..usage import (
     estimate_token_usage_cost,
+    openai_cache_write_reading,
     openai_cache_writes_billed,
     openai_input_tokens_are_separate,
     normalize_openai_usage,
@@ -461,16 +462,21 @@ class _SessionAccum:
             raw_input = usage.get("input_tokens")
             cached = usage.get("cached_input_tokens")
             out = usage.get("output_tokens")
-            # Codex GPT-5.6+ reports cache writes as ``cache_write_input_tokens``
-            # (a subset of input_tokens); gateways may use the Anthropic-style
-            # ``cache_creation_input_tokens`` (separate from input). Models
-            # without a cache-write fee keep written tokens in the input
-            # bucket, so their subset counter is ignored entirely.
-            cache_create = usage.get("cache_creation_input_tokens")
-            if cache_create is None:
-                subset_write = usage.get("cache_write_input_tokens")
-                if subset_write is not None and openai_cache_writes_billed(self.model):
-                    cache_create = subset_write
+            # Cache-write shape selection is shared with the event path via
+            # openai_cache_write_reading. Models without a cache-write fee
+            # keep written tokens in the input bucket, so their subset
+            # counter is ignored entirely. The subset flag is intentionally
+            # session-sticky: mixed-shape sessions are not attributable per
+            # segment without last_token_usage, and the fallback then keeps
+            # all writes billed as plain input (never a premium bucket).
+            cache_create = None
+            write_reading = openai_cache_write_reading(usage)
+            if write_reading is not None:
+                write_tokens, write_is_subset = write_reading
+                if not write_is_subset:
+                    cache_create = write_tokens
+                elif openai_cache_writes_billed(self.model):
+                    cache_create = write_tokens
                     self._cum_cache_write_is_subset = True
             total = usage.get("total_tokens")
             default_separate = _input_tokens_default_separate(self.provider)
@@ -611,9 +617,12 @@ class _SessionAccum:
         raw_input = usage.get("input_tokens")
         cached = usage.get("cached_input_tokens")
         out = usage.get("output_tokens")
-        cache_create = usage.get("cache_creation_input_tokens")
-        if cache_create is None and openai_cache_writes_billed(self.model):
-            cache_create = usage.get("cache_write_input_tokens")
+        # Replayed parent events arrive before the fork's turn_context, so the
+        # model is usually still unknown here. Record the raw reading
+        # unconditionally; billing classification happens later against the
+        # same cumulative counters.
+        write_reading = openai_cache_write_reading(usage)
+        cache_create = write_reading[0] if write_reading is not None else None
         total = usage.get("total_tokens")
         if raw_input is not None:
             self.fork_baseline_raw_input = raw_input

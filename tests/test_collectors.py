@@ -1204,6 +1204,53 @@ def test_codex_cumulative_fallback_keeps_cache_write_subset_in_input():
     assert abs(sum(r["estimated_cost_usd"] for r in rows) - expected) < 1e-12
 
 
+def test_codex_cumulative_fallback_dual_key_matches_event_path_shape():
+    """Dual-key cumulative snapshots use the same subset preference as events."""
+    accum = CodexSessionAccum(Path("/tmp/fake.jsonl"), project_path="/test")
+    accum.model = "gpt-5.6-sol"
+    accum._process_event_msg({
+        "type": "token_count",
+        "info": {
+            "total_token_usage": {
+                "input_tokens": 1_000,
+                "cached_input_tokens": 200,
+                "output_tokens": 100,
+                "cache_write_input_tokens": 300,
+                "cache_creation_input_tokens": 300,
+                "total_tokens": 1_100,
+            },
+        },
+    }, ts="2026-07-20T10:00:01Z")
+
+    rows = accum.usage_bucket_rows()
+    # Subset preference: writes stay inside input on the legacy fallback and
+    # the separate-shaped copy is not added on top of them.
+    assert sum(r["input_tokens"] for r in rows) == 800
+    assert sum(r["cache_creation_tokens"] for r in rows) == 0
+
+
+def test_codex_fork_baseline_records_subset_writes_before_model_is_known():
+    accum = CodexSessionAccum(Path("/tmp/fake.jsonl"), project_path="/test")
+    accum.is_forked = True
+    # Replayed parent usage arrives before the fork's turn_context, so the
+    # model is still empty when the baseline is captured.
+    accum._process_event_msg({
+        "type": "token_count",
+        "info": {
+            "total_token_usage": {
+                "input_tokens": 5_000,
+                "cached_input_tokens": 1_000,
+                "output_tokens": 500,
+                "cache_write_input_tokens": 300,
+                "total_tokens": 5_500,
+            },
+        },
+    }, ts="2026-07-20T10:00:00Z")
+
+    assert accum.fork_baseline_cache_create == 300
+    assert accum.fork_baseline_raw_input == 5_000
+
+
 def test_codex_cumulative_fallback_model_switch_never_reclassifies_writes():
     """5.6 → 5.5 → 5.6 switches must not move 5.5-era writes into a write bucket."""
     accum = CodexSessionAccum(Path("/tmp/fake.jsonl"), project_path="/test")

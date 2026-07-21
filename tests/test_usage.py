@@ -96,6 +96,28 @@ def test_openai_usage_prefers_subset_cache_write_key_over_separate_shape():
     assert usage.cache_write_5m_tokens == 400
 
 
+def test_openai_usage_dual_key_unbilled_model_counts_writes_once(tmp_path):
+    """Dual-key payload on an unbilled model must not double count writes."""
+    import agentic_metric.pricing as pricing
+
+    pricing._user_cache = None
+    pricing._user_cache_mtime = -1.0
+    with patch("agentic_metric.pricing.PRICING_FILE", tmp_path / "pricing.json"):
+        usage = normalize_openai_usage({
+            "input_tokens": 1_000,
+            "cached_input_tokens": 0,
+            "output_tokens": 10,
+            "cache_write_input_tokens": 400,
+            "cache_creation_input_tokens": 400,
+        }, model="gpt-5.5")
+    pricing._user_cache = None
+    pricing._user_cache_mtime = -1.0
+
+    assert usage is not None
+    assert usage.input_tokens == 1_000  # subset stays in input
+    assert usage.cache_write_5m_tokens == 0  # separate copy not added on top
+
+
 def test_openai_usage_ignores_anthropic_cache_creation_1h_shape():
     usage = normalize_openai_usage({
         "input_tokens": 100,
