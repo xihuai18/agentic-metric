@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .pricing import estimate_cost
+from .pricing import estimate_cost, get_pricing
 
 
 def _nonnegative_int(value: object) -> int:
@@ -71,6 +71,8 @@ def estimate_token_usage_cost(
     usage: TokenUsage,
     *,
     apply_long_context: bool = True,
+    service_tier: str = "",
+    speed: str = "",
 ) -> float | None:
     """Estimate cost for one normalized event."""
     return estimate_cost(
@@ -81,6 +83,8 @@ def estimate_token_usage_cost(
         cache_creation_tokens=usage.cache_creation_tokens,
         cache_creation_1h_tokens=usage.cache_write_1h_tokens,
         apply_long_context=apply_long_context,
+        service_tier=service_tier,
+        speed=speed,
     )
 
 
@@ -119,10 +123,22 @@ def normalize_anthropic_usage(usage: object) -> TokenUsage | None:
     )
 
 
+def openai_cache_writes_billed(model: str) -> bool:
+    """True when a model bills cache writes at a dedicated rate (GPT-5.6+).
+
+    Models before the GPT-5.6 family have no cache-write fee: written tokens
+    are simply paid at the normal input rate, so they must stay in the input
+    bucket instead of moving to a zero-priced cache-write bucket.
+    """
+    pricing = get_pricing(model)
+    return bool(pricing and pricing[3] > 0)
+
+
 def normalize_openai_usage(
     usage: object,
     *,
     default_input_tokens_are_separate: bool = False,
+    model: str | None = None,
 ) -> TokenUsage | None:
     """Normalize OpenAI/Codex-compatible usage fields.
 
@@ -131,6 +147,16 @@ def normalize_openai_usage(
     report ``input_tokens`` as non-cached input and add cached tokens
     separately. We detect the latter using ``total_tokens`` when available,
     and also guard the impossible subset shape ``cached > input``.
+
+    Cache writes come in two shapes: Codex's ``cache_write_input_tokens``
+    (GPT-5.6+; a subset of ``input_tokens``, like OpenAI's
+    ``cache_write_tokens``) and gateway-style ``cache_creation_input_tokens``
+    (Anthropic semantics; separate from input). The subset shape is moved out
+    of the non-cached input bucket so those tokens are billed once at the
+    cache-write rate — but only when ``model`` actually bills cache writes
+    (GPT-5.6+). Earlier models have no write fee, so their written tokens
+    stay in the input bucket at the input rate. Pass ``model=None`` to always
+    move the subset (legacy behavior for callers without model context).
 
     OpenAI/Codex-compatible payloads do not expose Anthropic's 1-hour
     cache-write billing tier, so all cache writes stay in the normalized 5m
@@ -144,18 +170,25 @@ def normalize_openai_usage(
     raw_input = _nonnegative_int(usage.get("input_tokens"))
     cached = _nonnegative_int(usage.get("cached_input_tokens"))
     output = _nonnegative_int(usage.get("output_tokens"))
-    cache_create = _nonnegative_int(usage.get("cache_creation_input_tokens"))
+    cache_write_subset = _nonnegative_int(usage.get("cache_write_input_tokens"))
+    cache_create_separate = _nonnegative_int(usage.get("cache_creation_input_tokens"))
+    non_cached_input = openai_non_cached_input(
+        usage,
+        raw_input=raw_input,
+        cached_input=cached,
+        output_tokens=output,
+        default_is_separate=default_input_tokens_are_separate,
+    )
+    if cache_write_subset and (model is None or openai_cache_writes_billed(model)):
+        cache_write_5m_tokens = cache_write_subset
+        non_cached_input = max(non_cached_input - cache_write_subset, 0)
+    else:
+        cache_write_5m_tokens = cache_create_separate
     return TokenUsage(
-        input_tokens=openai_non_cached_input(
-            usage,
-            raw_input=raw_input,
-            cached_input=cached,
-            output_tokens=output,
-            default_is_separate=default_input_tokens_are_separate,
-        ),
+        input_tokens=non_cached_input,
         output_tokens=output,
         cache_read_tokens=cached,
-        cache_write_5m_tokens=cache_create,
+        cache_write_5m_tokens=cache_write_5m_tokens,
         cache_write_1h_tokens=0,
     )
 

@@ -66,6 +66,9 @@ class RemoteHistoryCollector(BaseCollector):
         self.data_root = target.data_root
         self._agent_type = target.agent_type
         self.last_error = ""
+        # (found, cache_changed, manifest_digest) from a prepare_cache() call
+        # awaiting its sync_history(); None when no mirror result is pending.
+        self._prepared: tuple[bool, bool, str] | None = None
 
         cache_root = _cache_root_for(target)
         if target.agent_type == "codex":
@@ -87,20 +90,51 @@ class RemoteHistoryCollector(BaseCollector):
     def agent_type(self) -> str:
         return self._agent_type
 
-    def sync_history(self, db) -> None:
+    def prepare_cache(self) -> None:
+        """Mirror the remote root into the local cache (no DB access).
+
+        Network-only, so a registry can run one prepare per remote target in
+        parallel before the serial DB parsing phase.
+        """
         try:
-            if not _sync_target_to_cache(self.target):
-                self.last_error = (
-                    f"remote path not found: "
-                    f"{self.target.source_root}/{self.target.source_child}"
-                )
-                return
-            _purge_removed_remote_sessions(db, self.target)
-            self.last_error = ""
+            self._prepared = _sync_target_to_cache(self.target)
+            self.last_error = "" if self._prepared[0] else (
+                f"remote path not found: "
+                f"{self.target.source_root}/{self.target.source_child}"
+            )
         except Exception as exc:
+            self._prepared = (False, False, "")
             self.last_error = str(exc)
+
+    def sync_history(self, db) -> None:
+        prepared = self._prepared
+        self._prepared = None
+        if prepared is None:
+            self.prepare_cache()
+            prepared = self._prepared or (False, False, "")
+            self._prepared = None
+        found, cache_changed, manifest_digest = prepared
+        if not found:
             return
+        ready_key = self._ready_state_key()
+        if not cache_changed and db.get_sync_state(ready_key) == manifest_digest:
+            # The mirror is byte-identical to the last fully parsed state, so
+            # the per-file scan of the whole cache tree can be skipped.
+            return
+        if cache_changed:
+            _purge_removed_remote_sessions(db, self.target)
         self._inner.sync_history(db)
+        db.set_sync_state(ready_key, manifest_digest)
+
+    def _ready_state_key(self) -> str:
+        """Sync-state key marking a fully parsed mirror state.
+
+        Shares the collector sync-state prefixes so pricing-fingerprint
+        migrations and history rebuilds invalidate it together with the
+        per-file parse states.
+        """
+        prefix = "codex_jsonl" if self.target.agent_type == "codex" else "cc_jsonl"
+        return f"{prefix}:remote_ready:v1:{_cache_root_for(self.target).name}"
 
 
 def _cache_root_for(target: RemoteSyncTarget) -> Path:
@@ -254,11 +288,17 @@ def _manifest_command(target: RemoteSyncTarget) -> str:
         find_expr = "-name 'rollout-*.jsonl'"
     else:
         find_expr = "\\( -name '*.jsonl' -o -name 'sessions-index.json' \\)"
+    # GNU find prints size/mtime natively (one process for the whole tree);
+    # BSD find lacks -printf and falls back to one stat per file batch. The
+    # local parser truncates fractional %T@ mtimes to whole seconds so both
+    # formats produce identical manifest values.
     return (
         _remote_base_script(target.source_root, target.source_child)
         + 'if [ ! -d "$base" ]; then printf "MISSING\\0"; exit 0; fi; '
         + 'printf "OK\\0"; cd "$base"; '
-        + f"find . -type f {find_expr} {_manifest_stat_exec()}"
+        + "if find . -maxdepth 0 -printf '' 2>/dev/null; then "
+        + f"find . -type f {find_expr} -printf '%s\\t%T@\\t%p\\0'; "
+        + f"else find . -type f {find_expr} {_manifest_stat_exec()}; fi"
     )
 
 
@@ -283,15 +323,18 @@ def _download_command(target: RemoteSyncTarget) -> str:
     )
 
 
-def _sync_target_to_cache(target: RemoteSyncTarget) -> bool:
+def _sync_target_to_cache(target: RemoteSyncTarget) -> tuple[bool, bool, str]:
+    """Mirror one remote root. Returns (found, cache_changed, manifest_digest)."""
     cache_root = _cache_root_for(target)
     cache_root.mkdir(parents=True, exist_ok=True)
 
     manifest = _read_remote_manifest(target)
     if manifest is None:
-        return False
+        return (False, False, "")
 
-    previous = _load_manifest(cache_root)
+    loaded = _load_manifest(cache_root)
+    had_manifest = loaded is not None
+    previous = loaded or {}
     changed = [
         rel for rel, meta in manifest.items()
         if previous.get(rel) != meta or not (cache_root / target.source_child / rel).exists()
@@ -311,9 +354,20 @@ def _sync_target_to_cache(target: RemoteSyncTarget) -> bool:
         )
         if proc.stdout:
             _extract_tarball(proc.stdout, cache_root / target.source_child)
-    _archive_stale_cache_files(cache_root, target, manifest)
-    _save_manifest(cache_root, manifest)
-    return True
+    # A missing saved manifest means the cache state is unknown (first run or
+    # cleared), so stray files must still be archived and sessions re-purged.
+    cache_changed = bool(changed) or not had_manifest or previous != manifest
+    if cache_changed:
+        # Stale archiving and session purging only matter when the mirror
+        # actually changed; skipping them keeps unchanged remotes cheap.
+        _archive_stale_cache_files(cache_root, target, manifest)
+        _save_manifest(cache_root, manifest)
+    return (True, cache_changed, _manifest_digest(manifest))
+
+
+def _manifest_digest(manifest: dict[str, dict[str, str]]) -> str:
+    raw = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+    return sha1(raw.encode("utf-8")).hexdigest()
 
 
 def _run_ssh(
@@ -360,7 +414,12 @@ def _read_remote_manifest(target: RemoteSyncTarget) -> dict[str, dict[str, str]]
         safe = _safe_member_path(rel)
         if safe is None:
             continue
-        manifest[str(PurePosixPath(*safe.parts))] = {"size": size, "mtime": mtime}
+        # GNU find %T@ is fractional; stat %Y/%m are whole seconds. Truncate
+        # so switching manifest sources never re-flags every file as changed.
+        manifest[str(PurePosixPath(*safe.parts))] = {
+            "size": size,
+            "mtime": mtime.split(".", 1)[0],
+        }
     return manifest
 
 
@@ -368,12 +427,18 @@ def _manifest_path(cache_root: Path) -> Path:
     return cache_root / ".remote-manifest.json"
 
 
-def _load_manifest(cache_root: Path) -> dict[str, dict[str, str]]:
+def _load_manifest(cache_root: Path) -> dict[str, dict[str, str]] | None:
+    """Return the saved manifest, or None when missing/unreadable.
+
+    ``None`` (unknown previous state) must not compare equal to an empty
+    remote manifest, otherwise stale archiving and session purging would be
+    skipped with leftover cache files still on disk.
+    """
     try:
         data = json.loads(_manifest_path(cache_root).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-        return {}
-    return data if isinstance(data, dict) else {}
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def _save_manifest(cache_root: Path, manifest: dict[str, dict[str, str]]) -> None:

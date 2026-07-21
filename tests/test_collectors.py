@@ -569,6 +569,206 @@ def test_remote_unchanged_manifest_skips_download(tmp_path):
     assert run_mock.call_count == 1
 
 
+def test_remote_unchanged_manifest_skips_session_purge(tmp_path):
+    remote = RemoteSpec(host="remote-dev", name="dev")
+    target = RemoteSyncTarget(
+        remote=remote,
+        agent_type="codex",
+        remote_root="~/.codex",
+        provider="openai",
+        index=0,
+    )
+    rel = "2026/04/23/rollout-remote.jsonl"
+    manifest = b"OK\0" + b"100\t123\t./2026/04/23/rollout-remote.jsonl\0"
+
+    with patch("agentic_metric.collectors.remote.DATA_DIR", tmp_path / "data"), \
+         patch(
+             "agentic_metric.collectors.remote.subprocess.run",
+             return_value=Mock(returncode=0, stdout=manifest, stderr=b""),
+         ), \
+         patch(
+             "agentic_metric.collectors.remote._purge_removed_remote_sessions"
+         ) as purge_mock:
+        cache_file = _cache_root_for(target) / "sessions" / rel
+        cache_file.parent.mkdir(parents=True)
+        cache_file.write_text("{}\n")
+        manifest_file = _cache_root_for(target) / ".remote-manifest.json"
+        manifest_file.write_text(
+            json.dumps({rel: {"size": "100", "mtime": "123"}}) + "\n"
+        )
+
+        db = Database(db_path=str(tmp_path / "data.db"))
+        collector = RemoteHistoryCollector(target)
+        collector.sync_history(db)
+        db.close()
+
+    assert collector.last_error == ""
+    purge_mock.assert_not_called()
+
+
+def test_remote_unchanged_manifest_skips_inner_reparse(tmp_path):
+    """Second sync with identical manifest must not rescan the cache tree."""
+    import io
+    import tarfile
+
+    remote = RemoteSpec(host="remote-dev", name="dev")
+    target = RemoteSyncTarget(
+        remote=remote,
+        agent_type="codex",
+        remote_root="~/.codex",
+        provider="openai",
+        index=0,
+    )
+    lines = [
+        {
+            "timestamp": "2026-04-23T10:00:00Z",
+            "type": "session_meta",
+            "payload": {"id": "ready-sid", "cwd": "/work/project", "model_provider": "openai"},
+        },
+        {
+            "timestamp": "2026-04-23T10:00:01Z",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "hello"},
+        },
+        {
+            "timestamp": "2026-04-23T10:00:02Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {"total_token_usage": {"input_tokens": 100, "output_tokens": 20}},
+            },
+        },
+    ]
+    payload = "".join(json.dumps(line) + "\n" for line in lines).encode()
+    tar_bytes = io.BytesIO()
+    with tarfile.open(fileobj=tar_bytes, mode="w:gz") as tar:
+        info = tarfile.TarInfo("2026/04/23/rollout-ready.jsonl")
+        info.size = len(payload)
+        tar.addfile(info, io.BytesIO(payload))
+    manifest = (
+        b"OK\0"
+        + f"{len(payload)}\t123\t./2026/04/23/rollout-ready.jsonl".encode()
+        + b"\0"
+    )
+
+    db = Database(db_path=str(tmp_path / "data.db"))
+    with patch("agentic_metric.collectors.remote.DATA_DIR", tmp_path / "data"), \
+         patch(
+             "agentic_metric.collectors.remote.subprocess.run",
+             side_effect=[
+                 Mock(returncode=0, stdout=manifest, stderr=b""),
+                 Mock(returncode=0, stdout=tar_bytes.getvalue(), stderr=b""),
+                 Mock(returncode=0, stdout=manifest, stderr=b""),
+             ],
+         ):
+        RemoteHistoryCollector(target).sync_history(db)
+        with patch.object(CodexCollector, "sync_history") as inner_mock:
+            RemoteHistoryCollector(target).sync_history(db)
+
+    inner_mock.assert_not_called()
+    row = db.conn.execute(
+        "SELECT input_tokens FROM sessions WHERE session_id = 'ready-sid'"
+    ).fetchone()
+    assert row["input_tokens"] == 100
+    db.close()
+
+
+def test_remote_fractional_mtime_matches_previous_integer_manifest(tmp_path):
+    """GNU find %T@ fractional mtimes must not re-flag unchanged files."""
+    remote = RemoteSpec(host="remote-dev", name="dev")
+    target = RemoteSyncTarget(
+        remote=remote,
+        agent_type="codex",
+        remote_root="~/.codex",
+        provider="openai",
+        index=0,
+    )
+    rel = "2026/04/23/rollout-remote.jsonl"
+    fractional = b"OK\0" + b"100\t123.4567890\t./2026/04/23/rollout-remote.jsonl\0"
+
+    with patch("agentic_metric.collectors.remote.DATA_DIR", tmp_path / "data"), \
+         patch(
+             "agentic_metric.collectors.remote.subprocess.run",
+             return_value=Mock(returncode=0, stdout=fractional, stderr=b""),
+         ) as run_mock:
+        cache_file = _cache_root_for(target) / "sessions" / rel
+        cache_file.parent.mkdir(parents=True)
+        cache_file.write_text("{}\n")
+        manifest_file = _cache_root_for(target) / ".remote-manifest.json"
+        manifest_file.write_text(
+            json.dumps({rel: {"size": "100", "mtime": "123"}}) + "\n"
+        )
+
+        db = Database(db_path=str(tmp_path / "data.db"))
+        RemoteHistoryCollector(target).sync_history(db)
+        db.close()
+
+    # Only the manifest call: no tar download of "changed" files.
+    assert run_mock.call_count == 1
+
+
+def test_remote_corrupted_manifest_still_purges_and_archives(tmp_path):
+    """A corrupted saved manifest means unknown state; purge must still run."""
+    remote = RemoteSpec(host="remote-dev", name="dev")
+    target = RemoteSyncTarget(
+        remote=remote,
+        agent_type="codex",
+        remote_root="~/.codex",
+        provider="openai",
+        index=0,
+    )
+    manifest = b"OK\0"  # remote now empty
+
+    with patch("agentic_metric.collectors.remote.DATA_DIR", tmp_path / "data"), \
+         patch(
+             "agentic_metric.collectors.remote.subprocess.run",
+             return_value=Mock(returncode=0, stdout=manifest, stderr=b""),
+         ), \
+         patch(
+             "agentic_metric.collectors.remote._purge_removed_remote_sessions"
+         ) as purge_mock:
+        cache_root = _cache_root_for(target)
+        stray = cache_root / "sessions" / "2026" / "04" / "23" / "rollout-stray.jsonl"
+        stray.parent.mkdir(parents=True)
+        stray.write_text("{}\n")
+        (cache_root / ".remote-manifest.json").write_text("{not json")
+
+        db = Database(db_path=str(tmp_path / "data.db"))
+        RemoteHistoryCollector(target).sync_history(db)
+        db.close()
+
+    purge_mock.assert_called_once()
+    assert not stray.exists()  # archived into .stale
+
+
+def test_registry_prepares_remote_caches_before_serial_sync():
+    calls: list[str] = []
+
+    class FakeRemoteCollector(BaseCollector):
+        def __init__(self, name: str) -> None:
+            self._name = name
+            self.last_error = ""
+
+        @property
+        def agent_type(self) -> str:
+            return f"remote-{self._name}"
+
+        def prepare_cache(self) -> None:
+            calls.append(f"prepare-{self._name}")
+
+        def sync_history(self, db) -> None:
+            calls.append(f"sync-{self._name}")
+
+    registry = CollectorRegistry()
+    registry.register(FakeRemoteCollector("a"))
+    registry.register(FakeRemoteCollector("b"))
+    registry.sync_all(db=Mock())
+
+    assert sorted(c for c in calls if c.startswith("prepare-")) == ["prepare-a", "prepare-b"]
+    assert calls[-2:] == ["sync-a", "sync-b"]
+    assert registry.get_sync_errors() == []
+
+
 def test_remote_removed_file_is_archived_not_reparsed(tmp_path):
     remote = RemoteSpec(host="remote-dev", name="dev")
     target = RemoteSyncTarget(
@@ -820,6 +1020,220 @@ def test_codex_cached_only_update_recomputes_input_tokens():
     assert accum.input_tokens == 800
     assert sum(r["input_tokens"] for r in accum.usage_bucket_rows()) == 800
     assert sum(r["cache_read_tokens"] for r in accum.usage_bucket_rows()) == 200
+
+
+def test_codex_thread_settings_service_tier_prices_priority_requests():
+    accum = CodexSessionAccum(Path("/tmp/fake.jsonl"), project_path="/test")
+    accum.model = "gpt-5.6-sol"
+    accum._process_event_msg({
+        "type": "thread_settings_applied",
+        "thread_settings": {"service_tier": "priority", "model": "gpt-5.6-sol"},
+    }, ts="2026-07-20T10:00:00Z")
+    accum._process_event_msg({
+        "type": "token_count",
+        "info": {
+            "total_token_usage": {
+                "input_tokens": 1_000,
+                "cached_input_tokens": 200,
+                "output_tokens": 100,
+                "total_tokens": 1_100,
+            },
+            "last_token_usage": {
+                "input_tokens": 1_000,
+                "cached_input_tokens": 200,
+                "output_tokens": 100,
+                "total_tokens": 1_100,
+            },
+        },
+    }, ts="2026-07-20T10:00:01Z")
+
+    expected = estimate_cost(
+        "gpt-5.6-sol",
+        input_tokens=800,
+        output_tokens=100,
+        cache_read_tokens=200,
+        service_tier="priority",
+    )
+    rows = accum.usage_bucket_rows()
+    assert abs(sum(r["estimated_cost_usd"] for r in rows) - expected) < 1e-12
+    assert expected > estimate_cost(
+        "gpt-5.6-sol",
+        input_tokens=800,
+        output_tokens=100,
+        cache_read_tokens=200,
+    )
+
+
+def test_codex_thread_settings_default_tier_restores_standard_pricing():
+    accum = CodexSessionAccum(Path("/tmp/fake.jsonl"), project_path="/test")
+    accum.model = "gpt-5.6-sol"
+    accum.service_tier = "priority"
+    accum._process_event_msg({
+        "type": "thread_settings_applied",
+        "thread_settings": {"service_tier": "default"},
+    }, ts="2026-07-20T10:00:00Z")
+    accum._process_event_msg({
+        "type": "token_count",
+        "info": {
+            "total_token_usage": {"input_tokens": 1_000, "output_tokens": 100},
+            "last_token_usage": {"input_tokens": 1_000, "output_tokens": 100},
+        },
+    }, ts="2026-07-20T10:00:01Z")
+
+    expected = estimate_cost("gpt-5.6-sol", input_tokens=1_000, output_tokens=100)
+    rows = accum.usage_bucket_rows()
+    assert abs(sum(r["estimated_cost_usd"] for r in rows) - expected) < 1e-12
+
+
+def test_codex_forked_session_inherits_replayed_service_tier():
+    accum = CodexSessionAccum(Path("/tmp/fake.jsonl"), project_path="/test")
+    accum.is_forked = True
+    accum.model = "gpt-5.6-sol"
+    # Replayed parent events arrive before the fork's first turn_context.
+    accum._process_event_msg({
+        "type": "thread_settings_applied",
+        "thread_settings": {"service_tier": "priority"},
+    }, ts="2026-07-20T10:00:00Z")
+    assert accum.service_tier == "priority"
+
+
+def test_codex_gpt56_cache_write_tokens_are_billed():
+    accum = CodexSessionAccum(Path("/tmp/fake.jsonl"), project_path="/test")
+    accum.model = "gpt-5.6-sol"
+    accum._process_event_msg({
+        "type": "token_count",
+        "info": {
+            "total_token_usage": {
+                "input_tokens": 1_000,
+                "cached_input_tokens": 200,
+                "output_tokens": 100,
+                "cache_write_input_tokens": 300,
+                "total_tokens": 1_100,
+            },
+            "last_token_usage": {
+                "input_tokens": 1_000,
+                "cached_input_tokens": 200,
+                "output_tokens": 100,
+                "cache_write_input_tokens": 300,
+                "total_tokens": 1_100,
+            },
+        },
+    }, ts="2026-07-20T10:00:01Z")
+
+    rows = accum.usage_bucket_rows()
+    assert sum(r["input_tokens"] for r in rows) == 500
+    assert sum(r["cache_read_tokens"] for r in rows) == 200
+    assert sum(r["cache_creation_tokens"] for r in rows) == 300
+    expected = estimate_cost(
+        "gpt-5.6-sol",
+        input_tokens=500,
+        output_tokens=100,
+        cache_read_tokens=200,
+        cache_creation_tokens=300,
+    )
+    assert abs(sum(r["estimated_cost_usd"] for r in rows) - expected) < 1e-12
+
+
+def test_codex_unbilled_model_keeps_cache_write_subset_in_input():
+    """gpt-5.5 has no cache-write fee: writes must stay billed as input."""
+    accum = CodexSessionAccum(Path("/tmp/fake.jsonl"), project_path="/test")
+    accum.model = "gpt-5.5"
+    accum._process_event_msg({
+        "type": "token_count",
+        "info": {
+            "total_token_usage": {
+                "input_tokens": 1_000,
+                "cached_input_tokens": 200,
+                "output_tokens": 100,
+                "cache_write_input_tokens": 300,
+                "total_tokens": 1_100,
+            },
+            "last_token_usage": {
+                "input_tokens": 1_000,
+                "cached_input_tokens": 200,
+                "output_tokens": 100,
+                "cache_write_input_tokens": 300,
+                "total_tokens": 1_100,
+            },
+        },
+    }, ts="2026-07-20T10:00:01Z")
+
+    rows = accum.usage_bucket_rows()
+    assert sum(r["input_tokens"] for r in rows) == 800
+    assert sum(r["cache_creation_tokens"] for r in rows) == 0
+    expected = estimate_cost(
+        "gpt-5.5",
+        input_tokens=800,
+        output_tokens=100,
+        cache_read_tokens=200,
+    )
+    assert abs(sum(r["estimated_cost_usd"] for r in rows) - expected) < 1e-12
+
+
+def test_codex_cumulative_fallback_keeps_cache_write_subset_in_input():
+    """Without last_token_usage, subset writes stay billed as plain input.
+
+    The cumulative counters cannot attribute writes per model across
+    mid-session model switches, so the legacy fallback never moves them.
+    """
+    accum = CodexSessionAccum(Path("/tmp/fake.jsonl"), project_path="/test")
+    accum.model = "gpt-5.6-sol"
+    accum._process_event_msg({
+        "type": "token_count",
+        "info": {
+            "total_token_usage": {
+                "input_tokens": 1_000,
+                "cached_input_tokens": 200,
+                "output_tokens": 100,
+                "cache_write_input_tokens": 300,
+                "total_tokens": 1_100,
+            },
+        },
+    }, ts="2026-07-20T10:00:01Z")
+
+    rows = accum.usage_bucket_rows()
+    assert sum(r["input_tokens"] for r in rows) == 800
+    assert sum(r["cache_read_tokens"] for r in rows) == 200
+    assert sum(r["cache_creation_tokens"] for r in rows) == 0
+    expected = estimate_cost(
+        "gpt-5.6-sol",
+        input_tokens=800,
+        output_tokens=100,
+        cache_read_tokens=200,
+    )
+    assert abs(sum(r["estimated_cost_usd"] for r in rows) - expected) < 1e-12
+
+
+def test_codex_cumulative_fallback_model_switch_never_reclassifies_writes():
+    """5.6 → 5.5 → 5.6 switches must not move 5.5-era writes into a write bucket."""
+    accum = CodexSessionAccum(Path("/tmp/fake.jsonl"), project_path="/test")
+
+    def snapshot(input_tokens, writes, output):
+        return {
+            "type": "token_count",
+            "info": {
+                "total_token_usage": {
+                    "input_tokens": input_tokens,
+                    "cached_input_tokens": 0,
+                    "output_tokens": output,
+                    "cache_write_input_tokens": writes,
+                    "total_tokens": input_tokens + output,
+                },
+            },
+        }
+
+    accum.model = "gpt-5.6-sol"
+    accum._process_event_msg(snapshot(1_000, 300, 100), ts="2026-07-20T10:00:01Z")
+    accum.model = "gpt-5.5"
+    accum._process_event_msg(snapshot(2_000, 700, 200), ts="2026-07-20T10:00:02Z")
+    accum.model = "gpt-5.6-sol"
+    accum._process_event_msg(snapshot(3_000, 900, 300), ts="2026-07-20T10:00:03Z")
+
+    rows = accum.usage_bucket_rows()
+    assert sum(r["cache_creation_tokens"] for r in rows) == 0
+    assert sum(r["input_tokens"] for r in rows) == 3_000
+    assert sum(r["output_tokens"] for r in rows) == 300
+    assert all(r["input_tokens"] >= 0 for r in rows)
 
 
 def test_codex_last_token_usage_drives_long_context_cost():
@@ -1385,6 +1799,64 @@ def test_claude_duplicate_assistant_message_id_uses_last_usage(tmp_path):
         cache_creation_1h_tokens=15,
     )
     assert abs(sum(r["estimated_cost_usd"] for r in accum.usage_bucket_rows()) - expected_cost) < 1e-12
+
+
+def test_claude_usage_speed_fast_prices_fast_mode(tmp_path):
+    session_file = tmp_path / "session.jsonl"
+    lines = [
+        {
+            "timestamp": "2026-07-20T10:00:00Z",
+            "type": "user",
+            "message": {"content": "hello"},
+        },
+        {
+            "timestamp": "2026-07-20T10:00:01Z",
+            "type": "assistant",
+            "message": {
+                "id": "msg-fast",
+                "model": "claude-opus-4-8",
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cache_read_input_tokens": 1_000,
+                    "cache_creation_input_tokens": 200,
+                    "speed": "fast",
+                },
+            },
+        },
+        {
+            "timestamp": "2026-07-20T10:00:02Z",
+            "type": "assistant",
+            "message": {
+                "id": "msg-standard",
+                "model": "claude-opus-4-8",
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "speed": "standard",
+                },
+            },
+        },
+    ]
+    session_file.write_text("".join(json.dumps(line) + "\n" for line in lines))
+
+    accum = ClaudeSessionAccum(session_file, project_path="/tmp/project")
+    accum.read_new_lines()
+
+    expected = estimate_cost(
+        "claude-opus-4-8",
+        input_tokens=100,
+        output_tokens=50,
+        cache_read_tokens=1_000,
+        cache_creation_tokens=200,
+        speed="fast",
+    ) + estimate_cost(
+        "claude-opus-4-8",
+        input_tokens=100,
+        output_tokens=50,
+    )
+    total = sum(r["estimated_cost_usd"] for r in accum.usage_bucket_rows())
+    assert abs(total - expected) < 1e-12
 
 
 def test_claude_real_model_replaces_initial_synthetic(tmp_path):

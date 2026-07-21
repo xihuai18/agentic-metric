@@ -40,9 +40,11 @@ agent 数据文件(`~/.claude/`、`~/.codex/`);如果配置了 SSH
 | 首条/末条 prompt | ✓ | ✓ |
 | 成本估算 | ✓ | ✓ |
 
-> ¹ Codex 仅暴露 cache-read tokens,cache-write 不上报。OpenAI 的 `input_tokens`
-> 字段本身包含了已缓存部分,collector 存储时会扣掉 `cached_input_tokens`,
-> 避免在 input 价和 cache-read 价上重复计费。
+> ¹ OpenAI 的 `input_tokens` 字段本身包含了已缓存部分,collector 存储时会扣掉
+> `cached_input_tokens`,避免在 input 价和 cache-read 价上重复计费。GPT-5.6 及
+> 之后的模型还会上报 `cache_write_input_tokens`(input 的子集):这些 token 会移入
+> cache-write 桶,按官方 1.25× 写入价计费;更早的模型没有写入费,写入 token 保留在
+> input 中按原价计。
 
 ## 安装
 
@@ -132,6 +134,8 @@ agentic-metric pricing cache reset claude-sonnet-4                # 删除覆盖
 ```
 
 未知模型不会自动套用默认价或模型族价格。它们的用量和 tokens 仍会纳入报告,但在你用 `agentic-metric pricing set` 添加明确价格前不会计入费用总额。CLI 和 TUI 会集中显示 `Pricing missing` 提示及模型名称,不会在费用数字里混入 `?`。
+
+费用一律按官方 API 牌价折算;session 日志里网关回报的单请求费用(可能含供应商折扣)会被忽略。当历史记录带有明确标记时,非标准速度/优先级模式会按官方溢价表计费:Codex 会话记录 `thread_settings_applied.service_tier`(`priority`,或按 OpenAI priority 费率计费的 `fast`),Claude 会话记录 API 实际服务速度 `usage.speed`(受支持的 Opus 模型按 fast mode 溢价)。没有标记的历史按标准价计。
 
 定价变更后,命令会自动重新同步历史数据,从原始 JSONL 数据重新计算事件级成本(如长上下文请求)。
 

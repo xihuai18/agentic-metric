@@ -11,6 +11,7 @@ from ..config import CODEX_SESSIONS_DIR
 from ..pricing import estimate_cost
 from ..usage import (
     estimate_token_usage_cost,
+    openai_cache_writes_billed,
     openai_input_tokens_are_separate,
     normalize_openai_usage,
 )
@@ -45,6 +46,7 @@ class _SessionAccum:
         "_cum_output_tokens",
         "_cum_cache_read",
         "_cum_cache_create",
+        "_cum_cache_write_is_subset",
         "_cum_total_tokens",
         "today_user_turns",
         "today_message_count",
@@ -63,6 +65,7 @@ class _SessionAccum:
         "last_prompt",
         "git_branch",
         "model",
+        "service_tier",
         "partial_line",
         "file_id",
         "file_mtime_ns",
@@ -101,6 +104,7 @@ class _SessionAccum:
         self._cum_output_tokens = 0
         self._cum_cache_read = 0
         self._cum_cache_create = 0
+        self._cum_cache_write_is_subset = False
         self._cum_total_tokens = 0
         self.today_user_turns = 0
         self.today_message_count = 0
@@ -119,6 +123,7 @@ class _SessionAccum:
         self.last_prompt = ""
         self.git_branch = ""
         self.model = ""
+        self.service_tier = ""
         self.partial_line = b""
         self.file_id: tuple[int, int] | None = None
         self.file_mtime_ns = -1
@@ -203,6 +208,7 @@ class _SessionAccum:
         self._cum_output_tokens = 0
         self._cum_cache_read = 0
         self._cum_cache_create = 0
+        self._cum_cache_write_is_subset = False
         self._cum_total_tokens = 0
         self.first_ts = ""
         self.last_ts = ""
@@ -210,6 +216,7 @@ class _SessionAccum:
         self.last_prompt = ""
         self.git_branch = ""
         self.model = ""
+        self.service_tier = ""
         self.partial_line = b""
         self.is_forked = False
         self.seen_turn_context = False
@@ -396,6 +403,17 @@ class _SessionAccum:
     def _process_event_msg(self, payload: dict, is_today: bool = True, ts: str = "") -> None:
         msg_type = payload.get("type", "")
 
+        if msg_type == "thread_settings_applied":
+            # Codex persists the effective per-thread settings (including
+            # service_tier for priority/fast mode) whenever they change; the
+            # latest value applies to subsequent requests. Handled before the
+            # fork gate so forked sessions inherit replayed parent settings.
+            settings = payload.get("thread_settings")
+            if isinstance(settings, dict):
+                tier = settings.get("service_tier")
+                self.service_tier = tier.strip() if isinstance(tier, str) else ""
+            return
+
         if self.is_forked and not self.seen_turn_context:
             if msg_type == "token_count":
                 self._update_fork_baseline(payload)
@@ -443,12 +461,23 @@ class _SessionAccum:
             raw_input = usage.get("input_tokens")
             cached = usage.get("cached_input_tokens")
             out = usage.get("output_tokens")
+            # Codex GPT-5.6+ reports cache writes as ``cache_write_input_tokens``
+            # (a subset of input_tokens); gateways may use the Anthropic-style
+            # ``cache_creation_input_tokens`` (separate from input). Models
+            # without a cache-write fee keep written tokens in the input
+            # bucket, so their subset counter is ignored entirely.
             cache_create = usage.get("cache_creation_input_tokens")
+            if cache_create is None:
+                subset_write = usage.get("cache_write_input_tokens")
+                if subset_write is not None and openai_cache_writes_billed(self.model):
+                    cache_create = subset_write
+                    self._cum_cache_write_is_subset = True
             total = usage.get("total_tokens")
             default_separate = _input_tokens_default_separate(self.provider)
             event_usage = normalize_openai_usage(
                 info.get("last_token_usage"),
                 default_input_tokens_are_separate=default_separate,
+                model=self.model,
             )
             prev_raw_input = self.raw_input_tokens
             prev_output = self._cum_output_tokens
@@ -494,31 +523,47 @@ class _SessionAccum:
                 else:
                     prev_input = max(prev_raw_input - prev_cache_read, 0)
                     current_input = max(self.raw_input_tokens - self._cum_cache_read, 0)
+                # Subset-shaped cache writes live inside input_tokens. The
+                # cumulative counters cannot attribute them per model across
+                # mid-session model switches, so this legacy fallback keeps
+                # them billed as plain input; the 1.25x write rate is applied
+                # only on the per-request last_token_usage path.
+                if self._cum_cache_write_is_subset:
+                    fallback_cache_create = 0
+                    prev_fallback_cache_create = 0
+                else:
+                    fallback_cache_create = self._cum_cache_create
+                    prev_fallback_cache_create = prev_cache_create
                 d_input = current_input - prev_input
                 d_output = self._cum_output_tokens - prev_output
                 d_cache_read = self._cum_cache_read - prev_cache_read
-                d_cache_create = self._cum_cache_create - prev_cache_create
+                d_cache_create = fallback_cache_create - prev_fallback_cache_create
                 if min(d_input, d_output, d_cache_read, d_cache_create) < 0:
                     event_cost = estimate_cost(
                         self.model,
                         input_tokens=current_input,
                         output_tokens=self._cum_output_tokens,
                         cache_read_tokens=self._cum_cache_read,
-                        cache_creation_tokens=self._cum_cache_create,
+                        cache_creation_tokens=fallback_cache_create,
                         apply_long_context=False,
+                        service_tier=self.service_tier,
                     )
                     self._replace_usage_token_snapshot(
                         ts,
                         input_tokens=current_input,
                         output_tokens=self._cum_output_tokens,
                         cache_read_tokens=self._cum_cache_read,
-                        cache_creation_tokens=self._cum_cache_create,
+                        cache_creation_tokens=fallback_cache_create,
                         estimated_cost_usd=event_cost,
                     )
                     d_input = d_output = d_cache_read = d_cache_create = 0
             if d_input or d_output or d_cache_read or d_cache_create:
                 event_cost = (
-                    estimate_token_usage_cost(self.model, event_usage)
+                    estimate_token_usage_cost(
+                        self.model,
+                        event_usage,
+                        service_tier=self.service_tier,
+                    )
                     if event_usage is not None
                     else None
                 )
@@ -530,6 +575,7 @@ class _SessionAccum:
                         cache_read_tokens=d_cache_read,
                         cache_creation_tokens=d_cache_create,
                         apply_long_context=False,
+                        service_tier=self.service_tier,
                     )
                 self.input_tokens += d_input
                 self.output_tokens += d_output
@@ -566,6 +612,8 @@ class _SessionAccum:
         cached = usage.get("cached_input_tokens")
         out = usage.get("output_tokens")
         cache_create = usage.get("cache_creation_input_tokens")
+        if cache_create is None and openai_cache_writes_billed(self.model):
+            cache_create = usage.get("cache_write_input_tokens")
         total = usage.get("total_tokens")
         if raw_input is not None:
             self.fork_baseline_raw_input = raw_input

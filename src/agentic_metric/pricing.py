@@ -28,9 +28,12 @@ PriceTuple = tuple[float, float, float, float]
 #   https://platform.claude.com/docs/en/docs/about-claude/pricing
 #   https://ai.google.dev/gemini-api/docs/pricing
 # Cache-write uses the 5-minute rate for Anthropic unless a collector observes
-# a different cache duration. Provider speed/priority modes are intentionally
-# ignored because the local histories this tool reads do not expose reliable
-# non-standard markers.
+# a different cache duration. Costs are always API list prices: gateway-reported
+# per-request costs in session logs (possible vendor discounts) are ignored.
+# Non-standard speed/priority modes are billed from the official premium tables
+# below only when a collector observes an explicit per-session/per-request
+# marker (Codex ``thread_settings_applied.service_tier``, Anthropic
+# ``usage.speed``); unmarked history stays at standard rates.
 _BUILTIN_PRICING: dict[str, PriceTuple] = {
     # ── Anthropic Claude ──
     "claude-fable-5":        (10.0, 50.0, 1.00, 12.50),
@@ -92,6 +95,45 @@ _MODEL_ALIASES: dict[str, str] = {
     "gpt-5.6": "gpt-5.6-sol",
 }
 
+# Official premium prices for observable non-standard modes, keyed by mode →
+# model prefix → (input, output, cache_read, cache_write) USD per million.
+# ``None`` marks a model where the provider does not offer the mode, so
+# requests fall back to standard rates (OpenAI bills ramp-limited priority
+# requests at standard rates too; Claude Opus 4.6 runs ``speed: "fast"``
+# requests at standard speed and standard rates).
+# Verified against OpenAI's pricing page and Anthropic's fast-mode docs on
+# 2026-07-21:
+#   https://developers.openai.com/api/docs/pricing/
+#   https://developers.openai.com/api/docs/guides/priority-processing
+#   https://platform.claude.com/docs/en/build-with-claude/fast-mode
+_NON_STANDARD_MODE_PRICING: dict[str, dict[str, PriceTuple | None]] = {
+    # OpenAI priority processing (Codex fast mode uses priority processing;
+    # with an API key it bills at the priority token rate).
+    "priority": {
+        "gpt-5.6-sol":   (10.0, 60.0, 1.0,  12.5),
+        "gpt-5.6-terra": (5.0,  30.0, 0.50,  6.25),
+        "gpt-5.6-luna":  (2.0,  12.0, 0.20,  2.50),
+        "gpt-5.5":       (12.5, 75.0, 1.25,  0.0),
+        "gpt-5.4-mini":  (1.50,  9.0, 0.15,  0.0),
+        "gpt-5.4-nano":  None,
+        "gpt-5.4":       (5.0,  30.0, 0.50,  0.0),
+        "gpt-5.3-codex": (3.50, 28.0, 0.35,  0.0),
+    },
+    # Anthropic fast mode (research preview); cache multipliers stack on the
+    # fast base input price, so cache_read = 0.1x and cache_write = 1.25x.
+    "fast": {
+        "claude-opus-4-8": (10.0,  50.0, 1.0,  12.5),
+        "claude-opus-4-7": (30.0, 150.0, 3.0, 37.5),
+        "claude-opus-4-6": None,
+    },
+}
+
+# Codex persists its fast mode as ``service_tier = "fast"``; with API-key
+# billing that is OpenAI priority processing.
+_MODE_ALIASES: dict[str, str] = {"fast": "priority"}
+
+_STANDARD_MODES = {"", "standard", "default"}
+
 # Internal placeholder/system responses that should never be billed as a model.
 _NON_BILLABLE_MODELS = {"<synthetic>"}
 
@@ -106,7 +148,7 @@ _UNKNOWN_MODEL_PREFIXES = (
     "gpt-5-pro",
 )
 
-_PRICING_FINGERPRINT_VERSION = 15
+_PRICING_FINGERPRINT_VERSION = 16
 
 # Long-context pricing applies per request/prompt, not per stored hour/session.
 # Collectors pass single-event usage into ``estimate_cost`` before aggregating
@@ -188,6 +230,50 @@ def _matched_tier_prices(total_input_tokens: int, tiers: list[dict[str, object]]
 def _matches_model_prefix(model: str, prefix: str) -> bool:
     """Return True for an exact model id or a dated/preview variant."""
     return model == prefix or model.startswith(f"{prefix}-")
+
+
+def _normalize_mode(mode: str) -> str:
+    return (mode or "").strip().lower()
+
+
+def _non_standard_mode_prices(
+    model: str,
+    service_tier: str,
+    speed: str,
+) -> tuple[float, float, float, float] | None:
+    """Return official premium prices for an observed non-standard mode.
+
+    Each marker consults only its own provider's premium table: ``speed``
+    (Anthropic per-request ``usage.speed``) resolves against the fast-mode
+    table, while ``service_tier`` (Codex per-session setting) resolves against
+    the priority table (Codex's ``fast`` tier is priority processing). Modes or
+    models without a premium table fall back to standard rates; models without
+    standard pricing stay unknown, and unknown-model prefixes never inherit a
+    family premium.
+    """
+    if get_pricing(model) is None or _matches_any_model_prefix(
+        normalize_model(model), _UNKNOWN_MODEL_PREFIXES
+    ):
+        return None
+
+    model = normalize_model(model)
+    lookups: list[str] = []
+    speed_mode = _normalize_mode(speed)
+    if speed_mode not in _STANDARD_MODES:
+        lookups.append(speed_mode)
+    tier_mode = _normalize_mode(service_tier)
+    if tier_mode not in _STANDARD_MODES:
+        # The tier alias is Codex-specific; Anthropic's ``speed`` values are
+        # matched against their own table verbatim.
+        lookups.append(_MODE_ALIASES.get(tier_mode, tier_mode))
+    for mode in lookups:
+        table = _NON_STANDARD_MODE_PRICING.get(mode)
+        if not table:
+            continue
+        for prefix, prices in sorted(table.items(), key=lambda x: len(x[0]), reverse=True):
+            if _matches_model_prefix(model, prefix):
+                return prices
+    return None
 
 
 def _matches_any_model_prefix(model: str, prefixes: tuple[str, ...]) -> bool:
@@ -653,7 +739,13 @@ def get_pricing_fingerprint() -> str:
         "aliases": sorted(_MODEL_ALIASES.items()),
         "builtin": sorted((model, list(prices)) for model, prices in _BUILTIN_PRICING.items()),
         "long_context_rules": get_long_context_rules(include_disabled=True),
+        "mode_aliases": sorted(_MODE_ALIASES.items()),
         "non_billable": sorted(_NON_BILLABLE_MODELS),
+        "non_standard_modes": sorted(
+            (mode, model, list(prices) if prices else None)
+            for mode, table in _NON_STANDARD_MODE_PRICING.items()
+            for model, prices in table.items()
+        ),
         "unknown_model_prefixes": sorted(_UNKNOWN_MODEL_PREFIXES),
         "user_config": _load_user_config(),
     }
@@ -668,8 +760,10 @@ def estimate_cost(
     cache_creation_tokens: int = 0,
     cache_creation_1h_tokens: int = 0,
     apply_long_context: bool = True,
+    service_tier: str = "",
+    speed: str = "",
 ) -> float | None:
-    """Estimate API-equivalent cost in USD.
+    """Estimate API-equivalent cost in USD at official list prices.
 
     ``input_tokens`` must NOT include cached tokens. Collectors should normalize
     provider payloads into non-overlapping buckets before storing them.
@@ -678,6 +772,11 @@ def estimate_cost(
     multiplier when provided. Long-context rates are only correct for
     single-request usage; callers that only have hourly/session aggregates
     should pass ``apply_long_context=False``.
+
+    ``service_tier``/``speed`` are collector-observed mode markers. A matched
+    premium mode replaces the standard rate for the whole request (OpenAI
+    priority processing does not support long context; Anthropic fast mode
+    prices the full context window), so long-context tiers are skipped.
     """
     if (
         input_tokens <= 0
@@ -690,8 +789,8 @@ def estimate_cost(
 
     cache_creation_1h_tokens = max(0, min(cache_creation_1h_tokens, cache_creation_tokens))
     cache_creation_5m_tokens = cache_creation_tokens - cache_creation_1h_tokens
-    pricing = None
-    if apply_long_context:
+    pricing = _non_standard_mode_prices(model, service_tier, speed)
+    if pricing is None and apply_long_context:
         pricing = _long_context_prices(
             model,
             input_tokens=input_tokens,

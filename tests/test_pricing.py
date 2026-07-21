@@ -263,6 +263,170 @@ def test_aggregate_callers_can_disable_long_context_surcharge(tmp_path):
     _reset_cache()
 
 
+def test_openai_priority_tier_uses_official_priority_prices(tmp_path):
+    with _patch_empty_user_pricing(tmp_path):
+        cost = estimate_cost(
+            "gpt-5.6-sol",
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            cache_read_tokens=1_000_000,
+            cache_creation_tokens=1_000_000,
+            service_tier="priority",
+        )
+        assert abs(cost - (10.0 + 60.0 + 1.0 + 12.5)) < 1e-9
+
+        standard = estimate_cost(
+            "gpt-5.6-sol",
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            service_tier="default",
+            apply_long_context=False,
+        )
+        assert abs(standard - (5.0 + 30.0)) < 1e-9
+    _reset_cache()
+
+
+def test_priority_tier_wins_over_long_context(tmp_path):
+    """OpenAI priority processing does not support long context."""
+    with _patch_empty_user_pricing(tmp_path):
+        cost = estimate_cost(
+            "gpt-5.6-sol",
+            input_tokens=300_000,
+            output_tokens=1_000,
+            service_tier="priority",
+        )
+        expected = (300_000 * 10.0 + 1_000 * 60.0) / 1_000_000
+        assert abs(cost - expected) < 1e-9
+    _reset_cache()
+
+
+def test_codex_fast_tier_bills_as_priority(tmp_path):
+    """Codex persists fast mode as service_tier="fast" → priority token rate."""
+    with _patch_empty_user_pricing(tmp_path):
+        fast = estimate_cost(
+            "gpt-5.6-sol",
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            service_tier="fast",
+        )
+        priority = estimate_cost(
+            "gpt-5.6-sol",
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            service_tier="priority",
+        )
+        assert fast == priority
+    _reset_cache()
+
+
+def test_priority_tier_without_official_price_falls_back_to_standard(tmp_path):
+    with _patch_empty_user_pricing(tmp_path):
+        # No published priority price for this model family.
+        cost = estimate_cost(
+            "gpt-5.1-codex",
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            service_tier="priority",
+        )
+        assert abs(cost - (1.25 + 10.0)) < 1e-9
+
+        # Priority is explicitly not offered for nano → standard rates.
+        nano = estimate_cost(
+            "gpt-5.4-nano",
+            input_tokens=1_000_000,
+            service_tier="priority",
+        )
+        assert abs(nano - 0.20) < 1e-9
+
+        # Unknown models stay unknown even with a tier marker.
+        assert estimate_cost(
+            "gpt-5.4-pro",
+            input_tokens=1_000,
+            service_tier="priority",
+        ) is None
+    _reset_cache()
+
+
+def test_anthropic_speed_fast_does_not_bill_gpt_priority(tmp_path):
+    """A gateway-artifact speed:"fast" on a GPT model has no official price."""
+    with _patch_empty_user_pricing(tmp_path):
+        cost = estimate_cost(
+            "gpt-5.6-sol",
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            speed="fast",
+            apply_long_context=False,
+        )
+        assert abs(cost - (5.0 + 30.0)) < 1e-9
+    _reset_cache()
+
+
+def test_priority_tier_does_not_leak_family_price_to_user_priced_pro(tmp_path):
+    pricing_file = tmp_path / "pricing.json"
+    pricing_file.write_text(json.dumps({
+        "models": {
+            "gpt-5.4-pro": [60.0, 270.0, 6.0, 0.0],
+        },
+    }))
+
+    _reset_cache()
+    with patch("agentic_metric.pricing.PRICING_FILE", pricing_file):
+        cost = estimate_cost(
+            "gpt-5.4-pro",
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            service_tier="priority",
+        )
+        # User price applies; the gpt-5.4 priority family price must not.
+        assert abs(cost - (60.0 + 270.0)) < 1e-9
+    _reset_cache()
+
+
+def test_claude_fast_speed_uses_fast_mode_prices(tmp_path):
+    with _patch_empty_user_pricing(tmp_path):
+        cost = estimate_cost(
+            "claude-opus-4-8",
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            cache_read_tokens=1_000_000,
+            cache_creation_tokens=1_000_000,
+            cache_creation_1h_tokens=1_000_000,
+            speed="fast",
+        )
+        # Cache multipliers stack on the fast base price: read 0.1x,
+        # 1h write 2x of the fast input rate.
+        assert abs(cost - (10.0 + 50.0 + 1.0 + 20.0)) < 1e-9
+
+        standard = estimate_cost(
+            "claude-opus-4-8",
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            speed="standard",
+        )
+        assert abs(standard - (5.0 + 25.0)) < 1e-9
+
+        # Opus 4.6 runs speed:"fast" requests at standard speed and rates.
+        opus46 = estimate_cost(
+            "claude-opus-4-6",
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            speed="fast",
+        )
+        assert abs(opus46 - (5.0 + 25.0)) < 1e-9
+    _reset_cache()
+
+
+def test_pricing_fingerprint_includes_non_standard_modes(tmp_path):
+    pricing_file = tmp_path / "pricing.json"
+
+    _reset_cache()
+    with patch("agentic_metric.pricing.PRICING_FILE", pricing_file):
+        base = get_pricing_fingerprint()
+        with patch("agentic_metric.pricing._NON_STANDARD_MODE_PRICING", {}):
+            assert get_pricing_fingerprint() != base
+    _reset_cache()
+
+
 def test_estimate_cost_prices_cache_creation_1h_tokens(tmp_path):
     with _patch_empty_user_pricing(tmp_path):
         cost = estimate_cost(

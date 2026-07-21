@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.8.0 (2026-07-21)
+
+### Improvements
+
+- **Fast/priority mode billing**: Codex sessions now bill requests after a
+  `thread_settings_applied` event at the official OpenAI priority rate when
+  `service_tier` is `priority` (or `fast`, which uses priority processing),
+  and Claude sessions bill each request at the fast-mode premium when the API
+  reports `usage.speed: "fast"`. Unmarked history stays at standard rates, and
+  gateway-reported per-request costs (possible vendor discounts) are still
+  ignored in favor of official list prices.
+- **GPT-5.6 cache writes billed**: Codex `cache_write_input_tokens` (a subset
+  of input tokens on GPT-5.6+) is now moved into the cache-write bucket and
+  priced at the official 1.25x cache-write rate instead of the plain input
+  rate. Models before the GPT-5.6 family have no cache-write fee, so their
+  written tokens stay in the input bucket at the normal input rate instead of
+  disappearing into a zero-priced bucket.
+- **Parallel remote sync**: SSH remote roots are mirrored concurrently before
+  the serial database phase, so sync latency is bounded by the slowest remote
+  instead of the sum of all remotes. Unchanged remote mirrors also skip the
+  per-file session purge scan.
+- **Cheaper remote manifests and cached reparse**: remote manifests use GNU
+  find `-printf` when available (one process instead of one `stat` per file),
+  and a byte-identical mirror skips the whole per-file cache-tree reparse via
+  a single sync-state check. Pricing changes still invalidate these states and
+  force a full reparse.
+
 ## v0.7.8 (2026-07-14)
 
 ### Improvements

@@ -364,7 +364,15 @@ class _SessionAccum:
                     return
                 inp, out, cr, cw = normalized.as_bucket_tuple()
                 cw_1h = normalized.cache_write_1h_tokens
-                usage_cost = estimate_token_usage_cost(bucket_model, normalized)
+                # Anthropic reports the speed that actually served the request
+                # (fast mode bills at a premium; standard fallbacks report
+                # "standard"), so each event is priced at its own mode.
+                speed = usage.get("speed")
+                usage_cost = estimate_token_usage_cost(
+                    bucket_model,
+                    normalized,
+                    speed=speed if isinstance(speed, str) else "",
+                )
                 self._set_assistant_usage(
                     msg_id,
                     (inp, out, cr, cw, cw_1h, usage_cost),

@@ -40,12 +40,36 @@ class CollectorRegistry:
     def sync_all(self, db) -> None:
         """Sync all collectors' history into the database."""
         self._sync_errors = []
+        self._prepare_remote_caches()
         for collector in self._collectors:
             try:
                 collector.sync_history(db)
             except Exception as exc:
                 db.conn.rollback()
                 self._sync_errors.append(f"{self._label(collector)}: {exc}")
+
+    def _prepare_remote_caches(self) -> None:
+        """Mirror all remote caches in parallel before the serial DB phase.
+
+        prepare_cache() is network-only and reports failures through each
+        collector's ``last_error``, so total sync latency is bounded by the
+        slowest remote instead of the sum of all remotes.
+        """
+        preparable = [
+            collector
+            for collector in self._collectors
+            if callable(getattr(collector, "prepare_cache", None))
+        ]
+        if len(preparable) < 2:
+            return
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(
+            max_workers=min(8, len(preparable)),
+            thread_name_prefix="remote-cache",
+        ) as pool:
+            for _ in pool.map(lambda collector: collector.prepare_cache(), preparable):
+                pass
 
     def get_sync_errors(self) -> list[str]:
         """Return collector sync errors that were captured during sync."""

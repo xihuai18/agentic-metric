@@ -41,10 +41,12 @@ caches a local copy for aggregation.
 | First/last prompt | ✓ | ✓ |
 | Cost estimation | ✓ | ✓ |
 
-> ¹ Codex exposes cache-read tokens only; cache-write is not reported. Codex's
-> `input_tokens` already includes cached tokens, so the collector stores
-> `input_tokens − cached_input_tokens` to avoid double-charging at both input
-> and cache-read pricing.
+> ¹ Codex's `input_tokens` already includes cached tokens, so the collector
+> stores `input_tokens − cached_input_tokens` to avoid double-charging at both
+> input and cache-read pricing. GPT-5.6+ additionally reports
+> `cache_write_input_tokens` (a subset of input): those tokens move to the
+> cache-write bucket at the official 1.25x write rate. Earlier models have no
+> cache-write fee, so their written tokens stay billed as normal input.
 
 ## Installation
 
@@ -145,8 +147,15 @@ Unknown models are not priced by default. Their usage and tokens remain in the
 report, but cost totals exclude them until you add explicit pricing with
 `agentic-metric pricing set`. The CLI and TUI show a `Pricing missing` warning
 with the affected model names instead of mixing `?` into numeric cost fields.
-Provider speed/priority modes are not shown or priced separately because the
-local history files do not expose reliable non-standard markers.
+
+Costs are always API list prices; per-request costs reported by gateways in
+session logs (which may include vendor discounts) are ignored. Non-standard
+speed/priority modes are billed from the official premium tables when the
+history exposes an explicit marker: Codex sessions record
+`thread_settings_applied.service_tier` (`priority`, or `fast` which bills at
+the OpenAI priority token rate), and Claude sessions record the per-request
+`usage.speed` served by the API (fast mode premium for supported Opus models).
+History without such markers is billed at standard rates.
 
 After a pricing change, the command resyncs local history so event-level costs
 such as long-context requests are recalculated from the original JSONL data.
