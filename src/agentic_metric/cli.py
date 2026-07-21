@@ -51,9 +51,15 @@ cache_pricing_app = typer.Typer(
     help="Manage cache-duration pricing.",
     context_settings={"help_option_names": ["-h", "--help"]},
 )
+cache_app = typer.Typer(
+    help="Inspect and prune the local remote-mirror cache.",
+    invoke_without_command=True,
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
 app.add_typer(pricing_app, name="pricing")
 pricing_app.add_typer(long_context_app, name="long-context")
 pricing_app.add_typer(cache_pricing_app, name="cache")
+app.add_typer(cache_app, name="cache")
 
 
 console = Console()
@@ -1689,3 +1695,112 @@ def pricing_cache_reset(
         _refresh_history_after_pricing_change()
     else:
         console.print(f"[{C_YELLOW}]{model} has no cache pricing override.[/]")
+
+
+def _fmt_bytes(size: float | None) -> str:
+    if size is None:
+        return "—"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+@cache_app.callback(invoke_without_command=True)
+def _cache_default(ctx: typer.Context) -> None:
+    if ctx.invoked_subcommand is None:
+        console.print(ctx.get_help())
+        raise typer.Exit()
+
+
+@cache_app.command("info")
+def cache_info(
+    sizes: bool = typer.Option(
+        False, "--sizes", help="Also compute active mirror sizes (slower)."
+    ),
+) -> None:
+    """Show remote mirror cache usage and how much can be reclaimed."""
+    from .collectors.remote import remote_cache_report
+
+    with _sync_status("Scanning remote cache..."):
+        report = remote_cache_report(include_active_sizes=sizes)
+
+    entries = report["entries"]
+    if not entries:
+        console.print(f"[{C_MUTED}]Remote cache is empty.[/]")
+        return
+    if report["config_unavailable"]:
+        console.print(
+            f"[{C_YELLOW}]Config file missing or unreadable — "
+            f"orphan detection is disabled.[/]"
+        )
+
+    table = Table(box=box.SIMPLE_HEAD, header_style=f"bold {C_TEXT}", pad_edge=False)
+    table.add_column("Remote root", style=C_TEXT, overflow="fold")
+    table.add_column("Status", style=C_TEXT)
+    table.add_column("Total", justify="right", style=C_SKY)
+    table.add_column("Stale", justify="right", style=C_PEACH)
+    for entry in entries:
+        if entry["is_orphan"]:
+            owner = Text(entry["path"].name, style=C_MUTED)
+            status = Text("orphan", style=C_RED)
+        else:
+            owner = Text(entry["owner"])
+            status = Text("active", style=C_GREEN)
+        table.add_row(
+            owner,
+            status,
+            _fmt_bytes(entry["total_bytes"]),
+            _fmt_bytes(entry["stale_bytes"]) if entry["stale_bytes"] else "—",
+        )
+    console.print(table)
+
+    reclaimable = report["reclaimable_bytes"]
+    if reclaimable:
+        console.print(
+            f"Reclaimable: [bold {C_PEACH}]{_fmt_bytes(reclaimable)}[/] "
+            f"[{C_MUTED}](orphaned mirrors + stale archives — run "
+            f"`agentic-metric cache prune` to free)[/]"
+        )
+    else:
+        console.print(f"[{C_MUTED}]Nothing to reclaim.[/]")
+
+
+@cache_app.command("prune")
+def cache_prune(
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Show what would be removed without deleting."
+    ),
+) -> None:
+    """Remove orphaned remote mirrors and stale archives."""
+    from .collectors.remote import prune_remote_cache
+
+    with _sync_status("Scanning remote cache..."):
+        result = prune_remote_cache(dry_run=dry_run)
+
+    if result["config_unavailable"]:
+        console.print(
+            f"[{C_YELLOW}]Config file missing or unreadable — "
+            f"orphan removal skipped, only stale archives are pruned.[/]"
+        )
+    if not result["removed"] and not result["failed"]:
+        console.print(f"[{C_MUTED}]Nothing to reclaim.[/]")
+        return
+
+    verb = "Would remove" if dry_run else "Removed"
+    for item in result["removed"]:
+        console.print(
+            f"  [{C_MUTED}]{verb}[/] {_shorten_home(str(item['path']))} "
+            f"[{C_PEACH}]{_fmt_bytes(item['bytes'])}[/] [{C_MUTED}]({item['kind']})[/]"
+        )
+    for item in result["failed"]:
+        console.print(
+            f"  [{C_RED}]Failed to remove[/] {_shorten_home(str(item['path']))} "
+            f"[{C_MUTED}]({item['kind']})[/]"
+        )
+    total = _fmt_bytes(result["reclaimed_bytes"])
+    if dry_run:
+        console.print(f"Total reclaimable: [bold {C_PEACH}]{total}[/] (dry run — nothing deleted)")
+    else:
+        console.print(f"[bold {C_GREEN}]✓[/] Reclaimed [bold {C_PEACH}]{total}[/].")

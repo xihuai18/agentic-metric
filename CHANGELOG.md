@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.8.2 (2026-07-21)
+
+### Improvements
+
+- **Bounded remote cache storage**: stale archives (local copies of files
+  that disappeared from a remote) are now aged out automatically after 30
+  days during sync, instead of accumulating forever.
+- **`cache info` / `cache prune`**: new CLI commands show remote mirror cache
+  usage — active mirrors, stale archives, and orphaned mirrors left behind by
+  config changes — and reclaim the orphaned/stale portions on demand.
+  `cache prune --dry-run` previews what would be removed; active mirrors and
+  source data are never touched.
+
 ## v0.8.1 (2026-07-21)
 
 ### Fixes

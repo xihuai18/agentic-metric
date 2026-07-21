@@ -9,13 +9,19 @@ import json
 from pathlib import Path, PurePosixPath
 import posixpath
 import shlex
+import shutil
 import subprocess
 import tarfile
+import time
 
 from ..config import DATA_DIR, RemoteSpec
 from . import BaseCollector
 from .claude_code import ClaudeCodeCollector
 from .codex import CodexCollector
+
+# Stale archives keep a short-lived local copy of files that disappeared from
+# a remote; they are never parsed again, so age them out to bound cache growth.
+_STALE_RETENTION_DAYS = 30
 
 
 @dataclass(frozen=True)
@@ -362,6 +368,9 @@ def _sync_target_to_cache(target: RemoteSyncTarget) -> tuple[bool, bool, str]:
         # actually changed; skipping them keeps unchanged remotes cheap.
         _archive_stale_cache_files(cache_root, target, manifest)
         _save_manifest(cache_root, manifest)
+    # Age out expired stale archives on every sync — an unchanged remote must
+    # not keep them alive forever. The walk only touches .stale, so it's cheap.
+    _prune_old_stale_archives(cache_root)
     return (True, cache_changed, _manifest_digest(manifest))
 
 
@@ -470,6 +479,179 @@ def _archive_stale_cache_files(
             archive_path = _next_archive_path(stale_root / rel)
             archive_path.parent.mkdir(parents=True, exist_ok=True)
             path.replace(archive_path)
+            # replace() keeps the source mtime; retention must run from the
+            # archive time, or an old file removed today would age out at once.
+            archive_path.touch()
+
+
+def _prune_old_stale_archives(cache_root: Path, retention_days: int = _STALE_RETENTION_DAYS) -> int:
+    """Delete stale archives older than the retention window.
+
+    Returns the number of bytes reclaimed.
+    """
+    stale_root = cache_root / ".stale"
+    if not stale_root.exists():
+        return 0
+    cutoff = time.time() - retention_days * 86400
+    reclaimed = 0
+    for path in sorted(stale_root.rglob("*"), reverse=True):
+        try:
+            if path.is_file() and path.stat().st_mtime < cutoff:
+                reclaimed += path.stat().st_size
+                path.unlink()
+            elif path.is_dir() and not any(path.iterdir()):
+                path.rmdir()
+        except OSError:
+            continue
+    try:
+        if stale_root.exists() and not any(stale_root.iterdir()):
+            stale_root.rmdir()
+    except OSError:
+        pass
+    return reclaimed
+
+
+# ── Cache accounting and pruning ─────────────────────────────────────────
+
+
+def _remotes_config_readable() -> bool:
+    """True when the config file exists, parses, and has a sane shape.
+
+    A readable config with zero remotes is a deliberate state (the user
+    removed them), so orphan detection may trust it. A missing or corrupt
+    file — or one whose top level / ``remotes`` key has the wrong type,
+    which ``get_remote_specs`` also treats as "no remotes" — is
+    indistinguishable from a mistake and must not be trusted.
+    """
+    from ..config import CONFIG_FILE
+
+    try:
+        data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    remotes = data.get("remotes")
+    return remotes is None or isinstance(remotes, list)
+
+
+def _configured_targets() -> dict[str, RemoteSyncTarget]:
+    """Map active cache-dir digests to their configured remote targets."""
+    from ..config import get_remote_specs
+
+    targets: dict[str, RemoteSyncTarget] = {}
+    for remote in get_remote_specs():
+        for agent_type in ("claude_code", "codex"):
+            for index, root in enumerate((remote.collectors or {}).get(agent_type, [])):
+                target = RemoteSyncTarget(
+                    remote=remote,
+                    agent_type=agent_type,
+                    remote_root=root.path,
+                    provider=root.provider,
+                    index=index,
+                )
+                targets[_cache_root_for(target).name] = target
+    return targets
+
+
+def _tree_bytes(root: Path) -> int:
+    total = 0
+    try:
+        for path in root.rglob("*"):
+            try:
+                if path.is_file():
+                    total += path.stat().st_size
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return total
+
+
+def remote_cache_report(*, include_active_sizes: bool = False) -> dict:
+    """Describe the remote mirror cache: active mirrors, stale data, orphans.
+
+    Orphans are cache dirs whose digest no longer matches any configured
+    remote target (left behind by config changes); together with stale
+    archives they are safe to reclaim. Active mirror sizes require a full
+    tree walk, so they are only computed on request.
+    """
+    cache_dir = DATA_DIR / "remote-cache"
+    targets = _configured_targets()
+    # An empty target set with a readable config means the user removed the
+    # remotes — old mirrors really are orphans. But when the config file is
+    # missing or corrupt, that state is indistinguishable from a transient
+    # failure; calling every mirror an orphan then would let prune delete all
+    # (expensively re-downloadable) mirrors, so orphan detection is disabled.
+    config_unavailable = not targets and not _remotes_config_readable()
+    entries: list[dict] = []
+    if cache_dir.exists():
+        for path in sorted(cache_dir.iterdir()):
+            if not path.is_dir():
+                continue
+            target = targets.get(path.name)
+            is_orphan = target is None and not config_unavailable
+            stale_bytes = _tree_bytes(path / ".stale")
+            entry = {
+                "path": path,
+                "owner": (
+                    f"{target.label}/{target.agent_type}/{target.remote_root}"
+                    if target is not None
+                    else ""
+                ),
+                "is_orphan": is_orphan,
+                "stale_bytes": stale_bytes,
+                "total_bytes": (
+                    _tree_bytes(path) if include_active_sizes or is_orphan else None
+                ),
+            }
+            entries.append(entry)
+    reclaimable = sum(
+        (entry["total_bytes"] if entry["is_orphan"] else entry["stale_bytes"]) or 0
+        for entry in entries
+    )
+    return {
+        "entries": entries,
+        "reclaimable_bytes": reclaimable,
+        "config_unavailable": config_unavailable,
+    }
+
+
+def prune_remote_cache(*, dry_run: bool = False) -> dict:
+    """Delete orphaned cache dirs and all stale archives.
+
+    Only touches this tool's own derived mirror cache under
+    ``DATA_DIR/remote-cache``; active mirrors and source data are never
+    removed. Returns the report of what was (or would be) reclaimed.
+    """
+    cache_dir = (DATA_DIR / "remote-cache").resolve()
+    report = remote_cache_report()
+    removed: list[dict] = []
+    failed: list[dict] = []
+    for entry in report["entries"]:
+        path = entry["path"].resolve()
+        if cache_dir not in path.parents:
+            continue
+        if entry["is_orphan"]:
+            item = {"path": path, "bytes": entry["total_bytes"] or 0, "kind": "orphan"}
+        elif entry["stale_bytes"]:
+            item = {"path": path / ".stale", "bytes": entry["stale_bytes"], "kind": "stale"}
+        else:
+            continue
+        if not dry_run:
+            shutil.rmtree(item["path"], ignore_errors=True)
+            if item["path"].exists():
+                # Deletion silently failed (permissions, concurrent writes);
+                # don't report space as reclaimed when it wasn't.
+                failed.append(item)
+                continue
+        removed.append(item)
+    return {
+        "removed": removed,
+        "failed": failed,
+        "reclaimed_bytes": sum(r["bytes"] for r in removed),
+        "config_unavailable": report["config_unavailable"],
+    }
 
 
 def _next_archive_path(path: Path) -> Path:

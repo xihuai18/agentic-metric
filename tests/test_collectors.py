@@ -2,6 +2,7 @@
 
 import json
 import os
+import time
 from datetime import date, datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -938,6 +939,293 @@ def test_remote_removed_claude_file_purges_existing_db_usage(tmp_path):
             "SELECT COUNT(*) AS n FROM session_usage WHERE session_id = 'removed-claude'"
         ).fetchone()["n"] == 0
         db.close()
+
+
+def test_remote_stale_archives_age_out(tmp_path):
+    from agentic_metric.collectors.remote import _prune_old_stale_archives
+
+    stale_root = tmp_path / ".stale" / "sessions"
+    stale_root.mkdir(parents=True)
+    old_file = stale_root / "old.jsonl"
+    old_file.write_text("{}\n")
+    fresh_file = stale_root / "fresh.jsonl"
+    fresh_file.write_text("{}\n")
+    expired = time.time() - 40 * 86400
+    os.utime(old_file, (expired, expired))
+
+    reclaimed = _prune_old_stale_archives(tmp_path, retention_days=30)
+
+    assert reclaimed == 3
+    assert not old_file.exists()
+    assert fresh_file.exists()
+
+    os.utime(fresh_file, (expired, expired))
+    _prune_old_stale_archives(tmp_path, retention_days=30)
+    assert not (tmp_path / ".stale").exists()
+
+
+def test_remote_cache_prune_removes_orphans_and_stale_only(tmp_path):
+    from agentic_metric.collectors.remote import prune_remote_cache, remote_cache_report
+
+    remote = RemoteSpec(
+        host="remote-dev",
+        name="dev",
+        collectors={
+            "codex": [RemoteCollectorRoot(path="~/.codex", provider="openai")],
+            "claude_code": [],
+        },
+    )
+    target = RemoteSyncTarget(
+        remote=remote,
+        agent_type="codex",
+        remote_root="~/.codex",
+        provider="openai",
+        index=0,
+    )
+
+    with patch("agentic_metric.collectors.remote.DATA_DIR", tmp_path / "data"), \
+         patch("agentic_metric.config.get_remote_specs", return_value=[remote]):
+        active_root = _cache_root_for(target)
+        active_file = active_root / "sessions" / "keep.jsonl"
+        active_file.parent.mkdir(parents=True)
+        active_file.write_text("{}\n")
+        stale_file = active_root / ".stale" / "sessions" / "gone.jsonl"
+        stale_file.parent.mkdir(parents=True)
+        stale_file.write_text("stale-data\n")
+
+        orphan_root = tmp_path / "data" / "remote-cache" / "0123abcd456789ef"
+        orphan_file = orphan_root / "sessions" / "orphan.jsonl"
+        orphan_file.parent.mkdir(parents=True)
+        orphan_file.write_text("orphan-data\n")
+
+        report = remote_cache_report()
+        by_orphan = {entry["is_orphan"]: entry for entry in report["entries"]}
+        assert by_orphan[False]["owner"].startswith("dev/codex/")
+        assert by_orphan[False]["total_bytes"] is None  # active size not computed
+        assert by_orphan[True]["total_bytes"] == orphan_file.stat().st_size
+        assert report["reclaimable_bytes"] == (
+            orphan_file.stat().st_size + stale_file.stat().st_size
+        )
+
+        dry = prune_remote_cache(dry_run=True)
+        assert dry["reclaimed_bytes"] == report["reclaimable_bytes"]
+        assert orphan_file.exists() and stale_file.exists()
+
+        result = prune_remote_cache()
+        assert result["reclaimed_bytes"] == report["reclaimable_bytes"]
+        assert {r["kind"] for r in result["removed"]} == {"orphan", "stale"}
+        assert not orphan_root.exists()
+        assert not (active_root / ".stale").exists()
+        assert active_file.exists()
+
+
+def test_remote_sync_prunes_expired_stale_archives(tmp_path):
+    """A sync that changes the cache also ages out old stale archives."""
+    remote = RemoteSpec(host="remote-dev", name="dev")
+    target = RemoteSyncTarget(
+        remote=remote,
+        agent_type="codex",
+        remote_root="~/.codex",
+        provider="openai",
+        index=0,
+    )
+    # Remote reports no files while the saved manifest still lists one:
+    # the cache changed (removal) without any download round-trip.
+    manifest = b"OK\0"
+
+    with patch("agentic_metric.collectors.remote.DATA_DIR", tmp_path / "data"), \
+         patch(
+             "agentic_metric.collectors.remote.subprocess.run",
+             return_value=Mock(returncode=0, stdout=manifest, stderr=b""),
+         ):
+        cache_root = _cache_root_for(target)
+        cache_root.mkdir(parents=True)
+        (cache_root / ".remote-manifest.json").write_text(
+            json.dumps({"2026/04/23/rollout-remote.jsonl": {"size": "100", "mtime": "123"}}) + "\n"
+        )
+        expired_file = cache_root / ".stale" / "sessions" / "ancient.jsonl"
+        expired_file.parent.mkdir(parents=True)
+        expired_file.write_text("{}\n")
+        expired = time.time() - 40 * 86400
+        os.utime(expired_file, (expired, expired))
+
+        db = Database(db_path=str(tmp_path / "data.db"))
+        collector = RemoteHistoryCollector(target)
+        collector.sync_history(db)
+        db.close()
+
+    assert collector.last_error == ""
+    assert not expired_file.exists()
+
+
+def test_remote_unchanged_sync_still_prunes_expired_stale_archives(tmp_path):
+    """Stale archives age out even when the remote never changes again."""
+    remote = RemoteSpec(host="remote-dev", name="dev")
+    target = RemoteSyncTarget(
+        remote=remote,
+        agent_type="codex",
+        remote_root="~/.codex",
+        provider="openai",
+        index=0,
+    )
+    rel = "2026/04/23/rollout-remote.jsonl"
+    manifest = b"OK\0" + b"100\t123\t./2026/04/23/rollout-remote.jsonl\0"
+
+    with patch("agentic_metric.collectors.remote.DATA_DIR", tmp_path / "data"), \
+         patch(
+             "agentic_metric.collectors.remote.subprocess.run",
+             return_value=Mock(returncode=0, stdout=manifest, stderr=b""),
+         ):
+        cache_root = _cache_root_for(target)
+        cache_file = cache_root / "sessions" / rel
+        cache_file.parent.mkdir(parents=True)
+        cache_file.write_text("{}\n")
+        (cache_root / ".remote-manifest.json").write_text(
+            json.dumps({rel: {"size": "100", "mtime": "123"}}) + "\n"
+        )
+        expired_file = cache_root / ".stale" / "sessions" / "ancient.jsonl"
+        expired_file.parent.mkdir(parents=True)
+        expired_file.write_text("{}\n")
+        expired = time.time() - 40 * 86400
+        os.utime(expired_file, (expired, expired))
+
+        db = Database(db_path=str(tmp_path / "data.db"))
+        collector = RemoteHistoryCollector(target)
+        collector.sync_history(db)
+        db.close()
+
+    assert collector.last_error == ""
+    assert cache_file.exists()  # unchanged mirror untouched
+    assert not expired_file.exists()
+
+
+def test_remote_archiving_resets_stale_retention_clock(tmp_path):
+    """A just-archived file must get the full retention window, even if the
+    source file's own mtime is far older than the retention cutoff."""
+    remote = RemoteSpec(host="remote-dev", name="dev")
+    target = RemoteSyncTarget(
+        remote=remote,
+        agent_type="codex",
+        remote_root="~/.codex",
+        provider="openai",
+        index=0,
+    )
+    rel = "2026/04/23/rollout-remote.jsonl"
+
+    with patch("agentic_metric.collectors.remote.DATA_DIR", tmp_path / "data"), \
+         patch(
+             "agentic_metric.collectors.remote.subprocess.run",
+             return_value=Mock(returncode=0, stdout=b"OK\0", stderr=b""),
+         ):
+        cache_root = _cache_root_for(target)
+        cache_file = cache_root / "sessions" / rel
+        cache_file.parent.mkdir(parents=True)
+        cache_file.write_text("{}\n")
+        old = time.time() - 40 * 86400
+        os.utime(cache_file, (old, old))
+        (cache_root / ".remote-manifest.json").write_text(
+            json.dumps({rel: {"size": "100", "mtime": "123"}}) + "\n"
+        )
+
+        db = Database(db_path=str(tmp_path / "data.db"))
+        collector = RemoteHistoryCollector(target)
+        collector.sync_history(db)
+        db.close()
+
+        archived = cache_root / ".stale" / "sessions" / rel
+        assert collector.last_error == ""
+        assert not cache_file.exists()
+        assert archived.exists()
+        assert archived.stat().st_mtime > time.time() - 60
+
+
+def test_remote_cache_prune_skips_orphans_when_config_is_unreadable(tmp_path):
+    """Missing/corrupt config must not classify every mirror as an orphan."""
+    from agentic_metric.collectors.remote import prune_remote_cache, remote_cache_report
+
+    corrupt_config = tmp_path / "config.json"
+    corrupt_config.write_text("{not json")
+
+    with patch("agentic_metric.collectors.remote.DATA_DIR", tmp_path / "data"), \
+         patch("agentic_metric.config.CONFIG_FILE", corrupt_config), \
+         patch("agentic_metric.config.get_remote_specs", return_value=[]):
+        mirror = tmp_path / "data" / "remote-cache" / "0123abcd456789ef"
+        mirror_file = mirror / "sessions" / "keep.jsonl"
+        mirror_file.parent.mkdir(parents=True)
+        mirror_file.write_text("{}\n")
+        stale_file = mirror / ".stale" / "sessions" / "gone.jsonl"
+        stale_file.parent.mkdir(parents=True)
+        stale_file.write_text("stale\n")
+
+        report = remote_cache_report()
+        assert report["config_unavailable"] is True
+        assert all(not entry["is_orphan"] for entry in report["entries"])
+        assert report["reclaimable_bytes"] == stale_file.stat().st_size
+
+        result = prune_remote_cache()
+        assert result["config_unavailable"] is True
+        assert mirror_file.exists()  # mirror survives
+        assert not stale_file.exists()  # stale archives still pruned
+
+        # Missing config file is equally untrusted.
+        corrupt_config.unlink()
+        assert remote_cache_report()["config_unavailable"] is True
+
+        # Valid JSON with the wrong shape parses to "no remotes" in
+        # get_remote_specs, but must not be trusted for orphan deletion.
+        for bad_shape in ('[]', '"x"', '{"remotes": "bad"}'):
+            corrupt_config.write_text(bad_shape)
+            assert remote_cache_report()["config_unavailable"] is True
+
+
+def test_remote_cache_prune_reclaims_orphans_after_remotes_removed(tmp_path):
+    """A readable config with zero remotes is deliberate: mirrors are orphans."""
+    from agentic_metric.collectors.remote import prune_remote_cache, remote_cache_report
+
+    empty_config = tmp_path / "config.json"
+    empty_config.write_text("{}\n")
+
+    with patch("agentic_metric.collectors.remote.DATA_DIR", tmp_path / "data"), \
+         patch("agentic_metric.config.CONFIG_FILE", empty_config), \
+         patch("agentic_metric.config.get_remote_specs", return_value=[]):
+        mirror = tmp_path / "data" / "remote-cache" / "0123abcd456789ef"
+        mirror_file = mirror / "sessions" / "old.jsonl"
+        mirror_file.parent.mkdir(parents=True)
+        mirror_file.write_text("{}\n")
+
+        report = remote_cache_report()
+        assert report["config_unavailable"] is False
+        assert [entry["is_orphan"] for entry in report["entries"]] == [True]
+
+        prune_remote_cache()
+        assert not mirror.exists()
+
+
+def test_remote_cache_prune_reports_failed_deletions(tmp_path):
+    from agentic_metric.collectors.remote import prune_remote_cache
+
+    remote = RemoteSpec(
+        host="remote-dev",
+        name="dev",
+        collectors={
+            "codex": [RemoteCollectorRoot(path="~/.codex", provider="openai")],
+            "claude_code": [],
+        },
+    )
+
+    with patch("agentic_metric.collectors.remote.DATA_DIR", tmp_path / "data"), \
+         patch("agentic_metric.config.get_remote_specs", return_value=[remote]), \
+         patch("agentic_metric.collectors.remote.shutil.rmtree"):  # deletion no-op
+        orphan_file = tmp_path / "data" / "remote-cache" / "deadbeef" / "sessions" / "x.jsonl"
+        orphan_file.parent.mkdir(parents=True)
+        orphan_file.write_text("orphan\n")
+
+        result = prune_remote_cache()
+
+    assert result["removed"] == []
+    assert result["reclaimed_bytes"] == 0
+    assert [item["kind"] for item in result["failed"]] == ["orphan"]
+    assert orphan_file.exists()
 
 
 def test_codex_provider_mismatch_removes_only_same_provider_stale_rows(tmp_path):
