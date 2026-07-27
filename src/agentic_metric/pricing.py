@@ -19,7 +19,8 @@ PriceTuple = tuple[float, float, float, float]
 # against Anthropic's pricing docs on 2026-06-12, Claude Sonnet 5
 # standard pricing verified against Anthropic's pricing docs on
 # 2026-07-01, Claude Opus 4.8 verified against Anthropic's
-# 2026-05-28 launch note, and Gemini 3.5 Flash verified against
+# 2026-05-28 launch note, Claude Opus 5 verified against Anthropic's
+# pricing docs on 2026-07-28, and Gemini 3.5 Flash verified against
 # Google AI Dev pricing on 2026-06-05:
 #   https://developers.openai.com/api/docs/pricing/
 #   https://developers.openai.com/api/docs/models/gpt-5.6-sol/
@@ -38,6 +39,7 @@ _BUILTIN_PRICING: dict[str, PriceTuple] = {
     # ── Anthropic Claude ──
     "claude-fable-5":        (10.0, 50.0, 1.00, 12.50),
     "claude-sonnet-5":       (3.0,  15.0, 0.30,  3.75),
+    "claude-opus-5":         (5.0,  25.0, 0.50,  6.25),
     "claude-opus-4-8":       (5.0,  25.0, 0.50,  6.25),
     "claude-opus-4-7":       (5.0,  25.0, 0.50,  6.25),
     "claude-opus-4-6":       (5.0,  25.0, 0.50,  6.25),
@@ -102,7 +104,7 @@ _MODEL_ALIASES: dict[str, str] = {
 # requests at standard rates too; Claude Opus 4.6 runs ``speed: "fast"``
 # requests at standard speed and standard rates).
 # Verified against OpenAI's pricing page and Anthropic's fast-mode docs on
-# 2026-07-21:
+# 2026-07-21, with Claude Opus 5 fast mode verified on 2026-07-28:
 #   https://developers.openai.com/api/docs/pricing/
 #   https://developers.openai.com/api/docs/guides/priority-processing
 #   https://platform.claude.com/docs/en/build-with-claude/fast-mode
@@ -122,6 +124,7 @@ _NON_STANDARD_MODE_PRICING: dict[str, dict[str, PriceTuple | None]] = {
     # Anthropic fast mode (research preview); cache multipliers stack on the
     # fast base input price, so cache_read = 0.1x and cache_write = 1.25x.
     "fast": {
+        "claude-opus-5":   (10.0,  50.0, 1.0,  12.5),
         "claude-opus-4-8": (10.0,  50.0, 1.0,  12.5),
         "claude-opus-4-7": (30.0, 150.0, 3.0, 37.5),
         "claude-opus-4-6": None,
@@ -148,7 +151,7 @@ _UNKNOWN_MODEL_PREFIXES = (
     "gpt-5-pro",
 )
 
-_PRICING_FINGERPRINT_VERSION = 16
+_PRICING_FINGERPRINT_VERSION = 17
 
 # Long-context pricing applies per request/prompt, not per stored hour/session.
 # Collectors pass single-event usage into ``estimate_cost`` before aggregating

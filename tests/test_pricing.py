@@ -74,6 +74,12 @@ def test_claude_sonnet_5_pricing(tmp_path):
         assert get_pricing("claude-sonnet-5-20260701") == (3.0, 15.0, 0.30, 3.75)
 
 
+def test_claude_opus_5_pricing(tmp_path):
+    with _patch_empty_user_pricing(tmp_path):
+        assert get_pricing("claude-opus-5") == (5.0, 25.0, 0.50, 6.25)
+        assert get_pricing("claude-opus-5-20260728") == (5.0, 25.0, 0.50, 6.25)
+
+
 def test_unknown_model_fallback():
     p = get_pricing("unknown-model-xyz")
     assert p is None
@@ -413,6 +419,17 @@ def test_claude_fast_speed_uses_fast_mode_prices(tmp_path):
             speed="fast",
         )
         assert abs(opus46 - (5.0 + 25.0)) < 1e-9
+
+        # Opus 5 shares Opus 4.8's fast-mode premium.
+        opus5 = estimate_cost(
+            "claude-opus-5-20260728",
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            cache_read_tokens=1_000_000,
+            cache_creation_tokens=1_000_000,
+            speed="fast",
+        )
+        assert abs(opus5 - (10.0 + 50.0 + 1.0 + 12.5)) < 1e-9
     _reset_cache()
 
 

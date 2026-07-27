@@ -171,7 +171,7 @@ agentic-metric pricing cache reset claude-sonnet-4                # 删除覆盖
 
 ## 内置模型定价
 
-价格为 USD / 1M tokens。数据来源为官方定价页面(2026-04-25 核实；Claude Fable 5 于 2026-06-12 核实；Claude Opus 4.8 于 2026-06-02 核实)。
+价格为 USD / 1M tokens。数据来源为官方定价页面(2026-04-25 核实；Claude Fable 5 于 2026-06-12 核实；Claude Opus 4.8 于 2026-06-02 核实；Claude Opus 5 于 2026-07-28 核实)。
 
 <details>
 <summary>Anthropic Claude</summary>
@@ -181,7 +181,7 @@ agentic-metric pricing cache reset claude-sonnet-4                # 删除覆盖
 <!-- pricing:anthropic:start -->
 | claude-fable-5 | $10.00 | $50.00 | $1.00 | $12.50 |
 | claude-sonnet-5 / claude-sonnet-4-6 / claude-sonnet-4-5 / claude-sonnet-4 / claude-sonnet-3-7 / claude-3-7-sonnet / claude-3-5-sonnet | $3.00 | $15.00 | $0.30 | $3.75 |
-| claude-opus-4-8 / claude-opus-4-7 / claude-opus-4-6 / claude-opus-4-5 | $5.00 | $25.00 | $0.50 | $6.25 |
+| claude-opus-5 / claude-opus-4-8 / claude-opus-4-7 / claude-opus-4-6 / claude-opus-4-5 | $5.00 | $25.00 | $0.50 | $6.25 |
 | claude-opus-4-1 / claude-opus-4 / claude-3-opus | $15.00 | $75.00 | $1.50 | $18.75 |
 | claude-haiku-4-5 | $1.00 | $5.00 | $0.10 | $1.25 |
 | claude-haiku-3-5 / claude-3-5-haiku | $0.80 | $4.00 | $0.08 | $1.00 |

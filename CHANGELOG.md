@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.8.3 (2026-07-28)
+
+### Improvements
+
+- **Claude Opus 5 pricing**: `claude-opus-5` is now billed at the official
+  standard rate ($5 input / $25 output, $0.50 cache read, $6.25 5m cache
+  write, $10 1h cache write per 1M tokens), and requests the API reports as
+  `usage.speed: "fast"` bill at the Opus 5 fast-mode premium ($10 / $50).
+  Opus 5 usage was previously counted in tokens but left out of cost totals
+  as an unpriced model.
+
 ## v0.8.2 (2026-07-21)
 
 ### Improvements
