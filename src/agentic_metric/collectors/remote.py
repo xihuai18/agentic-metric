@@ -23,6 +23,13 @@ from .codex import CodexCollector
 # a remote; they are never parsed again, so age them out to bound cache growth.
 _STALE_RETENTION_DAYS = 30
 
+# Download budget per ssh/tar round trip, measured in remote (uncompressed)
+# bytes. Small enough that one batch still fits in the default 30s ssh timeout
+# on a slow link, large enough that a multi-GB mirror needs tens — not
+# thousands — of round trips.
+_DOWNLOAD_BATCH_BYTES = 128 * 1024 * 1024
+_DOWNLOAD_BATCH_FILES = 500
+
 
 @dataclass(frozen=True)
 class RemoteSyncTarget:
@@ -346,20 +353,7 @@ def _sync_target_to_cache(target: RemoteSyncTarget) -> tuple[bool, bool, str]:
         if previous.get(rel) != meta or not (cache_root / target.source_child / rel).exists()
     ]
     if changed:
-        payload = "\0".join(changed).encode("utf-8") + b"\0"
-        # tar exits 1 (not fatal) when a file changes/shrinks while it is being
-        # read — common when a remote session is live. The archive it streamed
-        # is still valid, so accept exit 1 and extract it; only exit >= 2 is a
-        # real failure. Without this, any active remote session would make every
-        # sync discard the whole download and never catch up.
-        proc = _run_ssh(
-            target.remote,
-            _download_command(target),
-            input_bytes=payload,
-            allowed_returncodes=(0, 1),
-        )
-        if proc.stdout:
-            _extract_tarball(proc.stdout, cache_root / target.source_child)
+        _download_changed_files(target, cache_root, manifest, previous, changed)
     # A missing saved manifest means the cache state is unknown (first run or
     # cleared), so stray files must still be archived and sessions re-purged.
     cache_changed = bool(changed) or not had_manifest or previous != manifest
@@ -372,6 +366,88 @@ def _sync_target_to_cache(target: RemoteSyncTarget) -> tuple[bool, bool, str]:
     # not keep them alive forever. The walk only touches .stale, so it's cheap.
     _prune_old_stale_archives(cache_root)
     return (True, cache_changed, _manifest_digest(manifest))
+
+
+def _download_batches(
+    manifest: dict[str, dict[str, str]],
+    changed: list[str],
+) -> list[list[str]]:
+    """Split changed files into transfer batches bounded by remote file size.
+
+    A first-run mirror of a multi-GB remote cannot be streamed as one tar
+    within ``remote.timeout``, and a timeout used to discard the whole download
+    so the mirror never caught up. Batching keeps every ssh call small enough
+    to finish inside the timeout. Sizes come from the remote manifest, so a
+    single file larger than the batch budget still gets its own batch.
+    """
+    batches: list[list[str]] = []
+    batch: list[str] = []
+    batch_bytes = 0
+    for rel in changed:
+        try:
+            size = max(0, int(manifest.get(rel, {}).get("size") or 0))
+        except ValueError:
+            size = 0
+        if batch and (
+            batch_bytes + size > _DOWNLOAD_BATCH_BYTES
+            or len(batch) >= _DOWNLOAD_BATCH_FILES
+        ):
+            batches.append(batch)
+            batch, batch_bytes = [], 0
+        batch.append(rel)
+        batch_bytes += size
+    if batch:
+        batches.append(batch)
+    return batches
+
+
+def _download_changed_files(
+    target: RemoteSyncTarget,
+    cache_root: Path,
+    manifest: dict[str, dict[str, str]],
+    previous: dict[str, dict[str, str]],
+    changed: list[str],
+) -> None:
+    """Download changed files batch by batch, persisting progress as it goes.
+
+    The saved manifest is advanced after each extracted batch, so a failure
+    part-way through (ssh timeout, dropped connection) leaves the already
+    mirrored files recorded and the next sync only fetches the remainder.
+    """
+    progress = dict(previous)
+    for batch in _download_batches(manifest, changed):
+        payload = "\0".join(batch).encode("utf-8") + b"\0"
+        # tar exits 1 (not fatal) when a file changes/shrinks while it is being
+        # read — common when a remote session is live. The archive it streamed
+        # is still valid, so accept exit 1 and extract it; only exit >= 2 is a
+        # real failure. Without this, any active remote session would make every
+        # sync discard the whole download and never catch up.
+        try:
+            proc = _run_ssh(
+                target.remote,
+                _download_command(target),
+                input_bytes=payload,
+                allowed_returncodes=(0, 1),
+            )
+            if proc.stdout:
+                _extract_tarball(proc.stdout, cache_root / target.source_child)
+        except Exception:
+            # Keep the batches already mirrored, but never record the failed one:
+            # a half-extracted file must still look changed to the next sync even
+            # when its manifest metadata matches, or the truncated copy would be
+            # accepted as current.
+            for rel in batch:
+                progress.pop(rel, None)
+            # An empty manifest is not the same as no manifest: writing one would
+            # turn "cache state unknown" into an authoritative "remote is empty"
+            # and skip stale archiving and session purging on the next sync.
+            if progress:
+                _save_manifest(cache_root, progress)
+            raise
+        for rel in batch:
+            meta = manifest.get(rel)
+            if meta is not None:
+                progress[rel] = meta
 
 
 def _manifest_digest(manifest: dict[str, dict[str, str]]) -> str:

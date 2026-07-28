@@ -215,6 +215,7 @@ agentic-metric pricing cache reset claude-sonnet-4                # 删除覆盖
 | 模型 | Input | Output | Cache Read | Cache Write |
 |------|------:|-------:|-----------:|------------:|
 <!-- pricing:gemini:start -->
+| gemini-3.6-flash | $1.50 | $7.50 | $0.15 | — |
 | gemini-3.5-flash | $1.50 | $9.00 | $0.15 | — |
 | gemini-3.1-pro / gemini-3-pro | $2.00 | $12.00 | $0.20 | — |
 | gemini-3.1-flash-lite | $0.25 | $1.50 | $0.025 | — |
@@ -326,7 +327,9 @@ collector 目录,它会复用本机的 collector roots;本机也没有配置时,
 `~/.claude` 和 `~/.codex`。远程同步会在远程主机上展开 `~`,通过 SSH 读取
 `projects/` 和 `sessions/`,缓存到 `$DATA/agentic_metric/remote-cache/`,再和本机用量一起汇总。
 缓存里也会保存远程文件 manifest,所以重复 sync 只会下载变化过的 session/index
-文件,不会每次重新传完整 agent 目录。已经从远程 manifest 消失的缓存文件会被移到
+文件,不会每次重新传完整 agent 目录。下载按体积分批进行,每批下载完成后 manifest
+就会推进,因此 `timeout` 是按批生效的;大目录第一次同步被中断后,下次只补剩下的
+部分,不会从头重来。已经从远程 manifest 消失的缓存文件会被移到
 `.stale/`,不再参与解析;但之前已入库的用量仍保留在本地数据库里,历史报表照常包含。
 如果远程目录不存在,这个 collector 会被跳过,不会拿旧缓存继续入库。CLI/TUI
 总量保持合并,明细和 Top projects 会保留 host/source 维度。

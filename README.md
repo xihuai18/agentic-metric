@@ -239,6 +239,7 @@ Claude Opus 5 on 2026-07-28).
 | Model | Input | Output | Cache Read | Cache Write |
 |-------|------:|-------:|-----------:|------------:|
 <!-- pricing:gemini:start -->
+| gemini-3.6-flash | $1.50 | $7.50 | $0.15 | — |
 | gemini-3.5-flash | $1.50 | $9.00 | $0.15 | — |
 | gemini-3.1-pro / gemini-3-pro | $2.00 | $12.00 | $0.20 | — |
 | gemini-3.1-flash-lite | $0.25 | $1.50 | $0.025 | — |
@@ -353,7 +354,10 @@ and `~/.codex` on the remote. Remote sync expands `~` on the remote host, reads
 `$DATA/agentic_metric/remote-cache/`, and aggregates those rows with local usage.
 It also keeps a remote file manifest in the cache, so repeated syncs only
 download changed session/index files instead of transferring full agent
-directories again. Cached files that disappear from the remote manifest are
+directories again. Downloads run in size-bounded batches and the manifest
+advances after each batch, so `timeout` applies per batch and an interrupted
+sync of a large remote resumes instead of starting over. Cached files that
+disappear from the remote manifest are
 moved under `.stale/` and no longer parsed; usage already recorded from them
 stays in the database, so historical reports keep it.
 If a remote path is missing, that collector is skipped rather than reusing old

@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.8.5 (2026-07-28)
+
+### Fixes
+
+- **Resumable remote downloads**: a remote root too large to transfer inside
+  `remote.timeout` used to be re-downloaded from scratch on every sync and
+  time out again, so the mirror never caught up. Changed files are now fetched
+  in size-bounded batches and the cache manifest advances after each batch, so
+  an interrupted sync keeps what it already mirrored and the next run only
+  fetches the remainder.
+
+### Improvements
+
+- **Gemini 3.6 Flash pricing**: `gemini-3.6-flash` is priced at the official
+  standard rate ($1.50 input / $7.50 output, $0.15 cached input per 1M tokens).
+- **`mock` is no longer reported as unpriced**: the placeholder model id written
+  by local harness transcripts is treated as zero-cost, like `<synthetic>`,
+  instead of showing up in the `Pricing missing` hint.
+
 ## v0.8.4 (2026-07-28)
 
 ### Fixes

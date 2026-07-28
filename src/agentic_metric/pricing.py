@@ -21,7 +21,7 @@ PriceTuple = tuple[float, float, float, float]
 # 2026-07-01, Claude Opus 4.8 verified against Anthropic's
 # 2026-05-28 launch note, Claude Opus 5 verified against Anthropic's
 # pricing docs on 2026-07-28, and Gemini 3.5 Flash verified against
-# Google AI Dev pricing on 2026-06-05:
+# Google AI Dev pricing on 2026-06-05 (Gemini 3.6 Flash on 2026-07-28):
 #   https://developers.openai.com/api/docs/pricing/
 #   https://developers.openai.com/api/docs/models/gpt-5.6-sol/
 #   https://developers.openai.com/api/docs/models/gpt-5.6-terra/
@@ -79,6 +79,7 @@ _BUILTIN_PRICING: dict[str, PriceTuple] = {
     "gpt-5.3-chat-latest":   (1.75, 14.0,  0.175, 0.0),
     "gpt-5.3":               (1.75, 14.0,  0.175, 0.0),
     # ── Google Gemini ──
+    "gemini-3.6-flash":      (1.50,  7.50, 0.15, 0.0),
     "gemini-3.5-flash":      (1.50,  9.00, 0.15, 0.0),
     "gemini-3.1-pro":        (2.00, 12.00, 0.20, 0.0),
     "gemini-3.1-flash-lite": (0.25,  1.50, 0.025, 0.0),
@@ -139,7 +140,9 @@ _MODE_ALIASES: dict[str, str] = {"fast": "priority"}
 _STANDARD_MODES = {"", "standard", "default"}
 
 # Internal placeholder/system responses that should never be billed as a model.
-_NON_BILLABLE_MODELS = {"<synthetic>"}
+# ``mock`` is written by local harness/test transcripts, not by a real provider,
+# so it is zero-cost instead of an unpriced model in the missing-pricing hint.
+_NON_BILLABLE_MODELS = {"<synthetic>", "mock"}
 
 # Explicitly unsupported paid-model families. Keep these before builtin prefix
 # matching so ``gpt-5.4-pro`` cannot accidentally inherit ``gpt-5.4`` pricing.

@@ -21,6 +21,7 @@ from agentic_metric.collectors.remote import (
     RemoteHistoryCollector,
     RemoteSyncTarget,
     _cache_root_for,
+    _extract_tarball as remote_extract_tarball,
     _manifest_command,
     _ssh_command,
 )
@@ -480,6 +481,241 @@ def test_remote_download_tolerates_tar_file_changed_exit_1(tmp_path):
         "FROM sessions WHERE session_id = 'live-sid'"
     ).fetchone()
     assert dict(row) == {"input_tokens": 100, "output_tokens": 20}
+    db.close()
+
+
+def _codex_rollout_tarball(name: str, session_id: str) -> tuple[bytes, bytes]:
+    """Return (raw jsonl bytes, gzipped tar bytes) for one remote rollout file."""
+    import io
+    import tarfile
+
+    lines = [
+        {
+            "timestamp": "2026-04-23T10:00:00Z",
+            "type": "session_meta",
+            "payload": {"id": session_id, "cwd": "/work/project", "model_provider": "openai"},
+        },
+        {
+            "timestamp": "2026-04-23T10:00:01Z",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "hello"},
+        },
+        {
+            "timestamp": "2026-04-23T10:00:02Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {"total_token_usage": {"input_tokens": 100, "output_tokens": 20}},
+            },
+        },
+    ]
+    payload = "".join(json.dumps(line) + "\n" for line in lines).encode()
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        info = tarfile.TarInfo(name)
+        info.size = len(payload)
+        tar.addfile(info, io.BytesIO(payload))
+    return payload, buf.getvalue()
+
+
+def test_remote_download_splits_large_payload_into_batches(tmp_path):
+    """A multi-GB first run must not be one all-or-nothing tar stream.
+
+    Batches are bounded by the remote file sizes in the manifest, so each ssh
+    call stays inside the configured timeout.
+    """
+    files = [
+        ("2026/04/23/rollout-a.jsonl", "sid-a"),
+        ("2026/04/23/rollout-b.jsonl", "sid-b"),
+        ("2026/04/23/rollout-c.jsonl", "sid-c"),
+    ]
+    big = 100 * 1024 * 1024  # 3 x 100 MB against a 128 MB batch budget
+    manifest = b"OK\0" + b"".join(
+        f"{big}\t123\t./{name}".encode() + b"\0" for name, _ in files
+    )
+    tarballs = [_codex_rollout_tarball(name, sid)[1] for name, sid in files]
+    run_mock = Mock(side_effect=[
+        Mock(returncode=0, stdout=manifest, stderr=b""),
+        *[Mock(returncode=0, stdout=tar, stderr=b"") for tar in tarballs],
+    ])
+    target = RemoteSyncTarget(
+        remote=RemoteSpec(host="remote-dev", name="dev", timeout=9),
+        agent_type="codex",
+        remote_root="~/.codex",
+        provider="openai",
+        index=0,
+    )
+    db = Database(db_path=str(tmp_path / "data.db"))
+    with patch("agentic_metric.collectors.remote.DATA_DIR", tmp_path / "data"), \
+         patch("agentic_metric.collectors.remote.subprocess.run", run_mock):
+        collector = RemoteHistoryCollector(target)
+        collector.sync_history(db)
+
+    assert collector.last_error == ""
+    downloads = [call.kwargs["input"] for call in run_mock.call_args_list[1:]]
+    assert downloads == [f"{name}\0".encode() for name, _ in files]
+    ids = {row["session_id"] for row in db.conn.execute("SELECT session_id FROM sessions")}
+    assert ids == {"sid-a", "sid-b", "sid-c"}
+    db.close()
+
+
+def test_remote_download_timeout_keeps_completed_batches(tmp_path):
+    """A timeout mid-download must not throw away the batches already mirrored.
+
+    Without persisted progress a remote too large for one transfer window can
+    never catch up: every sync re-downloads from scratch and times out again.
+    """
+    import subprocess
+
+    files = [
+        ("2026/04/23/rollout-a.jsonl", "sid-a"),
+        ("2026/04/23/rollout-b.jsonl", "sid-b"),
+    ]
+    big = 100 * 1024 * 1024
+    manifest = b"OK\0" + b"".join(
+        f"{big}\t123\t./{name}".encode() + b"\0" for name, _ in files
+    )
+    tar_a = _codex_rollout_tarball(files[0][0], files[0][1])[1]
+    tar_b = _codex_rollout_tarball(files[1][0], files[1][1])[1]
+
+    data_dir = tmp_path / "data"
+    db = Database(db_path=str(tmp_path / "data.db"))
+    first_run = Mock(side_effect=[
+        Mock(returncode=0, stdout=manifest, stderr=b""),
+        Mock(returncode=0, stdout=tar_a, stderr=b""),
+        subprocess.TimeoutExpired(cmd="ssh", timeout=9),
+    ])
+    target = RemoteSyncTarget(
+        remote=RemoteSpec(host="remote-dev", name="dev", timeout=9),
+        agent_type="codex",
+        remote_root="~/.codex",
+        provider="openai",
+        index=0,
+    )
+    with patch("agentic_metric.collectors.remote.DATA_DIR", data_dir), \
+         patch("agentic_metric.collectors.remote.subprocess.run", first_run):
+        collector = RemoteHistoryCollector(target)
+        collector.sync_history(db)
+        cache_root = _cache_root_for(target)
+
+    assert "timed out" in collector.last_error
+    saved = json.loads((cache_root / ".remote-manifest.json").read_text())
+    assert set(saved) == {files[0][0]}
+
+    second_run = Mock(side_effect=[
+        Mock(returncode=0, stdout=manifest, stderr=b""),
+        Mock(returncode=0, stdout=tar_b, stderr=b""),
+    ])
+    with patch("agentic_metric.collectors.remote.DATA_DIR", data_dir), \
+         patch("agentic_metric.collectors.remote.subprocess.run", second_run):
+        collector = RemoteHistoryCollector(target)
+        collector.sync_history(db)
+
+    assert collector.last_error == ""
+    # Only the missing file is fetched the second time.
+    assert [call.kwargs["input"] for call in second_run.call_args_list[1:]] == [
+        f"{files[1][0]}\0".encode()
+    ]
+    ids = {row["session_id"] for row in db.conn.execute("SELECT session_id FROM sessions")}
+    assert ids == {"sid-a", "sid-b"}
+    db.close()
+
+
+def test_remote_first_batch_failure_keeps_cache_state_unknown(tmp_path):
+    """No completed batch means no manifest: an empty one would claim the remote
+    is empty and skip stale archiving / session purging on the next sync."""
+    import subprocess
+
+    name, sid = "2026/04/23/rollout-a.jsonl", "sid-a"
+    payload, _ = _codex_rollout_tarball(name, sid)
+    manifest = b"OK\0" + f"{len(payload)}\t123\t./{name}".encode() + b"\0"
+    run_mock = Mock(side_effect=[
+        Mock(returncode=0, stdout=manifest, stderr=b""),
+        subprocess.TimeoutExpired(cmd="ssh", timeout=9),
+    ])
+    target = RemoteSyncTarget(
+        remote=RemoteSpec(host="remote-dev", name="dev", timeout=9),
+        agent_type="codex",
+        remote_root="~/.codex",
+        provider="openai",
+        index=0,
+    )
+    db = Database(db_path=str(tmp_path / "data.db"))
+    with patch("agentic_metric.collectors.remote.DATA_DIR", tmp_path / "data"), \
+         patch("agentic_metric.collectors.remote.subprocess.run", run_mock):
+        collector = RemoteHistoryCollector(target)
+        collector.sync_history(db)
+        cache_root = _cache_root_for(target)
+
+    assert "timed out" in collector.last_error
+    assert not (cache_root / ".remote-manifest.json").exists()
+    db.close()
+
+
+def test_remote_failed_batch_is_refetched_after_extraction_error(tmp_path):
+    """A batch that failed to extract must not be recorded as mirrored.
+
+    Its files may be truncated on disk, so the next sync has to download them
+    again even though the remote metadata is unchanged.
+    """
+    files = [
+        ("2026/04/23/rollout-a.jsonl", "sid-a"),
+        ("2026/04/23/rollout-b.jsonl", "sid-b"),
+    ]
+    big = 100 * 1024 * 1024
+    manifest = b"OK\0" + b"".join(
+        f"{big}\t123\t./{name}".encode() + b"\0" for name, _ in files
+    )
+    tar_a = _codex_rollout_tarball(files[0][0], files[0][1])[1]
+    tar_b = _codex_rollout_tarball(files[1][0], files[1][1])[1]
+
+    data_dir = tmp_path / "data"
+    db = Database(db_path=str(tmp_path / "data.db"))
+    target = RemoteSyncTarget(
+        remote=RemoteSpec(host="remote-dev", name="dev", timeout=9),
+        agent_type="codex",
+        remote_root="~/.codex",
+        provider="openai",
+        index=0,
+    )
+    real_extract = remote_extract_tarball
+    calls = {"n": 0}
+
+    def flaky_extract(data, dest):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError("disk full mid-extract")
+        real_extract(data, dest)
+
+    first_run = Mock(side_effect=[
+        Mock(returncode=0, stdout=manifest, stderr=b""),
+        Mock(returncode=0, stdout=tar_a, stderr=b""),
+        Mock(returncode=0, stdout=tar_b, stderr=b""),
+    ])
+    with patch("agentic_metric.collectors.remote.DATA_DIR", data_dir), \
+         patch("agentic_metric.collectors.remote.subprocess.run", first_run), \
+         patch("agentic_metric.collectors.remote._extract_tarball", flaky_extract):
+        collector = RemoteHistoryCollector(target)
+        collector.sync_history(db)
+        cache_root = _cache_root_for(target)
+
+    assert collector.last_error
+    saved = json.loads((cache_root / ".remote-manifest.json").read_text())
+    assert set(saved) == {files[0][0]}
+
+    second_run = Mock(side_effect=[
+        Mock(returncode=0, stdout=manifest, stderr=b""),
+        Mock(returncode=0, stdout=tar_b, stderr=b""),
+    ])
+    with patch("agentic_metric.collectors.remote.DATA_DIR", data_dir), \
+         patch("agentic_metric.collectors.remote.subprocess.run", second_run):
+        collector = RemoteHistoryCollector(target)
+        collector.sync_history(db)
+
+    assert collector.last_error == ""
+    assert [call.kwargs["input"] for call in second_run.call_args_list[1:]] == [
+        f"{files[1][0]}\0".encode()
+    ]
     db.close()
 
 

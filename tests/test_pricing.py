@@ -80,6 +80,21 @@ def test_claude_opus_5_pricing(tmp_path):
         assert get_pricing("claude-opus-5-20260728") == (5.0, 25.0, 0.50, 6.25)
 
 
+def test_gemini_3_6_flash_pricing(tmp_path):
+    with _patch_empty_user_pricing(tmp_path):
+        assert get_pricing("gemini-3.6-flash") == (1.50, 7.50, 0.15, 0.0)
+        assert get_pricing("gemini-3.6-flash-preview") == (1.50, 7.50, 0.15, 0.0)
+
+
+def test_mock_model_is_never_billed(tmp_path):
+    """``mock`` transcripts are a local harness artifact, not a paid model."""
+    with _patch_empty_user_pricing(tmp_path):
+        assert get_pricing("mock") == (0.0, 0.0, 0.0, 0.0)
+        assert estimate_cost("mock", input_tokens=1_000_000, output_tokens=1_000_000) == 0.0
+        # Only the exact placeholder is exempt.
+        assert get_pricing("mock-1-preview") is None
+
+
 def test_unknown_model_fallback():
     p = get_pricing("unknown-model-xyz")
     assert p is None
