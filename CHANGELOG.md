@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.8.4 (2026-07-28)
+
+### Fixes
+
+- **Dropped the stale Opus 4.7 fast-mode price**: Anthropic now rejects
+  `speed: "fast"` on `claude-opus-4-7` instead of serving it, so the premium
+  entry could never match real history. Opus 4.7 is marked as not offering
+  the mode, alongside Opus 4.6.
+
 ## v0.8.3 (2026-07-28)
 
 ### Improvements

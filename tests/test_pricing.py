@@ -420,6 +420,16 @@ def test_claude_fast_speed_uses_fast_mode_prices(tmp_path):
         )
         assert abs(opus46 - (5.0 + 25.0)) < 1e-9
 
+        # Opus 4.7 rejects speed:"fast" outright, so it has no premium price
+        # and any such marker bills at standard rates.
+        opus47 = estimate_cost(
+            "claude-opus-4-7",
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            speed="fast",
+        )
+        assert abs(opus47 - (5.0 + 25.0)) < 1e-9
+
         # Opus 5 shares Opus 4.8's fast-mode premium.
         opus5 = estimate_cost(
             "claude-opus-5-20260728",

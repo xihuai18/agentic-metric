@@ -102,7 +102,8 @@ _MODEL_ALIASES: dict[str, str] = {
 # ``None`` marks a model where the provider does not offer the mode, so
 # requests fall back to standard rates (OpenAI bills ramp-limited priority
 # requests at standard rates too; Claude Opus 4.6 runs ``speed: "fast"``
-# requests at standard speed and standard rates).
+# requests at standard speed and standard rates, and Claude Opus 4.7 rejects
+# them outright, so neither can produce fast-marked history).
 # Verified against OpenAI's pricing page and Anthropic's fast-mode docs on
 # 2026-07-21, with Claude Opus 5 fast mode verified on 2026-07-28:
 #   https://developers.openai.com/api/docs/pricing/
@@ -126,7 +127,7 @@ _NON_STANDARD_MODE_PRICING: dict[str, dict[str, PriceTuple | None]] = {
     "fast": {
         "claude-opus-5":   (10.0,  50.0, 1.0,  12.5),
         "claude-opus-4-8": (10.0,  50.0, 1.0,  12.5),
-        "claude-opus-4-7": (30.0, 150.0, 3.0, 37.5),
+        "claude-opus-4-7": None,
         "claude-opus-4-6": None,
     },
 }
