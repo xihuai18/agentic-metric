@@ -20,6 +20,7 @@ from agentic_metric.collectors.codex import (
 from agentic_metric.collectors.remote import (
     RemoteHistoryCollector,
     RemoteSyncTarget,
+    _MAX_SKIPPED_BATCHES,
     _cache_root_for,
     _extract_tarball as remote_extract_tarball,
     _manifest_command,
@@ -486,36 +487,108 @@ def test_remote_download_tolerates_tar_file_changed_exit_1(tmp_path):
 
 def _codex_rollout_tarball(name: str, session_id: str) -> tuple[bytes, bytes]:
     """Return (raw jsonl bytes, gzipped tar bytes) for one remote rollout file."""
+    payloads = _codex_rollout_payloads([(name, session_id)])
+    return payloads[name], _codex_tarball(payloads)
+
+
+def _codex_rollout_payloads(entries: list[tuple[str, str]]) -> dict[str, bytes]:
+    payloads: dict[str, bytes] = {}
+    for name, session_id in entries:
+        lines = [
+            {
+                "timestamp": "2026-04-23T10:00:00Z",
+                "type": "session_meta",
+                "payload": {"id": session_id, "cwd": "/work/project", "model_provider": "openai"},
+            },
+            {
+                "timestamp": "2026-04-23T10:00:01Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "hello"},
+            },
+            {
+                "timestamp": "2026-04-23T10:00:02Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {"total_token_usage": {"input_tokens": 100, "output_tokens": 20}},
+                },
+            },
+        ]
+        payloads[name] = "".join(json.dumps(line) + "\n" for line in lines).encode()
+    return payloads
+
+
+def _codex_tarball(payloads: dict[str, bytes]) -> bytes:
+    """Pack one gzipped tar holding every given member."""
     import io
     import tarfile
 
-    lines = [
-        {
-            "timestamp": "2026-04-23T10:00:00Z",
-            "type": "session_meta",
-            "payload": {"id": session_id, "cwd": "/work/project", "model_provider": "openai"},
-        },
-        {
-            "timestamp": "2026-04-23T10:00:01Z",
-            "type": "event_msg",
-            "payload": {"type": "user_message", "message": "hello"},
-        },
-        {
-            "timestamp": "2026-04-23T10:00:02Z",
-            "type": "event_msg",
-            "payload": {
-                "type": "token_count",
-                "info": {"total_token_usage": {"input_tokens": 100, "output_tokens": 20}},
-            },
-        },
-    ]
-    payload = "".join(json.dumps(line) + "\n" for line in lines).encode()
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        info = tarfile.TarInfo(name)
-        info.size = len(payload)
-        tar.addfile(info, io.BytesIO(payload))
-    return payload, buf.getvalue()
+        for name, payload in payloads.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(payload)
+            tar.addfile(info, io.BytesIO(payload))
+    return buf.getvalue()
+
+
+def test_remote_file_absent_from_the_archive_is_not_recorded(tmp_path):
+    """A member the archive did not carry must stay pending, not look current.
+
+    Recording it would let an outdated local copy pass as up to date forever.
+    """
+    files = [
+        ("2026/04/23/rollout-a.jsonl", "sid-a"),
+        ("2026/04/23/rollout-b.jsonl", "sid-b"),
+    ]
+    payloads = _codex_rollout_payloads(files)
+    manifest = b"OK\0" + b"".join(
+        f"{len(payloads[name])}\t123\t./{name}".encode() + b"\0" for name, _ in files
+    )
+    # tar delivered only A even though both were requested.
+    partial_tar = _codex_tarball({files[0][0]: payloads[files[0][0]]})
+
+    data_dir = tmp_path / "data"
+    db = Database(db_path=str(tmp_path / "data.db"))
+    target = RemoteSyncTarget(
+        remote=RemoteSpec(host="remote-dev", name="dev", timeout=9),
+        agent_type="codex",
+        remote_root="~/.codex",
+        provider="openai",
+        index=0,
+    )
+    first_run = Mock(side_effect=[
+        Mock(returncode=0, stdout=manifest, stderr=b""),
+        Mock(returncode=0, stdout=partial_tar, stderr=b""),
+    ])
+    with patch("agentic_metric.collectors.remote.DATA_DIR", data_dir), \
+         patch("agentic_metric.collectors.remote.subprocess.run", first_run):
+        collector = RemoteHistoryCollector(target)
+        collector.sync_history(db)
+        cache_root = _cache_root_for(target)
+
+    saved = json.loads((cache_root / ".remote-manifest.json").read_text())
+    assert set(saved) == {files[0][0]}
+    assert (cache_root / ".remote-manifest.incomplete").exists()
+
+    # The next sync retries only the file that never arrived.
+    second_run = Mock(side_effect=[
+        Mock(returncode=0, stdout=manifest, stderr=b""),
+        Mock(returncode=0, stdout=_codex_tarball({files[1][0]: payloads[files[1][0]]}), stderr=b""),
+    ])
+    with patch("agentic_metric.collectors.remote.DATA_DIR", data_dir), \
+         patch("agentic_metric.collectors.remote.subprocess.run", second_run):
+        collector = RemoteHistoryCollector(target)
+        collector.sync_history(db)
+
+    assert [call.kwargs["input"] for call in second_run.call_args_list[1:]] == [
+        f"{files[1][0]}\0".encode()
+    ]
+    assert not (cache_root / ".remote-manifest.incomplete").exists()
+    assert json.loads((cache_root / ".remote-manifest.json").read_text()).keys() == {
+        files[0][0], files[1][0]
+    }
+    db.close()
 
 
 def test_remote_download_splits_large_payload_into_batches(tmp_path):
@@ -685,7 +758,7 @@ def test_remote_failed_batch_is_refetched_after_extraction_error(tmp_path):
         calls["n"] += 1
         if calls["n"] == 2:
             raise OSError("disk full mid-extract")
-        real_extract(data, dest)
+        return real_extract(data, dest)
 
     first_run = Mock(side_effect=[
         Mock(returncode=0, stdout=manifest, stderr=b""),
@@ -716,6 +789,248 @@ def test_remote_failed_batch_is_refetched_after_extraction_error(tmp_path):
     assert [call.kwargs["input"] for call in second_run.call_args_list[1:]] == [
         f"{files[1][0]}\0".encode()
     ]
+    db.close()
+
+
+def test_remote_unsplittable_batch_does_not_starve_later_files(tmp_path):
+    """One file too big for the timeout window must not block the rest.
+
+    A single-file batch cannot be split further, so it is skipped and reported;
+    the files behind it still land in the cache and the next sync retries only
+    the skipped one.
+    """
+    import subprocess
+
+    files = [
+        ("2026/04/23/rollout-huge.jsonl", "sid-huge"),
+        ("2026/04/23/rollout-small.jsonl", "sid-small"),
+    ]
+    big = 200 * 1024 * 1024  # each file gets its own batch
+    manifest = b"OK\0" + b"".join(
+        f"{big}\t123\t./{name}".encode() + b"\0" for name, _ in files
+    )
+    tar_small = _codex_rollout_tarball(files[1][0], files[1][1])[1]
+
+    data_dir = tmp_path / "data"
+    db = Database(db_path=str(tmp_path / "data.db"))
+    target = RemoteSyncTarget(
+        remote=RemoteSpec(host="remote-dev", name="dev", timeout=9),
+        agent_type="codex",
+        remote_root="~/.codex",
+        provider="openai",
+        index=0,
+    )
+    first_run = Mock(side_effect=[
+        Mock(returncode=0, stdout=manifest, stderr=b""),
+        subprocess.TimeoutExpired(cmd="ssh", timeout=9),
+        Mock(returncode=0, stdout=tar_small, stderr=b""),
+    ])
+    with patch("agentic_metric.collectors.remote.DATA_DIR", data_dir), \
+         patch("agentic_metric.collectors.remote.subprocess.run", first_run):
+        collector = RemoteHistoryCollector(target)
+        collector.sync_history(db)
+        cache_root = _cache_root_for(target)
+
+    assert "timed out" in collector.last_error
+    # The small file was fetched even though the huge one came first.
+    assert (cache_root / "sessions" / files[1][0]).exists()
+    saved = json.loads((cache_root / ".remote-manifest.json").read_text())
+    assert set(saved) == {files[1][0]}
+
+    second_run = Mock(side_effect=[
+        Mock(returncode=0, stdout=manifest, stderr=b""),
+        Mock(returncode=0, stdout=_codex_rollout_tarball(*files[0])[1], stderr=b""),
+    ])
+    with patch("agentic_metric.collectors.remote.DATA_DIR", data_dir), \
+         patch("agentic_metric.collectors.remote.subprocess.run", second_run):
+        collector = RemoteHistoryCollector(target)
+        collector.sync_history(db)
+
+    assert collector.last_error == ""
+    assert [call.kwargs["input"] for call in second_run.call_args_list[1:]] == [
+        f"{files[0][0]}\0".encode()
+    ]
+    db.close()
+
+
+def test_remote_multi_file_batch_failure_stops_the_download(tmp_path):
+    """A failure on a splittable batch means the remote is unhealthy: stop.
+
+    Continuing would spend one full timeout per remaining batch.
+    """
+    import subprocess
+
+    files = [(f"2026/04/23/rollout-{i}.jsonl", f"sid-{i}") for i in range(4)]
+    # 60 MB each against a 128 MB budget: two files per batch, so the failing
+    # batch is splittable rather than an unavoidable single-file one.
+    manifest = b"OK\0" + b"".join(
+        f"{60 * 1024 * 1024}\t123\t./{name}".encode() + b"\0" for name, _ in files
+    )
+    run_mock = Mock(side_effect=[
+        Mock(returncode=0, stdout=manifest, stderr=b""),
+        subprocess.TimeoutExpired(cmd="ssh", timeout=9),
+        Mock(returncode=0, stdout=b"", stderr=b""),
+    ])
+    target = RemoteSyncTarget(
+        remote=RemoteSpec(host="remote-dev", name="dev", timeout=9),
+        agent_type="codex",
+        remote_root="~/.codex",
+        provider="openai",
+        index=0,
+    )
+    db = Database(db_path=str(tmp_path / "data.db"))
+    with patch("agentic_metric.collectors.remote.DATA_DIR", tmp_path / "data"), \
+         patch("agentic_metric.collectors.remote.subprocess.run", run_mock):
+        collector = RemoteHistoryCollector(target)
+        collector.sync_history(db)
+
+    assert "timed out" in collector.last_error
+    # Manifest call plus exactly one download attempt: no further batches.
+    assert run_mock.call_count == 2
+    db.close()
+
+
+def test_remote_extraction_failure_is_never_skipped(tmp_path):
+    """A local extraction failure must stop the download, not skip a batch.
+
+    Nothing another batch does can fix a full disk or an unreadable archive.
+    """
+    files = [
+        ("2026/04/23/rollout-a.jsonl", "sid-a"),
+        ("2026/04/23/rollout-b.jsonl", "sid-b"),
+    ]
+    big = 200 * 1024 * 1024  # one single-file batch per file
+    manifest = b"OK\0" + b"".join(
+        f"{big}\t123\t./{name}".encode() + b"\0" for name, _ in files
+    )
+    run_mock = Mock(side_effect=[
+        Mock(returncode=0, stdout=manifest, stderr=b""),
+        Mock(returncode=0, stdout=_codex_rollout_tarball(*files[0])[1], stderr=b""),
+        Mock(returncode=0, stdout=_codex_rollout_tarball(*files[1])[1], stderr=b""),
+    ])
+    target = RemoteSyncTarget(
+        remote=RemoteSpec(host="remote-dev", name="dev", timeout=9),
+        agent_type="codex",
+        remote_root="~/.codex",
+        provider="openai",
+        index=0,
+    )
+    db = Database(db_path=str(tmp_path / "data.db"))
+    with patch("agentic_metric.collectors.remote.DATA_DIR", tmp_path / "data"), \
+         patch("agentic_metric.collectors.remote.subprocess.run", run_mock), \
+         patch(
+             "agentic_metric.collectors.remote._extract_tarball",
+             side_effect=OSError("disk full"),
+         ):
+        collector = RemoteHistoryCollector(target)
+        collector.sync_history(db)
+
+    assert "disk full" in collector.last_error
+    # Manifest call plus the one failed download: the second file is not tried.
+    assert run_mock.call_count == 2
+    db.close()
+
+
+def test_remote_download_stops_after_too_many_skipped_batches(tmp_path):
+    """Skipping is bounded: a dead connection must not burn a timeout per batch."""
+    import subprocess
+
+    files = [(f"2026/04/23/rollout-{i}.jsonl", f"sid-{i}") for i in range(8)]
+    big = 200 * 1024 * 1024  # every file becomes its own batch
+    manifest = b"OK\0" + b"".join(
+        f"{big}\t123\t./{name}".encode() + b"\0" for name, _ in files
+    )
+    run_mock = Mock(side_effect=[
+        Mock(returncode=0, stdout=manifest, stderr=b""),
+        *[subprocess.TimeoutExpired(cmd="ssh", timeout=9) for _ in files],
+    ])
+    target = RemoteSyncTarget(
+        remote=RemoteSpec(host="remote-dev", name="dev", timeout=9),
+        agent_type="codex",
+        remote_root="~/.codex",
+        provider="openai",
+        index=0,
+    )
+    db = Database(db_path=str(tmp_path / "data.db"))
+    with patch("agentic_metric.collectors.remote.DATA_DIR", tmp_path / "data"), \
+         patch("agentic_metric.collectors.remote.subprocess.run", run_mock):
+        collector = RemoteHistoryCollector(target)
+        collector.sync_history(db)
+
+    assert "timed out" in collector.last_error
+    # Manifest call, three skipped batches, then one fatal one.
+    assert run_mock.call_count == 1 + _MAX_SKIPPED_BATCHES + 1
+    db.close()
+
+
+def test_remote_skipped_file_deleted_upstream_is_still_archived(tmp_path):
+    """A partial manifest must not become authoritative.
+
+    Sequence: a file is mirrored, then changes and gets skipped, then disappears
+    from the remote. Its outdated local copy must be archived instead of staying
+    active just because the partial manifest matched the shrunken remote.
+    """
+    import subprocess
+
+    a_name, b_name = "2026/04/23/rollout-a.jsonl", "2026/04/23/rollout-b.jsonl"
+    a_payload, _ = _codex_rollout_tarball(a_name, "sid-a")
+    b_payload, b_tar = _codex_rollout_tarball(b_name, "sid-b")
+    huge = 200 * 1024 * 1024
+
+    def manifest_for(entries: list[tuple[str, int, int]]) -> bytes:
+        return b"OK\0" + b"".join(
+            f"{size}\t{mtime}\t./{name}".encode() + b"\0" for name, size, mtime in entries
+        )
+
+    full = manifest_for([(a_name, len(a_payload), 111), (b_name, len(b_payload), 222)])
+    a_changed = manifest_for([(a_name, huge, 333), (b_name, len(b_payload), 222)])
+    without_a = manifest_for([(b_name, len(b_payload), 222)])
+
+    data_dir = tmp_path / "data"
+    db = Database(db_path=str(tmp_path / "data.db"))
+    target = RemoteSyncTarget(
+        remote=RemoteSpec(host="remote-dev", name="dev", timeout=9),
+        agent_type="codex",
+        remote_root="~/.codex",
+        provider="openai",
+        index=0,
+    )
+
+    def run_sync(side_effect):
+        with patch("agentic_metric.collectors.remote.DATA_DIR", data_dir), \
+             patch("agentic_metric.collectors.remote.subprocess.run", Mock(side_effect=side_effect)):
+            collector = RemoteHistoryCollector(target)
+            collector.sync_history(db)
+            return collector, _cache_root_for(target)
+
+    # 1. Healthy mirror of both files: one batch carrying both members.
+    collector, cache_root = run_sync([
+        Mock(returncode=0, stdout=full, stderr=b""),
+        Mock(returncode=0, stdout=_codex_tarball({a_name: a_payload, b_name: b_payload}), stderr=b""),
+    ])
+    assert collector.last_error == ""
+    assert (cache_root / "sessions" / a_name).exists()
+    assert (cache_root / "sessions" / b_name).exists()
+    assert not (cache_root / ".remote-manifest.incomplete").exists()
+
+    # 2. A grew too large to transfer and is skipped; B is refetched fine.
+    collector, cache_root = run_sync([
+        Mock(returncode=0, stdout=a_changed, stderr=b""),
+        subprocess.TimeoutExpired(cmd="ssh", timeout=9),
+        Mock(returncode=0, stdout=b_tar, stderr=b""),
+    ])
+    assert "timed out" in collector.last_error
+    assert json.loads((cache_root / ".remote-manifest.json").read_text()).keys() == {b_name}
+    assert (cache_root / ".remote-manifest.incomplete").exists()
+    # The previous copy of A is still sitting in the active cache.
+    assert (cache_root / "sessions" / a_name).exists()
+
+    # 3. A disappears from the remote: the stale local copy must be archived.
+    collector, cache_root = run_sync([Mock(returncode=0, stdout=without_a, stderr=b"")])
+    assert collector.last_error == ""
+    assert not (cache_root / "sessions" / a_name).exists()
+    assert list((cache_root / ".stale").rglob("rollout-a*.jsonl"))
+    assert not (cache_root / ".remote-manifest.incomplete").exists()
     db.close()
 
 

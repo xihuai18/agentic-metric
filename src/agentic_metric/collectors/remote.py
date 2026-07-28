@@ -30,6 +30,11 @@ _STALE_RETENTION_DAYS = 30
 _DOWNLOAD_BATCH_BYTES = 128 * 1024 * 1024
 _DOWNLOAD_BATCH_FILES = 500
 
+# How many unsplittable (single-file) batches may be skipped before the whole
+# download is treated as failing. Keeps one oversized file from blocking the
+# mirror, without spending one timeout per batch when the remote is down.
+_MAX_SKIPPED_BATCHES = 3
+
 
 @dataclass(frozen=True)
 class RemoteSyncTarget:
@@ -346,26 +351,45 @@ def _sync_target_to_cache(target: RemoteSyncTarget) -> tuple[bool, bool, str]:
         return (False, False, "")
 
     loaded = _load_manifest(cache_root)
-    had_manifest = loaded is not None
+    # A partial manifest (left by a download that skipped files) is not
+    # authoritative: treat it like a missing one so stale archiving and session
+    # purging still run once the mirror completes.
+    had_manifest = loaded is not None and not _manifest_is_incomplete(cache_root)
     previous = loaded or {}
     changed = [
         rel for rel, meta in manifest.items()
         if previous.get(rel) != meta or not (cache_root / target.source_child / rel).exists()
     ]
     if changed:
-        _download_changed_files(target, cache_root, manifest, previous, changed)
+        missing = _download_changed_files(target, cache_root, manifest, previous, changed)
+    else:
+        missing = set()
     # A missing saved manifest means the cache state is unknown (first run or
     # cleared), so stray files must still be archived and sessions re-purged.
     cache_changed = bool(changed) or not had_manifest or previous != manifest
+    # Files the remote listed but the download never delivered must stay out of
+    # the saved manifest, or an outdated local copy would pass as current.
+    saved_manifest = (
+        manifest if not missing
+        else {rel: meta for rel, meta in manifest.items() if rel not in missing}
+    )
     if cache_changed:
         # Stale archiving and session purging only matter when the mirror
-        # actually changed; skipping them keeps unchanged remotes cheap.
+        # actually changed; skipping them keeps unchanged remotes cheap. Stale
+        # detection uses the full remote manifest so files that are merely
+        # pending download are not archived.
         _archive_stale_cache_files(cache_root, target, manifest)
-        _save_manifest(cache_root, manifest)
+        if missing:
+            _mark_manifest_incomplete(cache_root)
+        _save_manifest(cache_root, saved_manifest)
+    if not missing:
+        # Every changed file was downloaded, so the saved manifest covers the
+        # whole remote again.
+        _clear_manifest_incomplete(cache_root)
     # Age out expired stale archives on every sync — an unchanged remote must
     # not keep them alive forever. The walk only touches .stale, so it's cheap.
     _prune_old_stale_archives(cache_root)
-    return (True, cache_changed, _manifest_digest(manifest))
+    return (True, cache_changed, _manifest_digest(saved_manifest))
 
 
 def _download_batches(
@@ -407,47 +431,100 @@ def _download_changed_files(
     manifest: dict[str, dict[str, str]],
     previous: dict[str, dict[str, str]],
     changed: list[str],
-) -> None:
+) -> set[str]:
     """Download changed files batch by batch, persisting progress as it goes.
+
+    Returns the files the remote listed but the download did not deliver, so the
+    caller can keep them out of the saved manifest.
 
     The saved manifest is advanced after each extracted batch, so a failure
     part-way through (ssh timeout, dropped connection) leaves the already
     mirrored files recorded and the next sync only fetches the remainder.
+
+    A batch holding a single file cannot be split any further, so one file that
+    never transfers inside ``remote.timeout`` is skipped rather than allowed to
+    starve every batch behind it. Wider failures — or too many single-file ones —
+    mean the remote itself is unhealthy and stop the download immediately
+    instead of spending one timeout per remaining batch.
     """
     progress = dict(previous)
-    for batch in _download_batches(manifest, changed):
-        payload = "\0".join(batch).encode("utf-8") + b"\0"
-        # tar exits 1 (not fatal) when a file changes/shrinks while it is being
-        # read — common when a remote session is live. The archive it streamed
-        # is still valid, so accept exit 1 and extract it; only exit >= 2 is a
-        # real failure. Without this, any active remote session would make every
-        # sync discard the whole download and never catch up.
-        try:
-            proc = _run_ssh(
-                target.remote,
-                _download_command(target),
-                input_bytes=payload,
-                allowed_returncodes=(0, 1),
-            )
-            if proc.stdout:
-                _extract_tarball(proc.stdout, cache_root / target.source_child)
-        except Exception:
-            # Keep the batches already mirrored, but never record the failed one:
-            # a half-extracted file must still look changed to the next sync even
-            # when its manifest metadata matches, or the truncated copy would be
-            # accepted as current.
+    first_error: Exception | None = None
+    skipped = 0
+    missing: set[str] = set()
+
+    def persist() -> None:
+        # An empty manifest is not the same as no manifest: writing one would
+        # turn "cache state unknown" into an authoritative "remote is empty"
+        # and skip stale archiving and session purging on the next sync.
+        if progress:
+            # Mark before writing: a crash between the two writes must leave the
+            # partial manifest flagged, never authoritative.
+            _mark_manifest_incomplete(cache_root)
+            _save_manifest(cache_root, progress)
+
+    try:
+        for batch in _download_batches(manifest, changed):
+            payload = "\0".join(batch).encode("utf-8") + b"\0"
+            # tar exits 1 (not fatal) when a file changes/shrinks while it is
+            # being read — common when a remote session is live. The archive it
+            # streamed is still valid, so accept exit 1 and extract it; only
+            # exit >= 2 is a real failure. Without this, any active remote
+            # session would make every sync discard the whole download and never
+            # catch up.
+            try:
+                proc = _run_ssh(
+                    target.remote,
+                    _download_command(target),
+                    input_bytes=payload,
+                    allowed_returncodes=(0, 1),
+                )
+            except RuntimeError as exc:
+                # Never record the failed batch: a half-extracted file must still
+                # look changed to the next sync even when its manifest metadata
+                # matches, or the truncated copy would be accepted as current.
+                for rel in batch:
+                    progress.pop(rel, None)
+                if len(batch) == 1 and skipped < _MAX_SKIPPED_BATCHES:
+                    skipped += 1
+                    missing.update(batch)
+                    if first_error is None:
+                        first_error = exc
+                    continue
+                raise
+            try:
+                written = (
+                    _extract_tarball(proc.stdout, cache_root / target.source_child)
+                    if proc.stdout
+                    else set()
+                )
+            except Exception:
+                # A local extraction failure (full disk, unreadable archive) is
+                # not something another batch can work around, so never skip it.
+                for rel in batch:
+                    progress.pop(rel, None)
+                raise
             for rel in batch:
-                progress.pop(rel, None)
-            # An empty manifest is not the same as no manifest: writing one would
-            # turn "cache state unknown" into an authoritative "remote is empty"
-            # and skip stale archiving and session purging on the next sync.
-            if progress:
-                _save_manifest(cache_root, progress)
-            raise
-        for rel in batch:
-            meta = manifest.get(rel)
-            if meta is not None:
-                progress[rel] = meta
+                meta = manifest.get(rel)
+                if meta is None:
+                    continue
+                if rel in written:
+                    progress[rel] = meta
+                else:
+                    # The archive did not carry this member (deleted mid-transfer,
+                    # or dropped by tar). Recording it would let an outdated local
+                    # copy pass as current, so leave it for the next sync.
+                    progress.pop(rel, None)
+                    missing.add(rel)
+        if first_error is not None:
+            # Report the skipped files as a failed sync; they stay "changed", so
+            # the next run retries them while the rest of the mirror is current.
+            raise first_error
+    except BaseException:
+        # Any exit other than full success leaves a partial mirror; record what
+        # was fetched so the next run resumes instead of starting over.
+        persist()
+        raise
+    return missing
 
 
 def _manifest_digest(manifest: dict[str, dict[str, str]]) -> str:
@@ -510,6 +587,26 @@ def _read_remote_manifest(target: RemoteSyncTarget) -> dict[str, dict[str, str]]
 
 def _manifest_path(cache_root: Path) -> Path:
     return cache_root / ".remote-manifest.json"
+
+
+def _incomplete_marker_path(cache_root: Path) -> Path:
+    return cache_root / ".remote-manifest.incomplete"
+
+
+def _mark_manifest_incomplete(cache_root: Path) -> None:
+    """Record that the saved manifest only covers part of the remote."""
+    _incomplete_marker_path(cache_root).write_text("", encoding="utf-8")
+
+
+def _manifest_is_incomplete(cache_root: Path) -> bool:
+    return _incomplete_marker_path(cache_root).exists()
+
+
+def _clear_manifest_incomplete(cache_root: Path) -> None:
+    try:
+        _incomplete_marker_path(cache_root).unlink()
+    except OSError:
+        pass
 
 
 def _load_manifest(cache_root: Path) -> dict[str, dict[str, str]] | None:
@@ -740,7 +837,9 @@ def _next_archive_path(path: Path) -> Path:
     return path.with_name(f"{path.name}.stale")
 
 
-def _extract_tarball(payload: bytes, dest: Path) -> None:
+def _extract_tarball(payload: bytes, dest: Path) -> set[str]:
+    """Extract a downloaded archive. Returns the manifest keys actually written."""
+    written: set[str] = set()
     with tarfile.open(fileobj=BytesIO(payload), mode="r:gz") as tar:
         for member in tar.getmembers():
             if member.issym() or member.islnk():
@@ -760,6 +859,8 @@ def _extract_tarball(payload: bytes, dest: Path) -> None:
                 continue
             with src, target.open("wb") as out:
                 out.write(src.read())
+            written.add(str(PurePosixPath(*rel.parts)))
+    return written
 
 
 def _safe_member_path(name: str) -> Path | None:

@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.8.7 (2026-07-28)
+
+### Fixes
+
+- **One stuck file no longer blocks a whole remote mirror**: a file too large to
+  transfer inside `remote.timeout` forms a batch that cannot be split, so it is
+  now skipped (up to three per sync) and reported, instead of making every batch
+  behind it wait forever. A local extraction failure still stops the download
+  immediately, since no other batch can work around a full disk.
+- **Only files that really arrived are recorded as mirrored**: the cache manifest
+  now tracks the archive members that were actually extracted. A member the
+  remote dropped mid-transfer stays pending, so an outdated local copy can no
+  longer pass as current.
+- **Partial mirrors are never treated as authoritative**: an incomplete marker is
+  written next to a partial manifest before it is saved and cleared only once
+  every changed file has been downloaded, so stale-file archiving and session
+  purging still run when the remote shrinks in the meantime.
+
 ## v0.8.6 (2026-07-28)
 
 ### Improvements
