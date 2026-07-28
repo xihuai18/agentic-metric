@@ -10,7 +10,8 @@ from importlib.metadata import version as _pkg_version
 
 import typer
 from rich import box
-from rich.console import Console, Group
+from rich.console import Console, ConsoleOptions, Group
+from rich.measure import Measurement
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -133,6 +134,115 @@ def _scale_width(base: int, wide: int, *, threshold: int = 120) -> int:
     if width <= threshold:
         return base
     return min(wide, base + (width - threshold) // 4)
+
+
+# Wide enough that Rich reports a table's natural width instead of the
+# console-clamped one.
+_UNBOUNDED_WIDTH = 10_000
+
+
+def _fit_text_columns(
+    tbl: Table, text_columns: list[int], *, floor: int = 12, hard_floor: int = 4
+) -> None:
+    """Trim text columns until the table fits the console.
+
+    Rich squeezes every column proportionally when a table is too wide, which
+    ellipsizes costs and token counts into things like ``$6,850.…``. Metrics must
+    stay readable, so the surrounding labels (paths, model ids) give up the room
+    instead. Widths are measured rather than estimated, because padding and
+    separator overhead depend on the box style.
+
+    Labels shrink to ``floor`` first. If the table still does not fit — a very
+    narrow terminal, or one of the tables carrying four label columns — they
+    keep giving ground down to ``hard_floor``, because a clipped path costs the
+    reader less than a clipped number.
+    """
+    if not text_columns:
+        return
+    console_width = _console_width()
+    options = console.options.update_width(_UNBOUNDED_WIDTH)
+    # Each column can be pinned once at each floor, plus a final check.
+    for _ in range(2 * len(text_columns) + 2):
+        overflow = Measurement.get(console, options, tbl).maximum - console_width
+        if overflow <= 0:
+            return
+        widest = max(text_columns, key=lambda i: _text_column_width(tbl, i, options))
+        current = _text_column_width(tbl, widest, options)
+        if current <= hard_floor:
+            return
+        limit = floor if current > floor else hard_floor
+        tbl.columns[widest].max_width = max(limit, current - overflow)
+
+
+def _text_column_width(tbl: Table, index: int, options: ConsoleOptions) -> int:
+    column = tbl.columns[index]
+    natural = max(
+        (
+            Measurement.get(console, options, cell).maximum
+            for cell in (column.header, *column.cells)
+        ),
+        default=0,
+    )
+    return min(natural, column.max_width) if column.max_width else natural
+
+
+def _metric_layout() -> tuple[bool, bool]:
+    """Return ``(narrow, ultra_narrow)`` for the current console width.
+
+    Narrow terminals cannot hold a full In/Out/Cache split plus the secondary
+    counters without squeezing the numbers, so tables fold them into one Tokens
+    column and, past the ultra-narrow point, drop the counters entirely.
+    """
+    width = _console_width()
+    return width < 96, width < 68
+
+
+def _drop_trailing_column_if_overflowing(tbl: Table) -> None:
+    """Drop the last column when the table would not fit the console.
+
+    Used for decorative trailing columns (the cost bar) that are worth losing
+    before any number gets ellipsized.
+    """
+    options = console.options.update_width(_UNBOUNDED_WIDTH)
+    if Measurement.get(console, options, tbl).maximum > _console_width():
+        tbl.columns.pop()
+
+
+def _fit_stats_row(cells: list[Text], inner_width: int):
+    """Lay out the header stat row so no headline number is ellipsized.
+
+    Rich squeezes a grid that does not fit, which turns the total into
+    ``$7,266…``. Tighten the gaps first; if even the tightest row is too wide,
+    put the cost on a line of its own above the counters. The candidates are
+    trial-rendered because a grid's measured minimum does not account for how
+    Rich collapses padding between columns.
+    """
+
+    def row(items: list[Text], padding: int) -> Table:
+        grid = Table.grid(padding=(0, padding))
+        for _ in items:
+            grid.add_column(justify="left")
+        grid.add_row(*items)
+        return grid
+
+    def intact(grid: Table) -> bool:
+        options = console.options.update_width(max(8, inner_width))
+        rendered = "".join(
+            segment.text
+            for line in console.render_lines(grid, options, pad=False)
+            for segment in line
+        )
+        return all(
+            value in rendered
+            for cell in cells
+            for value in cell.plain.splitlines()
+        )
+
+    for padding in (3, 2, 1):
+        grid = row(cells, padding)
+        if intact(grid):
+            return grid
+    return Group(cells[0], row(cells[1:], 1))
 
 
 def _version_callback(value: bool) -> None:
@@ -514,28 +624,32 @@ def _print_report(
         header_text.append(f"   {frm} → {to}", style=C_MUTED)
 
     delta_line = _delta_line(tot_cost, prev_totals, current_unknown=tot_cost_unknown)
-    cost_cell = Group(
-        Text("COST", style=f"{C_MUTED}"),
-        Text(_fmt_cost(tot_cost, unknown=tot_cost_unknown), style=f"bold {C_YELLOW}"),
-        delta_line if delta_line else Text(""),
+    cost_cell = Text("COST", style=f"{C_MUTED}")
+    cost_cell.append("\n")
+    cost_cell.append(
+        _fmt_cost(tot_cost, unknown=tot_cost_unknown), style=f"bold {C_YELLOW}"
     )
+    cost_cell.append("\n")
+    if delta_line:
+        cost_cell.append_text(delta_line)
     # Token split lives in the heatmap panel; cache share is elevated here too.
-    stats = Table.grid(padding=(0, 3))
-    for _ in range(5):
-        stats.add_column(justify="left")
-    stats.add_row(
-        cost_cell,
-        _stat(
-            "Cache %",
-            f"{cache_pct:.0f}%" if cache_pct >= 0 else "—",
-            _cache_pct_style(cache_pct),
-        ),
-        _stat("Sessions", f"{tot_sess:,}", C_MAUVE),
-        _stat("Requests", f"{tot_requests:,}", C_SKY),
-        _stat("Turns", f"{tot_turns:,}", C_SKY),
+    panel_width = _panel_width()
+    stats = _fit_stats_row(
+        [
+            cost_cell,
+            _stat(
+                "Cache %",
+                f"{cache_pct:.0f}%" if cache_pct >= 0 else "—",
+                _cache_pct_style(cache_pct),
+            ),
+            _stat("Sessions", f"{tot_sess:,}", C_MAUVE),
+            _stat("Requests", f"{tot_requests:,}", C_SKY),
+            _stat("Turns", f"{tot_turns:,}", C_SKY),
+        ],
+        # Panel border (2) plus its horizontal padding (4).
+        panel_width - 6,
     )
 
-    panel_width = _panel_width()
     provider_rollup = _build_provider_rollup_block(
         by_provider,
         tot_cost,
@@ -903,6 +1017,7 @@ def _build_dimension_table(
     nonzero = [r for r in rows if _has_cost_signal(r)]
     if not nonzero:
         return None
+    narrow, ultra_narrow = _metric_layout()
     tbl = Table(
         show_header=True,
         header_style=f"bold {C_SUBTEXT}",
@@ -915,12 +1030,17 @@ def _build_dimension_table(
     )
     tbl.add_column(label, style=C_SKY, overflow="ellipsis", no_wrap=True, max_width=max_label_width)
     tbl.add_column("Sess", justify="right", style=C_TEXT, no_wrap=True)
-    tbl.add_column("Req", justify="right", style=C_TEXT, no_wrap=True)
-    tbl.add_column("Turns", justify="right", style=C_TEXT, no_wrap=True)
-    tbl.add_column("In", justify="right", style=C_TEAL, no_wrap=True)
-    tbl.add_column("Out", justify="right", style=C_TEAL, no_wrap=True)
-    tbl.add_column("Cache", justify="right", style=C_GREEN, no_wrap=True)
-    tbl.add_column("C%", justify="right", no_wrap=True)
+    if not ultra_narrow:
+        tbl.add_column("Req", justify="right", style=C_TEXT, no_wrap=True)
+        tbl.add_column("Turns", justify="right", style=C_TEXT, no_wrap=True)
+    if narrow:
+        tbl.add_column("Tokens", justify="right", style=C_TEAL, no_wrap=True)
+    else:
+        tbl.add_column("In", justify="right", style=C_TEAL, no_wrap=True)
+        tbl.add_column("Out", justify="right", style=C_TEAL, no_wrap=True)
+        tbl.add_column("Cache", justify="right", style=C_GREEN, no_wrap=True)
+    if not ultra_narrow:
+        tbl.add_column("C%", justify="right", no_wrap=True)
     tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}", no_wrap=True, min_width=6)
 
     for r in nonzero:
@@ -930,18 +1050,60 @@ def _build_dimension_table(
         turns = r.get("user_turns") or 0
         messages = r.get("message_count") or 0
         cp = _cache_hit_rate(r)
-        tbl.add_row(
-            display,
-            f"{r.get('session_count') or 0:,}",
-            f"{max(0, messages - turns):,}",
-            f"{turns:,}",
-            _fmt_tokens(r.get("input_tokens") or 0),
-            _fmt_tokens(r.get("output_tokens") or 0),
-            _fmt_tokens(_cache_tokens(r)),
-            _cache_pct_text(cp),
-            _fmt_cost(r.get("estimated_cost_usd"), unknown=_has_unknown_cost(r)),
+        values = [display, f"{r.get('session_count') or 0:,}"]
+        if not ultra_narrow:
+            values.extend((f"{max(0, messages - turns):,}", f"{turns:,}"))
+        if narrow:
+            values.append(_fmt_tokens(_token_summary(r)["total_tokens"]))
+        else:
+            values.extend((
+                _fmt_tokens(r.get("input_tokens") or 0),
+                _fmt_tokens(r.get("output_tokens") or 0),
+                _fmt_tokens(_cache_tokens(r)),
+            ))
+        if not ultra_narrow:
+            values.append(_cache_pct_text(cp))
+        values.append(
+            _fmt_cost(r.get("estimated_cost_usd"), unknown=_has_unknown_cost(r))
         )
+        tbl.add_row(*values)
+    _fit_text_columns(tbl, [0])
     return tbl
+
+
+def _merge_rows_by_model(rows: list[dict]) -> list[dict]:
+    """Collapse source/agent/provider splits into one row per model."""
+    merged: dict[tuple, dict] = {}
+    for r in rows:
+        key = (r.get("model") or "", r.get("raw_model") or "")
+        target = merged.get(key)
+        if target is None:
+            merged[key] = {
+                "model": r.get("model") or "",
+                "raw_model": r.get("raw_model"),
+                # Merged rows form a single group, so the grouping keys are
+                # blanked rather than inherited from an arbitrary member.
+                "agent_type": "",
+                "input_tokens": r.get("input_tokens") or 0,
+                "output_tokens": r.get("output_tokens") or 0,
+                "cache_read_tokens": r.get("cache_read_tokens") or 0,
+                "cache_creation_tokens": r.get("cache_creation_tokens") or 0,
+                "estimated_cost_usd": r.get("estimated_cost_usd") or 0.0,
+                "unknown_cost_count": r.get("unknown_cost_count") or 0,
+            }
+            continue
+        for field in (
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_creation_tokens",
+            "estimated_cost_usd",
+            "unknown_cost_count",
+        ):
+            target[field] += r.get(field) or 0
+    return sorted(
+        merged.values(), key=lambda r: r["estimated_cost_usd"], reverse=True
+    )
 
 
 def _build_by_agent_model_table(rows: list[dict], *, limit: int = 8) -> Table | None:
@@ -949,8 +1111,13 @@ def _build_by_agent_model_table(rows: list[dict], *, limit: int = 8) -> Table | 
     if not nonzero:
         return None
     console_width = _console_width()
-    narrow = console_width < 96
-    ultra_narrow = console_width < 68
+    narrow, _ = _metric_layout()
+    # Four label columns plus the metrics do not survive below 80 cells; drop
+    # the grouping keys there and merge the rows into one line per model, so
+    # the same model does not appear once per source.
+    ultra_narrow = console_width < 80
+    if ultra_narrow:
+        nonzero = _merge_rows_by_model(nonzero)
     source_width = 14 if narrow else _scale_width(16, 34)
     agent_width = 10 if narrow else _scale_width(8, 14)
     provider_width = 10 if narrow else _scale_width(6, 12)
@@ -1048,6 +1215,7 @@ def _build_by_agent_model_table(rows: list[dict], *, limit: int = 8) -> Table | 
                 _fmt_cost(agg["estimated_cost_usd"], unknown=_has_unknown_cost(agg))
             )
             tbl.add_row(*values)
+    _fit_text_columns(tbl, [0] if ultra_narrow else [0, 1, 2, 3])
     return tbl
 
 
@@ -1069,6 +1237,7 @@ def _build_cross_table(
     nonzero = [r for r in rows if _has_cost_signal(r)]
     if not nonzero:
         return None
+    narrow, ultra_narrow = _metric_layout()
     model_width = model_width or _scale_width(14, 32)
     tbl = Table(
         show_header=True,
@@ -1082,27 +1251,40 @@ def _build_cross_table(
     )
     tbl.add_column(a_title, style=C_MAUVE, overflow="ellipsis", no_wrap=True, max_width=a_width)
     tbl.add_column("Model", style=C_SKY, overflow="ellipsis", no_wrap=True, max_width=model_width)
-    tbl.add_column("Sess", justify="right", style=C_TEXT, no_wrap=True)
-    tbl.add_column("In", justify="right", style=C_TEAL, no_wrap=True)
-    tbl.add_column("Out", justify="right", style=C_TEAL, no_wrap=True)
-    tbl.add_column("Cache", justify="right", style=C_GREEN, no_wrap=True)
-    tbl.add_column("C%", justify="right", no_wrap=True)
+    if not ultra_narrow:
+        tbl.add_column("Sess", justify="right", style=C_TEXT, no_wrap=True)
+    if narrow:
+        tbl.add_column("Tokens", justify="right", style=C_TEAL, no_wrap=True)
+    else:
+        tbl.add_column("In", justify="right", style=C_TEAL, no_wrap=True)
+        tbl.add_column("Out", justify="right", style=C_TEAL, no_wrap=True)
+        tbl.add_column("Cache", justify="right", style=C_GREEN, no_wrap=True)
+    if not ultra_narrow:
+        tbl.add_column("C%", justify="right", no_wrap=True)
     tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}", no_wrap=True, min_width=7)
     for r in nonzero:
         model_display = r.get("model") or "—"
         if model_display == "Unknown" and r.get("raw_model"):
             model_display = f"Unknown: {r['raw_model']}"
         cp = _cache_hit_rate(r)
-        tbl.add_row(
-            a_value(r),
-            model_display,
-            f"{r.get('session_count') or 0:,}",
-            _fmt_tokens(r.get("input_tokens") or 0),
-            _fmt_tokens(r.get("output_tokens") or 0),
-            _fmt_tokens(_cache_tokens(r)),
-            _cache_pct_text(cp),
-            _fmt_cost(r.get("estimated_cost_usd"), unknown=_has_unknown_cost(r)),
+        values = [a_value(r), model_display]
+        if not ultra_narrow:
+            values.append(f"{r.get('session_count') or 0:,}")
+        if narrow:
+            values.append(_fmt_tokens(_token_summary(r)["total_tokens"]))
+        else:
+            values.extend((
+                _fmt_tokens(r.get("input_tokens") or 0),
+                _fmt_tokens(r.get("output_tokens") or 0),
+                _fmt_tokens(_cache_tokens(r)),
+            ))
+        if not ultra_narrow:
+            values.append(_cache_pct_text(cp))
+        values.append(
+            _fmt_cost(r.get("estimated_cost_usd"), unknown=_has_unknown_cost(r))
         )
+        tbl.add_row(*values)
+    _fit_text_columns(tbl, [0, 1])
     return tbl
 
 
@@ -1111,8 +1293,7 @@ def _build_top_projects_table(rows: list[dict]) -> Table | None:
     if not nonzero:
         return None
     console_width = _console_width()
-    narrow = console_width < 96
-    ultra_narrow = console_width < 68
+    narrow, ultra_narrow = _metric_layout()
     project_width = max(24, min(140, console_width - (32 if narrow else 44)))
     tbl = Table(
         show_header=True,
@@ -1160,6 +1341,7 @@ def _build_top_projects_table(rows: list[dict]) -> Table | None:
             _fmt_cost(r.get("estimated_cost_usd"), unknown=_has_unknown_cost(r))
         )
         tbl.add_row(*values)
+    _fit_text_columns(tbl, [0])
     return tbl
 
 
@@ -1167,6 +1349,7 @@ def _build_project_agent_table(rows: list[dict]) -> Table | None:
     nonzero = [r for r in rows if _has_cost_signal(r)]
     if not nonzero:
         return None
+    narrow, ultra_narrow = _metric_layout()
     project_width = max(28, min(120, _console_width() - 56))
     agent_width = _scale_width(8, 14)
     tbl = Table(
@@ -1182,12 +1365,18 @@ def _build_project_agent_table(rows: list[dict]) -> Table | None:
     tbl.add_column("Project", style=C_BLUE, overflow="ellipsis", no_wrap=True, max_width=project_width)
     tbl.add_column("Agent", style=C_MAUVE, overflow="ellipsis", no_wrap=True, min_width=5, max_width=agent_width)
     tbl.add_column("Sess", justify="right", style=C_TEXT, no_wrap=True)
-    tbl.add_column("Req", justify="right", style=C_TEXT, no_wrap=True)
-    tbl.add_column("Turns", justify="right", style=C_TEXT, no_wrap=True)
-    tbl.add_column("In", justify="right", style=C_TEAL, no_wrap=True)
-    tbl.add_column("Out", justify="right", style=C_TEAL, no_wrap=True)
-    tbl.add_column("Cache", justify="right", style=C_GREEN, no_wrap=True)
-    tbl.add_column("C%", justify="right", no_wrap=True)
+    # This is the widest drill-down, so the secondary counters go first;
+    # "By agent" still carries them at every width.
+    if not narrow:
+        tbl.add_column("Req", justify="right", style=C_TEXT, no_wrap=True)
+        tbl.add_column("Turns", justify="right", style=C_TEXT, no_wrap=True)
+        tbl.add_column("In", justify="right", style=C_TEAL, no_wrap=True)
+        tbl.add_column("Out", justify="right", style=C_TEAL, no_wrap=True)
+        tbl.add_column("Cache", justify="right", style=C_GREEN, no_wrap=True)
+    else:
+        tbl.add_column("Tokens", justify="right", style=C_TEAL, no_wrap=True)
+    if not ultra_narrow:
+        tbl.add_column("C%", justify="right", no_wrap=True)
     tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}", no_wrap=True, min_width=6)
     for r in nonzero:
         turns = r.get("user_turns") or 0
@@ -1198,18 +1387,28 @@ def _build_project_agent_table(rows: list[dict]) -> Table | None:
             max_len=project_width,
         )
         cp = _cache_hit_rate(r)
-        tbl.add_row(
+        values = [
             path,
             r.get("agent_type") or "—",
             f"{r.get('session_count') or 0:,}",
-            f"{max(0, messages - turns):,}",
-            f"{turns:,}",
-            _fmt_tokens(r.get("input_tokens") or 0),
-            _fmt_tokens(r.get("output_tokens") or 0),
-            _fmt_tokens(_cache_tokens(r)),
-            _cache_pct_text(cp),
-            _fmt_cost(r.get("estimated_cost_usd"), unknown=_has_unknown_cost(r)),
+        ]
+        if not narrow:
+            values.extend((
+                f"{max(0, messages - turns):,}",
+                f"{turns:,}",
+                _fmt_tokens(r.get("input_tokens") or 0),
+                _fmt_tokens(r.get("output_tokens") or 0),
+                _fmt_tokens(_cache_tokens(r)),
+            ))
+        else:
+            values.append(_fmt_tokens(_token_summary(r)["total_tokens"]))
+        if not ultra_narrow:
+            values.append(_cache_pct_text(cp))
+        values.append(
+            _fmt_cost(r.get("estimated_cost_usd"), unknown=_has_unknown_cost(r))
         )
+        tbl.add_row(*values)
+    _fit_text_columns(tbl, [0, 1])
     return tbl
 
 
@@ -1227,6 +1426,7 @@ def _build_periodic_table(periodic: list[dict], focus_kind: str | None) -> Table
         periodic_title, bucket_col = "By day", "Day"
 
     max_cost = max((b.get("cost") or 0) for b in nonzero) or 1e-9
+    narrow, _ = _metric_layout()
     tbl = Table(
         show_header=True,
         header_style=f"bold {C_SUBTEXT}",
@@ -1238,8 +1438,15 @@ def _build_periodic_table(periodic: list[dict], focus_kind: str | None) -> Table
         title_justify="left",
     )
     tbl.add_column(bucket_col, style=C_BLUE, no_wrap=True)
-    tbl.add_column("Sessions", justify="right", style=C_TEXT, no_wrap=True)
-    tbl.add_column("Cache %", justify="right", no_wrap=True, min_width=7)
+    # Spelled-out headers are wider than their own values here, so they are the
+    # first thing to give when the terminal is narrow.
+    tbl.add_column("Sess" if narrow else "Sessions", justify="right", style=C_TEXT, no_wrap=True)
+    tbl.add_column(
+        "C%" if narrow else "Cache %",
+        justify="right",
+        no_wrap=True,
+        min_width=3 if narrow else 7,
+    )
     tbl.add_column("Tokens", justify="right", style=C_TEAL, no_wrap=True)
     tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}", no_wrap=True)
     tbl.add_column("", justify="left", no_wrap=True)
@@ -1264,13 +1471,19 @@ def _build_periodic_table(periodic: list[dict], focus_kind: str | None) -> Table
             _fmt_cost(cost, unknown=unknown),
             bar,
         )
+    _drop_trailing_column_if_overflowing(tbl)
+    _fit_text_columns(tbl, [0])
     return tbl
 
 
-def _stat(label: str, value: str, style: str) -> Group:
-    label_text = Text(label.upper(), style=f"{C_MUTED}")
+def _stat(label: str, value: str, style: str) -> Text:
+    # One multi-line Text rather than a Group: Rich can measure a Text, so the
+    # header grid knows how narrow each stat may get before it truncates.
     value_style = style if "bold" in style.split() else f"bold {style}"
-    return Group(label_text, Text(value, style=value_style))
+    stat = Text(label.upper(), style=f"{C_MUTED}")
+    stat.append("\n")
+    stat.append(value, style=value_style)
+    return stat
 
 
 # ── helpers ────────────────────────────────────────────────────────

@@ -1,5 +1,35 @@
 # Changelog
 
+## v0.8.8 (2026-07-28)
+
+### Fixes
+
+- **Labels give up the room, not the numbers**: a report table wider than the
+  terminal used to be squeezed column by column, so costs printed as
+  `$6,850.…`, token counts as `129…`, and one header as a bare `…`. Tables now
+  shrink their text columns — project paths, model ids — until the table fits
+  and leave every metric column at full width. The summary header does the
+  same: it tightens the gaps between COST, CACHE %, SESSIONS, REQUESTS and
+  TURNS, and moves the total onto its own line when even that is not enough.
+- **A model is listed once, not once per source**: below 80 columns the
+  source/agent/provider columns are dropped from the model table, and the rows
+  behind them are now merged, so `gpt-5.6-sol` no longer appears three times
+  with a third of its spend on each line.
+
+### Improvements
+
+- **Dense drill-downs adapt to narrow terminals**: below 96 columns the
+  In/Out/Cache split folds into one Tokens column, the spelled-out `Sessions` /
+  `Cache %` headers shorten, and below 68 the secondary counters (requests,
+  turns, cache share) step aside — the pattern the project and model tables
+  already used, now applied to the host/agent/provider/model breakdowns as
+  well. The hourly cost bar is dropped before any figure is. Verified from 44
+  to 220 columns: no report truncates a number.
+- **Steadier TUI summary row**: `Cache %` no longer gets separated from its
+  number when a card wraps, and TODAY / WEEK / MONTH lay out against the
+  narrowest of the three, so the one-column rounding difference between them no
+  longer gives one card a different shape.
+
 ## v0.8.7 (2026-07-28)
 
 ### Fixes

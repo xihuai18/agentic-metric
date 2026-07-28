@@ -249,6 +249,24 @@ class SummaryCell(Static):
             self.remove_class("-focused")
         self.refresh()
 
+    def _row_width(self) -> int:
+        """Return the width shared by every cell in the summary row.
+
+        ``width: 1fr`` hands the leftover column to one cell, so a cell sized
+        one cell wider would wrap differently from its neighbours and the row
+        would look uneven. Everyone lays out against the narrowest cell.
+        """
+        own = self.content_size.width
+        parent = self.parent
+        if parent is None:
+            return own
+        widths = [
+            cell.content_size.width
+            for cell in parent.children
+            if isinstance(cell, SummaryCell) and cell.content_size.width > 0
+        ]
+        return min(widths) if widths else own
+
     def update_data(
         self, cost: float, sessions: int, tokens: int,
         prev_cost: float | None = None,
@@ -337,6 +355,11 @@ class SummaryCell(Static):
             avail = self.content_size.width
         except Exception:
             avail = 36
+        else:
+            try:
+                avail = self._row_width() or avail
+            except Exception:
+                pass
         ultra_compact = 0 < avail <= 16
 
         t = Text()
@@ -369,8 +392,21 @@ class SummaryCell(Static):
         t.append("Token ", style="white")
         t.append(fmt_tokens(self.tokens), style="bold bright_cyan")
         if self.cache_pct is not None:
-            t.append("  ·  Cache % ", style="white")
-            t.append(f"{self.cache_pct}%", style=_cache_pct_style(self.cache_pct))
+            # Break at the separator rather than letting the wrap orphan the
+            # "Cache %" label from its number.
+            separator = "  ·  "
+            cache_label = "Cache % "
+            cache_value = f"{self.cache_pct}%"
+            inline = (
+                len("Token ")
+                + len(fmt_tokens(self.tokens))
+                + len(separator)
+                + len(cache_label)
+                + len(cache_value)
+            )
+            t.append("\n" if 0 < avail < inline else separator, style="white")
+            t.append(cache_label, style="white")
+            t.append(cache_value, style=_cache_pct_style(self.cache_pct))
         t.append("\n")
         for row_idx, row in enumerate(self._stats_lines(avail)):
             if row_idx:
