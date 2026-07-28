@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.8.6 (2026-07-28)
+
+### Improvements
+
+- **Faster sync and parse**: pricing lookups are memoized per model instead of
+  re-deriving the builtin prefix order and the whole long-context rule table for
+  every usage event, the pricing config is stat-ed once per lookup instead of
+  twice, local date/hour bucketing is cached per minute, and local roots are
+  parsed while the remote mirrors are still downloading. On a 6-root ~20 GB
+  history a full reparse went from 169s to 98s and a routine sync from ~10.9s to
+  ~6.2s, with identical output (39,783 overlapping rows compared field by field
+  against the previous release, zero differences).
+
 ## v0.8.5 (2026-07-28)
 
 ### Fixes

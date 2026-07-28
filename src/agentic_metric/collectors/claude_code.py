@@ -10,7 +10,7 @@ from pathlib import Path
 from ..config import PROJECTS_DIR
 from ..pricing import estimate_cost
 from ..usage import estimate_token_usage_cost, normalize_anthropic_usage
-from . import BaseCollector
+from . import BaseCollector, local_time_bucket
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -223,7 +223,7 @@ class _SessionAccum:
     @staticmethod
     def _ts_local_date(ts: str) -> str:
         """Convert ISO timestamp to local date string YYYY-MM-DD."""
-        day, _hour = _local_bucket(ts)
+        day, _hour = local_time_bucket(ts)
         return day
 
     def _add_usage_bucket(
@@ -312,7 +312,7 @@ class _SessionAccum:
                 for c in content
             )
             if not is_tool_result:
-                entry_date, entry_hour = _local_bucket(ts)
+                entry_date, entry_hour = local_time_bucket(ts)
                 self.user_turns += 1
                 self.message_count += 1
                 self._add_usage_bucket(
@@ -345,7 +345,7 @@ class _SessionAccum:
                 self.model = msg_model
             elif msg_model and not self.model:
                 self.model = msg_model
-            entry_date, entry_hour = _local_bucket(ts)
+            entry_date, entry_hour = local_time_bucket(ts)
             if not entry_date:
                 entry_date, entry_hour = today_str, 0
             bucket_model = msg_model or self.model
@@ -847,12 +847,3 @@ def _usage_rows_cost(rows: list[dict]) -> float | None:
             return None
         total += float(cost)
     return total
-
-
-def _local_bucket(ts: str) -> tuple[str, int]:
-    """Return local (date, hour) for an ISO timestamp."""
-    try:
-        dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
-        return dt.strftime("%Y-%m-%d"), dt.hour
-    except (ValueError, TypeError):
-        return (ts[:10], 0) if len(ts) >= 10 else ("", 0)

@@ -16,7 +16,7 @@ from ..usage import (
     openai_input_tokens_are_separate,
     normalize_openai_usage,
 )
-from . import BaseCollector
+from . import BaseCollector, local_time_bucket
 
 
 # ── Incremental JSONL accumulator ────────────────────────────────────────
@@ -247,7 +247,7 @@ class _SessionAccum:
     @staticmethod
     def _ts_local_date(ts: str) -> str:
         """Convert ISO timestamp to local date string YYYY-MM-DD."""
-        day, _hour = _local_bucket(ts)
+        day, _hour = local_time_bucket(ts)
         return day
 
     def _add_usage_bucket(
@@ -262,7 +262,7 @@ class _SessionAccum:
         cache_creation_tokens: int = 0,
         estimated_cost_usd: float | None = 0.0,
     ) -> None:
-        usage_date, usage_hour = _local_bucket(ts)
+        usage_date, usage_hour = local_time_bucket(ts)
         if not usage_date:
             return
         key = (usage_date, usage_hour, self.model or "")
@@ -833,12 +833,3 @@ def _usage_rows_cost(rows: list[dict]) -> float | None:
             return None
         total += float(cost)
     return total
-
-
-def _local_bucket(ts: str) -> tuple[str, int]:
-    """Return local (date, hour) for an ISO timestamp."""
-    try:
-        dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
-        return dt.strftime("%Y-%m-%d"), dt.hour
-    except (ValueError, TypeError):
-        return (ts[:10], 0) if len(ts) >= 10 else ("", 0)

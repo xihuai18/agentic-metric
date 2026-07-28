@@ -256,19 +256,38 @@ def _non_standard_mode_prices(
     the priority table (Codex's ``fast`` tier is priority processing). Modes or
     models without a premium table fall back to standard rates; models without
     standard pricing stay unknown, and unknown-model prefixes never inherit a
-    family premium.
+    family premium. Resolved (model, mode) pairs are memoized: the tables are
+    static, but this runs for every priced event.
     """
-    if get_pricing(model) is None or _matches_any_model_prefix(
-        normalize_model(model), _UNKNOWN_MODEL_PREFIXES
-    ):
+    speed_mode = _normalize_mode(speed)
+    tier_mode = _normalize_mode(service_tier)
+    if speed_mode in _STANDARD_MODES and tier_mode in _STANDARD_MODES:
         return None
 
     model = normalize_model(model)
+    _fresh_derived_caches()
+    key = (model, speed_mode, tier_mode)
+    try:
+        return _mode_price_memo[key]
+    except KeyError:
+        prices = _compute_non_standard_mode_prices(model, speed_mode, tier_mode)
+        _mode_price_memo[key] = prices
+        return prices
+
+
+def _compute_non_standard_mode_prices(
+    model: str,
+    speed_mode: str,
+    tier_mode: str,
+) -> tuple[float, float, float, float] | None:
+    if get_pricing(model) is None or _matches_any_model_prefix(
+        model, _UNKNOWN_MODEL_PREFIXES
+    ):
+        return None
+
     lookups: list[str] = []
-    speed_mode = _normalize_mode(speed)
     if speed_mode not in _STANDARD_MODES:
         lookups.append(speed_mode)
-    tier_mode = _normalize_mode(service_tier)
     if tier_mode not in _STANDARD_MODES:
         # The tier alias is Codex-specific; Anthropic's ``speed`` values are
         # matched against their own table verbatim.
@@ -293,6 +312,44 @@ _user_cache: dict[str, object] | None = None
 _user_cache_mtime: float = -1.0
 _user_cache_lock = threading.Lock()
 
+# Bumped whenever a different config becomes effective. Derived lookup caches
+# compare against it instead of re-deriving per event. Every memoized lookup
+# still re-stats the config file, so an external edit takes effect at once.
+_config_generation = 0
+
+_derived_generation = -1
+_pricing_memo: dict[str, PriceTuple | None] = {}
+_mode_price_memo: dict[tuple[str, str, str], PriceTuple | None] = {}
+_long_context_memo: dict[str, tuple[tuple[bool, tuple[tuple[int, PriceTuple], ...]], ...]] = {}
+_cache_rule_memo: dict[str, dict[str, float] | None] = {}
+
+# Builtin prefixes are static, so order them once instead of per lookup.
+_SORTED_BUILTIN_PRICING: tuple[tuple[str, PriceTuple], ...] = tuple(
+    sorted(_BUILTIN_PRICING.items(), key=lambda item: len(item[0]), reverse=True)
+)
+
+
+def _reset_derived_caches() -> None:
+    """Drop memoized lookups. Needed when module tables are patched in tests."""
+    global _derived_generation
+    _pricing_memo.clear()
+    _mode_price_memo.clear()
+    _long_context_memo.clear()
+    _cache_rule_memo.clear()
+    _derived_generation = -1
+
+
+def _fresh_derived_caches() -> None:
+    """Drop memoized lookups when a different user config became effective."""
+    global _derived_generation
+    _load_user_config()
+    if _derived_generation != _config_generation:
+        _pricing_memo.clear()
+        _mode_price_memo.clear()
+        _long_context_memo.clear()
+        _cache_rule_memo.clear()
+        _derived_generation = _config_generation
+
 
 def _empty_user_config() -> dict[str, object]:
     return {
@@ -313,20 +370,26 @@ def _price_tuple(vals: object) -> PriceTuple:
 
 
 def _load_user_config() -> dict[str, object]:
-    """Load structured user pricing config from JSON, cached by mtime."""
-    global _user_cache, _user_cache_mtime
+    """Load structured user pricing config from JSON, cached by mtime.
+
+    One ``stat`` per call keeps an external edit to the pricing file effective
+    immediately; the parsed result and the "file absent" state are both cached
+    so nothing beyond that stat runs per priced event.
+    """
+    global _user_cache, _user_cache_mtime, _config_generation
 
     with _user_cache_lock:
-        if not PRICING_FILE.exists():
-            if _user_cache is not None:
-                _user_cache = None
-                _user_cache_mtime = -1.0
-            return _empty_user_config()
-
         try:
             mtime = PRICING_FILE.stat().st_mtime
         except OSError:
-            return _user_cache or _empty_user_config()
+            # Missing or unreadable: cache the empty config too, so a machine
+            # without user overrides does not re-derive it per lookup.
+            if _user_cache is not None and _user_cache_mtime == -1.0:
+                return _user_cache
+            _user_cache = _empty_user_config()
+            _user_cache_mtime = -1.0
+            _config_generation += 1
+            return _user_cache
 
         if _user_cache is not None and mtime == _user_cache_mtime:
             return _user_cache
@@ -377,10 +440,27 @@ def _load_user_config() -> dict[str, object]:
 
             _user_cache = result
             _user_cache_mtime = mtime
+            _config_generation += 1
             return result
         except (json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError):
             log.warning("Failed to parse %s, ignoring user overrides", PRICING_FILE)
-            return _empty_user_config()
+            # Cache the "no usable overrides" result against this file version:
+            # re-parsing per lookup would be wasted work, and leaving a stale
+            # generation would keep serving memoized overrides from the last
+            # valid config.
+            _user_cache = _empty_user_config()
+            _user_cache_mtime = mtime
+            _config_generation += 1
+            return _user_cache
+
+
+def _mutable_user_config() -> dict[str, object]:
+    """Return a copy writers may edit before saving.
+
+    The cached config is shared, so mutating it in place would expose changes
+    that a failed save never wrote to disk.
+    """
+    return dict(_load_user_config())
 
 
 def _save_user_config(config: dict[str, object]) -> None:
@@ -441,7 +521,7 @@ def set_user_pricing(
     cache_write_price: float = 0.0,
 ) -> None:
     """Add or update a user pricing override."""
-    config = _load_user_config()
+    config = _mutable_user_config()
     overrides: dict[str, PriceTuple] = dict(config.get("models") or {})
     model = normalize_model(model)
     overrides[model] = (input_price, output_price, cache_read_price, cache_write_price)
@@ -451,7 +531,7 @@ def set_user_pricing(
 
 def remove_user_pricing(model: str) -> bool:
     """Remove a user pricing override. Returns True if it existed."""
-    config = _load_user_config()
+    config = _mutable_user_config()
     overrides: dict[str, PriceTuple] = dict(config.get("models") or {})
     model = normalize_model(model)
     if model not in overrides:
@@ -483,7 +563,7 @@ def set_user_long_context_pricing(
     """Add or update one request-size long-context tier for a model prefix."""
     if threshold < 0:
         raise ValueError("threshold must be non-negative")
-    config = _load_user_config()
+    config = _mutable_user_config()
     rules: dict[str, dict[str, object]] = dict(config.get("long_context") or {})
     model = normalize_model(model)
     existing = dict(rules.get(model) or {})
@@ -504,7 +584,7 @@ def set_user_long_context_pricing(
 
 def remove_user_long_context_pricing(model: str, threshold: int | None = None) -> bool:
     """Remove one or all user long-context tiers without disabling builtin rules."""
-    config = _load_user_config()
+    config = _mutable_user_config()
     rules: dict[str, dict[str, object]] = dict(config.get("long_context") or {})
     model = normalize_model(model)
     if model not in rules:
@@ -528,7 +608,7 @@ def remove_user_long_context_pricing(model: str, threshold: int | None = None) -
 
 def disable_builtin_long_context(model: str) -> None:
     """Disable builtin long-context pricing for a model prefix."""
-    config = _load_user_config()
+    config = _mutable_user_config()
     model = normalize_model(model)
     disabled = set(str(v) for v in config.get("disabled_builtin_long_context") or [])
     disabled.add(model)
@@ -538,7 +618,7 @@ def disable_builtin_long_context(model: str) -> None:
 
 def enable_builtin_long_context(model: str) -> bool:
     """Re-enable builtin long-context pricing for a model prefix."""
-    config = _load_user_config()
+    config = _mutable_user_config()
     model = normalize_model(model)
     disabled = set(str(v) for v in config.get("disabled_builtin_long_context") or [])
     if model not in disabled:
@@ -551,7 +631,7 @@ def enable_builtin_long_context(model: str) -> bool:
 
 def set_user_cache_pricing(model: str, *, write_1h: float | None = None) -> None:
     """Add or update cache-duration pricing for a model prefix."""
-    config = _load_user_config()
+    config = _mutable_user_config()
     rules: dict[str, dict[str, float]] = dict(config.get("cache") or {})
     model = normalize_model(model)
     rule = dict(rules.get(model) or {})
@@ -565,7 +645,7 @@ def set_user_cache_pricing(model: str, *, write_1h: float | None = None) -> None
 
 def remove_user_cache_pricing(model: str) -> bool:
     """Remove user cache-duration pricing for a model prefix."""
-    config = _load_user_config()
+    config = _mutable_user_config()
     rules: dict[str, dict[str, float]] = dict(config.get("cache") or {})
     model = normalize_model(model)
     if model not in rules:
@@ -593,10 +673,20 @@ def get_pricing(model: str) -> tuple[float, float, float, float] | None:
     """Look up pricing: user overrides → builtin prefix match → unknown.
 
     Prefix matching is done longest-prefix-first to ensure ``gpt-5.4-mini``
-    matches its own entry before falling back to ``gpt-5.4``.
+    matches its own entry before falling back to ``gpt-5.4``. Results are
+    memoized per model because collectors price every usage event.
     """
     model = normalize_model(model)
+    _fresh_derived_caches()
+    try:
+        return _pricing_memo[model]
+    except KeyError:
+        pricing = _compute_pricing(model)
+        _pricing_memo[model] = pricing
+        return pricing
 
+
+def _compute_pricing(model: str) -> tuple[float, float, float, float] | None:
     if model in _NON_BILLABLE_MODELS:
         return (0.0, 0.0, 0.0, 0.0)
 
@@ -609,7 +699,7 @@ def get_pricing(model: str) -> tuple[float, float, float, float] | None:
         return None
 
     # 2. Builtin (prefix match — longest prefix first)
-    for prefix, pricing in sorted(_BUILTIN_PRICING.items(), key=lambda x: len(x[0]), reverse=True):
+    for prefix, pricing in _SORTED_BUILTIN_PRICING:
         if _matches_model_prefix(model, prefix):
             return pricing
 
@@ -667,6 +757,44 @@ def get_long_context_rules(*, include_disabled: bool = False) -> list[dict[str, 
     return rules
 
 
+def _model_long_context_rules(
+    model: str,
+) -> tuple[list[object], bool, tuple[tuple[int, dict[str, object]], ...]]:
+    """Return this model's applicable long-context rules, memoized.
+
+    Rebuilding and re-sorting the whole rule table for every priced event used
+    to dominate a full reparse. Only the prefix filtering depends on the model,
+    so it is cached; the threshold comparison still runs per request. Each kept
+    builtin rule carries the index of its prefix group in the *unfiltered*
+    order, so dropping non-matching rules cannot merge two groups that the
+    original scan treated as separate.
+    """
+    user_tiers = [
+        rule["tiers"]
+        for rule in _user_long_context_rules()
+        if _matches_any_model_prefix(model, tuple(str(p) for p in rule["prefixes"]))
+    ]
+    unknown = _matches_any_model_prefix(model, _UNKNOWN_MODEL_PREFIXES)
+    builtin: list[tuple[int, dict[str, object]]] = []
+    if not unknown:
+        group = -1
+        previous: tuple[str, ...] | None = None
+        for rule in get_long_context_rules():
+            if rule.get("source") not in {"builtin", "disabled"}:
+                continue
+            prefixes = tuple(str(p) for p in rule["prefixes"])
+            if prefixes != previous:
+                group += 1
+                previous = prefixes
+            excluded = tuple(str(p) for p in rule.get("excluded_prefixes", ()))
+            if not _matches_any_model_prefix(model, prefixes) or (
+                excluded and _matches_any_model_prefix(model, excluded)
+            ):
+                continue
+            builtin.append((group, rule))
+    return (user_tiers, unknown, tuple(builtin))
+
+
 def _long_context_prices(
     model: str,
     input_tokens: int,
@@ -680,31 +808,28 @@ def _long_context_prices(
     model = normalize_model(model)
     total_input_tokens = input_tokens + cache_read_tokens + cache_creation_tokens
 
-    for rule in _user_long_context_rules():
-        prefixes = tuple(str(p) for p in rule["prefixes"])
-        if not _matches_any_model_prefix(model, prefixes):
-            continue
-        matched = _matched_tier_prices(total_input_tokens, rule["tiers"])
+    _fresh_derived_caches()
+    try:
+        user_tiers, unknown, builtin = _long_context_memo[model]  # type: ignore[misc]
+    except KeyError:
+        entry = _model_long_context_rules(model)
+        _long_context_memo[model] = entry  # type: ignore[assignment]
+        user_tiers, unknown, builtin = entry  # type: ignore[misc]
+
+    for tiers in user_tiers:
+        matched = _matched_tier_prices(total_input_tokens, tiers)
         if matched is not None:
             return matched
 
-    if _matches_any_model_prefix(model, _UNKNOWN_MODEL_PREFIXES):
+    if unknown:
         return None
 
-    current_prefixes: tuple[str, ...] | None = None
+    current_group: int | None = None
     matched_builtin: tuple[float, float, float, float] | None = None
-    for rule in get_long_context_rules():
-        if rule.get("source") not in {"builtin", "disabled"}:
-            continue
-        prefixes = tuple(str(p) for p in rule["prefixes"])
-        if current_prefixes is not None and prefixes != current_prefixes and matched_builtin is not None:
+    for group, rule in builtin:
+        if current_group is not None and group != current_group and matched_builtin is not None:
             return matched_builtin
-        excluded = tuple(str(p) for p in rule.get("excluded_prefixes", ()))
-        if not _matches_any_model_prefix(model, prefixes) or (
-            excluded and _matches_any_model_prefix(model, excluded)
-        ):
-            continue
-        current_prefixes = prefixes
+        current_group = group
         if total_input_tokens > int(rule["threshold"]):
             matched_builtin = tuple(float(v) for v in rule["prices"])  # type: ignore[assignment]
     return matched_builtin
@@ -719,11 +844,18 @@ def get_all_pricing() -> dict[str, tuple[float, float, float, float]]:
 
 def _user_cache_rule(model: str) -> dict[str, float] | None:
     model = normalize_model(model)
-    rules = _load_user_config().get("cache") or {}
-    for prefix, rule in sorted(rules.items(), key=lambda x: len(x[0]), reverse=True):
-        if _matches_model_prefix(model, str(prefix)):
-            return dict(rule)
-    return None
+    _fresh_derived_caches()
+    try:
+        return _cache_rule_memo[model]
+    except KeyError:
+        rules = _load_user_config().get("cache") or {}
+        matched: dict[str, float] | None = None
+        for prefix, rule in sorted(rules.items(), key=lambda x: len(x[0]), reverse=True):
+            if _matches_model_prefix(model, str(prefix)):
+                matched = dict(rule)
+                break
+        _cache_rule_memo[model] = matched
+        return matched
 
 
 def get_cache_write_1h_price(model: str, input_price: float) -> float:

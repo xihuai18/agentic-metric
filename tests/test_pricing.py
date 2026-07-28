@@ -95,6 +95,36 @@ def test_mock_model_is_never_billed(tmp_path):
         assert get_pricing("mock-1-preview") is None
 
 
+def test_unparseable_config_drops_memoized_overrides(tmp_path):
+    """A broken pricing file must stop applying the last valid overrides."""
+    pricing_file = tmp_path / "pricing.json"
+    pricing_file.write_text(json.dumps({"models": {"custom-model": [1.0, 2.0, 3.0, 4.0]}}))
+
+    _reset_cache()
+    with patch("agentic_metric.pricing.PRICING_FILE", pricing_file):
+        assert get_pricing("custom-model") == (1.0, 2.0, 3.0, 4.0)
+        pricing_file.write_text("{not json")
+        assert get_pricing("custom-model") is None
+    _reset_cache()
+
+
+def test_failed_save_does_not_apply_the_override(tmp_path):
+    """A save that raises must leave the effective pricing untouched."""
+    pricing_file = tmp_path / "pricing.json"
+
+    _reset_cache()
+    with patch("agentic_metric.pricing.PRICING_FILE", pricing_file):
+        assert get_pricing("custom-model") is None
+        with patch(
+            "agentic_metric.pricing._save_user_config",
+            side_effect=OSError("read-only volume"),
+        ):
+            with pytest.raises(OSError):
+                set_user_pricing("custom-model", 1.0, 2.0)
+        assert get_pricing("custom-model") is None
+    _reset_cache()
+
+
 def test_unknown_model_fallback():
     p = get_pricing("unknown-model-xyz")
     assert p is None

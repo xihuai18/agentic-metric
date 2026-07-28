@@ -1006,6 +1006,121 @@ def test_registry_prepares_remote_caches_before_serial_sync():
     assert registry.get_sync_errors() == []
 
 
+def test_registry_parses_local_roots_while_remotes_mirror():
+    """Local parsing must overlap remote mirroring, not wait for it.
+
+    The remote prepare blocks until a local collector has started parsing, so a
+    serial implementation would hit the timeout instead of finishing.
+    """
+    import threading
+
+    local_started = threading.Event()
+    overlapped: list[bool] = []
+
+    class FakeLocalCollector(BaseCollector):
+        @property
+        def agent_type(self) -> str:
+            return "local"
+
+        def sync_history(self, db) -> None:
+            local_started.set()
+
+    class FakeRemoteCollector(BaseCollector):
+        def __init__(self) -> None:
+            self.last_error = ""
+
+        @property
+        def agent_type(self) -> str:
+            return "remote"
+
+        def prepare_cache(self) -> None:
+            overlapped.append(local_started.wait(timeout=5))
+
+        def sync_history(self, db) -> None:
+            pass
+
+    registry = CollectorRegistry()
+    registry.register(FakeRemoteCollector())
+    registry.register(FakeLocalCollector())
+    registry.sync_all(db=Mock())
+
+    assert overlapped == [True]
+    assert registry.get_sync_errors() == []
+
+
+def test_local_time_bucket_matches_uncached_conversion():
+    """The per-minute cache must never merge instants from different hours.
+
+    Half-hour offsets and DST shifts mean "same source hour" is not one local
+    hour, so the cache key is the parsed instant truncated to the minute.
+    """
+    from datetime import datetime
+
+    from agentic_metric.collectors import local_time_bucket
+
+    samples = [
+        "2024-01-01T00:10:00+05:30",
+        "2024-01-01T00:40:00+05:30",
+        "2024-10-05T15:20:00Z",
+        "2024-10-05T15:40:00Z",
+        "2026-07-28T03:14:15.123456Z",
+        "2026-07-28T03:14:59Z",
+        "2026-07-28T03:15:00Z",
+        "2026-07-28T03:14:15-05:00",
+        "2026-07-28T03:14:15",
+    ]
+    for ts in samples:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
+        assert local_time_bucket(ts) == (dt.strftime("%Y-%m-%d"), dt.hour), ts
+    # Repeat calls come from the cache and must not change.
+    for ts in samples:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
+        assert local_time_bucket(ts) == (dt.strftime("%Y-%m-%d"), dt.hour), ts
+
+
+def test_local_time_bucket_falls_back_for_unparseable_timestamps():
+    """Malformed input keeps the old fallback and never reads a cached bucket."""
+    from agentic_metric.collectors import local_time_bucket
+
+    assert local_time_bucket("2026-07-28T03:14:9XZ") == ("2026-07-28", 0)
+    assert local_time_bucket("2026-07-28T03:99:99Z") == ("2026-07-28", 0)
+    assert local_time_bucket("nonsense") == ("", 0)
+    assert local_time_bucket("") == ("", 0)
+
+
+def test_registry_reports_prepare_cache_exceptions_without_aborting(tmp_path):
+    """A remote whose mirroring raises must not stop the rest of the sync."""
+
+    class ExplodingRemote(BaseCollector):
+        @property
+        def agent_type(self) -> str:
+            return "remote-boom"
+
+        def prepare_cache(self) -> None:
+            raise RuntimeError("ssh exploded")
+
+        def sync_history(self, db) -> None:
+            pass
+
+    synced: list[str] = []
+
+    class FakeLocalCollector(BaseCollector):
+        @property
+        def agent_type(self) -> str:
+            return "local"
+
+        def sync_history(self, db) -> None:
+            synced.append("local")
+
+    registry = CollectorRegistry()
+    registry.register(ExplodingRemote())
+    registry.register(FakeLocalCollector())
+    registry.sync_all(db=Mock())
+
+    assert synced == ["local"]
+    assert registry.get_sync_errors() == ["remote-boom: ssh exploded"]
+
+
 def test_remote_removed_file_is_archived_not_reparsed(tmp_path):
     remote = RemoteSpec(host="remote-dev", name="dev")
     target = RemoteSyncTarget(
