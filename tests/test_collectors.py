@@ -26,7 +26,12 @@ from agentic_metric.collectors.remote import (
     _manifest_command,
     _ssh_command,
 )
-from agentic_metric.config import RemoteCollectorRoot, RemoteSpec, get_remote_specs
+from agentic_metric.config import (
+    RemoteCollectorRoot,
+    RemoteSpec,
+    config_is_reconcilable,
+    get_remote_specs,
+)
 from agentic_metric.pricing import estimate_cost
 from agentic_metric.store.database import Database
 
@@ -102,6 +107,19 @@ def test_default_registry_uses_configured_roots(tmp_path):
     ]
     assert collectors[0].projects_dir == tmp_path / "claude-alt" / "projects"
     assert collectors[2].sessions_dir == tmp_path / "codex-openai" / "sessions"
+
+
+def test_scope_reconciliation_requires_sane_config_shapes(tmp_path):
+    config_file = tmp_path / "config.json"
+    with patch("agentic_metric.config.CONFIG_FILE", config_file):
+        config_file.write_text(json.dumps({"collectors": {}, "remotes": []}))
+        assert config_is_reconcilable() is True
+
+        config_file.write_text(json.dumps({"collectors": {"codex": "bad"}}))
+        assert config_is_reconcilable() is False
+
+        config_file.write_text(json.dumps({"remotes": [{"name": "missing-host"}]}))
+        assert config_is_reconcilable() is False
 
 
 def test_remote_specs_default_to_local_collector_roots(tmp_path):
@@ -338,9 +356,300 @@ def test_codex_history_sync_supports_same_root_provider_filters(tmp_path):
         ("openai-sid", "openai", data_root),
     ]
     assert db.conn.execute(
-        "SELECT COUNT(*) AS n FROM sync_state WHERE key LIKE 'codex_jsonl:v13:%'"
+        "SELECT COUNT(*) AS n FROM sync_state WHERE key LIKE 'codex_jsonl:v17:%'"
     ).fetchone()["n"] == 4
     db.close()
+
+
+def test_claude_history_sync_scopes_state_by_provider_and_root(tmp_path):
+    projects = tmp_path / "projects"
+    project = projects / "-tmp-project"
+    project.mkdir(parents=True)
+    session_file = project / "sid.jsonl"
+    session_file.write_text("".join(json.dumps(line) + "\n" for line in [
+        {
+            "timestamp": "2026-04-23T10:00:00Z",
+            "type": "user",
+            "cwd": "/tmp/project",
+            "message": {"content": "hello"},
+        },
+        {
+            "timestamp": "2026-04-23T10:00:01Z",
+            "type": "assistant",
+            "cwd": "/tmp/project",
+            "message": {
+                "id": "msg-1",
+                "model": "gpt-5.5",
+                "usage": {"input_tokens": 100, "output_tokens": 20},
+            },
+        },
+    ]))
+
+    db = Database(db_path=str(tmp_path / "data.db"))
+    data_root = str(tmp_path)
+    for provider in ("p1", "p2"):
+        ClaudeCodeCollector(
+            projects_dir=projects,
+            provider=provider,
+            data_root=data_root,
+        ).sync_history(db)
+
+    rows = db.conn.execute(
+        """SELECT provider, input_tokens FROM sessions
+           WHERE session_id = 'sid' AND agent_type = 'claude_code'
+           ORDER BY provider"""
+    ).fetchall()
+    assert [tuple(row) for row in rows] == [("p1", 100), ("p2", 100)]
+    state_keys = db.conn.execute(
+        "SELECT key FROM sync_state WHERE key LIKE 'cc_jsonl:v13:%'"
+    ).fetchall()
+    assert len(state_keys) == 4
+    assert sum(":assistant_ids:" in row["key"] for row in state_keys) == 2
+    db.close()
+
+
+def test_codex_history_sync_removes_sessions_for_missing_local_files(tmp_path):
+    sessions = tmp_path / "sessions"
+    day_dir = sessions / "2026" / "04" / "23"
+    day_dir.mkdir(parents=True)
+
+    def write_rollout(session_id: str) -> Path:
+        path = day_dir / f"rollout-{session_id}.jsonl"
+        path.write_text("".join(json.dumps(line) + "\n" for line in [
+            {
+                "timestamp": "2026-04-23T10:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": session_id,
+                    "cwd": "/tmp/project",
+                    "model_provider": "openai",
+                },
+            },
+            {
+                "timestamp": "2026-04-23T10:00:01Z",
+                "type": "turn_context",
+                "payload": {"model": "gpt-5.5"},
+            },
+            {
+                "timestamp": "2026-04-23T10:00:01Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": session_id},
+            },
+            {
+                "timestamp": "2026-04-23T10:00:02Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 100,
+                            "output_tokens": 20,
+                        },
+                    },
+                },
+            },
+        ]))
+        return path
+
+    preserved = write_rollout("sid-a")
+    removed = write_rollout("sid-b")
+    db = Database(db_path=str(tmp_path / "data.db"))
+    collector = CodexCollector(
+        sessions_dir=sessions,
+        provider="openai",
+        data_root=str(tmp_path),
+    )
+    collector.sync_history(db)
+    removed.rename(tmp_path / "archived-rollout.jsonl")
+    collector.sync_history(db)
+
+    rows = db.conn.execute(
+        "SELECT session_id FROM sessions WHERE agent_type = 'codex'"
+    ).fetchall()
+    assert [row["session_id"] for row in rows] == ["sid-a"]
+    stale_states = db.conn.execute(
+        "SELECT key FROM sync_state WHERE key LIKE ? AND key LIKE '%sid-b%'",
+        (f"{collector.sync_state_prefix}:%",),
+    ).fetchall()
+    assert stale_states == []
+
+    preserved.rename(tmp_path / "archived-last-rollout.jsonl")
+    collector.sync_history(db)
+    row = db.conn.execute(
+        "SELECT session_id FROM sessions WHERE session_id = 'sid-a'"
+    ).fetchone()
+    assert row is not None
+    db.close()
+
+
+def test_claude_history_sync_removes_sessions_for_missing_local_files(tmp_path):
+    projects = tmp_path / "projects"
+    project = projects / "-tmp-project"
+    project.mkdir(parents=True)
+
+    def write_session(session_id: str) -> Path:
+        path = project / f"{session_id}.jsonl"
+        path.write_text("".join(json.dumps(line) + "\n" for line in [
+            {
+                "timestamp": "2026-04-23T10:00:00Z",
+                "type": "user",
+                "cwd": "/tmp/project",
+                "message": {"content": session_id},
+            },
+            {
+                "timestamp": "2026-04-23T10:00:01Z",
+                "type": "assistant",
+                "cwd": "/tmp/project",
+                "message": {
+                    "id": f"msg-{session_id}",
+                    "model": "gpt-5.5",
+                    "usage": {"input_tokens": 100, "output_tokens": 20},
+                },
+            },
+        ]))
+        return path
+
+    preserved = write_session("sid-a")
+    removed = write_session("sid-b")
+    db = Database(db_path=str(tmp_path / "data.db"))
+    collector = ClaudeCodeCollector(
+        projects_dir=projects,
+        provider="ichat",
+        data_root=str(tmp_path),
+    )
+    collector.sync_history(db)
+    removed.rename(tmp_path / "archived-session.jsonl")
+    collector.sync_history(db)
+
+    rows = db.conn.execute(
+        "SELECT session_id FROM sessions WHERE agent_type = 'claude_code'"
+    ).fetchall()
+    assert [row["session_id"] for row in rows] == ["sid-a"]
+    stale_states = db.conn.execute(
+        "SELECT key FROM sync_state WHERE key LIKE ? AND key LIKE '%sid-b%'",
+        (f"{collector.sync_state_prefix}:%",),
+    ).fetchall()
+    assert stale_states == []
+
+    preserved.rename(tmp_path / "archived-last-session.jsonl")
+    collector.sync_history(db)
+    row = db.conn.execute(
+        "SELECT session_id FROM sessions WHERE session_id = 'sid-a'"
+    ).fetchone()
+    assert row is not None
+    db.close()
+
+
+def test_claude_invalid_index_prevents_destructive_scope_sweep(tmp_path):
+    projects = tmp_path / "projects"
+    project = projects / "-tmp-project"
+    project.mkdir(parents=True)
+    (project / "sessions-index.json").write_text("not-json")
+
+    db = Database(db_path=str(tmp_path / "data.db"))
+    db.upsert_session(
+        "preserved",
+        "claude_code",
+        provider="ichat",
+        data_root=str(tmp_path),
+    )
+    db.commit()
+    ClaudeCodeCollector(
+        projects_dir=projects,
+        provider="ichat",
+        data_root=str(tmp_path),
+    ).sync_history(db)
+
+    row = db.conn.execute(
+        "SELECT session_id FROM sessions WHERE session_id = 'preserved'"
+    ).fetchone()
+    assert row is not None
+    db.close()
+
+
+def test_registry_reconciles_removed_scopes_only_after_success():
+    class ScopedCollector(BaseCollector):
+        agent_type = "codex"
+        provider = "openai"
+        data_root = "/active"
+        sync_state_prefix = "codex_jsonl:v17:active"
+
+        def sync_history(self, db) -> None:
+            pass
+
+    db = Database(db_path=":memory:")
+    for session_id, data_root in (("active", "/active"), ("stale", "/stale")):
+        db.upsert_session(
+            session_id,
+            "codex",
+            provider="openai",
+            data_root=data_root,
+        )
+    db.set_sync_state("codex_jsonl:v17:active:file", "1:1")
+    db.set_sync_state("codex_jsonl:v13:stale:file", "1:1")
+
+    registry = CollectorRegistry(reconcile_scopes=True)
+    registry.register(ScopedCollector())
+    registry.sync_all(db)
+
+    rows = db.conn.execute("SELECT session_id FROM sessions ORDER BY session_id").fetchall()
+    assert [row["session_id"] for row in rows] == ["active"]
+    states = db.conn.execute(
+        "SELECT key FROM sync_state WHERE key LIKE 'codex_jsonl:%'"
+    ).fetchall()
+    assert [row["key"] for row in states] == ["codex_jsonl:v17:active:file"]
+    db.close()
+
+
+def test_registry_skips_scope_reconciliation_after_collector_error():
+    class FailingScopedCollector(BaseCollector):
+        agent_type = "codex"
+        provider = "openai"
+        data_root = "/active"
+        sync_state_prefix = "codex_jsonl:v17:active"
+
+        def sync_history(self, db) -> None:
+            raise RuntimeError("sync failed")
+
+    db = Database(db_path=":memory:")
+    db.upsert_session(
+        "stale",
+        "codex",
+        provider="openai",
+        data_root="/stale",
+    )
+    db.commit()
+    registry = CollectorRegistry(reconcile_scopes=True)
+    registry.register(FailingScopedCollector())
+    registry.sync_all(db)
+
+    row = db.conn.execute(
+        "SELECT session_id FROM sessions WHERE session_id = 'stale'"
+    ).fetchone()
+    assert row is not None
+    db.close()
+
+
+def test_remote_ready_key_tracks_inner_parser_version():
+    codex = RemoteHistoryCollector(RemoteSyncTarget(
+        remote=RemoteSpec(host="remote", name="remote"),
+        agent_type="codex",
+        remote_root="~/.codex",
+        provider="openai",
+        index=0,
+    ))
+    claude = RemoteHistoryCollector(RemoteSyncTarget(
+        remote=RemoteSpec(host="remote", name="remote"),
+        agent_type="claude_code",
+        remote_root="~/.wcc",
+        provider="ichat",
+        index=0,
+    ))
+
+    assert codex._ready_state_key().startswith(codex._inner.sync_state_prefix)
+    assert "codex_jsonl:v17:" in codex._ready_state_key()
+    assert claude._ready_state_key().startswith(claude._inner.sync_state_prefix)
+    assert "cc_jsonl:v13:" in claude._ready_state_key()
 
 
 def test_remote_codex_collector_syncs_tarball_into_history(tmp_path):
@@ -557,6 +866,15 @@ def test_remote_file_absent_from_the_archive_is_not_recorded(tmp_path):
         provider="openai",
         index=0,
     )
+    db.upsert_session(
+        "sid-b",
+        "codex",
+        provider="openai",
+        data_root=target.data_root,
+        input_tokens=100,
+        output_tokens=20,
+    )
+    db.commit()
     first_run = Mock(side_effect=[
         Mock(returncode=0, stdout=manifest, stderr=b""),
         Mock(returncode=0, stdout=partial_tar, stderr=b""),
@@ -567,9 +885,12 @@ def test_remote_file_absent_from_the_archive_is_not_recorded(tmp_path):
         collector.sync_history(db)
         cache_root = _cache_root_for(target)
 
+    assert "incomplete" in collector.last_error
     saved = json.loads((cache_root / ".remote-manifest.json").read_text())
     assert set(saved) == {files[0][0]}
     assert (cache_root / ".remote-manifest.incomplete").exists()
+    ids = {row["session_id"] for row in db.conn.execute("SELECT session_id FROM sessions")}
+    assert ids == {"sid-a", "sid-b"}
 
     # The next sync retries only the file that never arrived.
     second_run = Mock(side_effect=[
@@ -1436,7 +1757,7 @@ def test_registry_reports_prepare_cache_exceptions_without_aborting(tmp_path):
     assert registry.get_sync_errors() == ["remote-boom: ssh exploded"]
 
 
-def test_remote_removed_file_is_archived_not_reparsed(tmp_path):
+def test_remote_empty_codex_inventory_archives_without_purging_usage(tmp_path):
     remote = RemoteSpec(host="remote-dev", name="dev")
     target = RemoteSyncTarget(
         remote=remote,
@@ -1524,14 +1845,14 @@ def test_remote_removed_file_is_archived_not_reparsed(tmp_path):
         ).exists()
         assert db.conn.execute(
             "SELECT COUNT(*) AS n FROM sessions WHERE session_id = 'removed-sid'"
-        ).fetchone()["n"] == 0
+        ).fetchone()["n"] == 1
         assert db.conn.execute(
             "SELECT COUNT(*) AS n FROM session_usage WHERE session_id = 'removed-sid'"
-        ).fetchone()["n"] == 0
+        ).fetchone()["n"] == 1
         db.close()
 
 
-def test_remote_removed_claude_file_purges_existing_db_usage(tmp_path):
+def test_remote_empty_claude_inventory_archives_without_purging_usage(tmp_path):
     remote = RemoteSpec(host="remote-dev", name="dev")
     target = RemoteSyncTarget(
         remote=remote,
@@ -1600,10 +1921,10 @@ def test_remote_removed_claude_file_purges_existing_db_usage(tmp_path):
         ).exists()
         assert db.conn.execute(
             "SELECT COUNT(*) AS n FROM sessions WHERE session_id = 'removed-claude'"
-        ).fetchone()["n"] == 0
+        ).fetchone()["n"] == 1
         assert db.conn.execute(
             "SELECT COUNT(*) AS n FROM session_usage WHERE session_id = 'removed-claude'"
-        ).fetchone()["n"] == 0
+        ).fetchone()["n"] == 1
         db.close()
 
 
@@ -3065,6 +3386,69 @@ def test_claude_history_sync_skips_replayed_subagent_assistant_usage(tmp_path):
     db.close()
 
 
+def test_claude_history_sync_keeps_zero_turn_unique_usage(tmp_path):
+    projects = tmp_path / "projects"
+    subagents = projects / "-tmp-project" / "parent-session" / "subagents"
+    subagents.mkdir(parents=True)
+
+    zero_turn = [
+        {
+            "timestamp": "2026-04-23T10:00:01Z",
+            "type": "assistant",
+            "cwd": "/tmp/project",
+            "message": {
+                "id": "msg-shared",
+                "model": "gpt-5.5",
+                "usage": {"input_tokens": 10, "output_tokens": 20},
+            },
+        },
+    ]
+    later = [
+        {
+            "timestamp": "2026-04-23T10:00:02Z",
+            "type": "user",
+            "cwd": "/tmp/project",
+            "message": {"content": "later task"},
+        },
+        zero_turn[0],
+        {
+            "timestamp": "2026-04-23T10:00:03Z",
+            "type": "assistant",
+            "cwd": "/tmp/project",
+            "message": {
+                "id": "msg-unique",
+                "model": "gpt-5.5",
+                "usage": {"input_tokens": 7, "output_tokens": 8},
+            },
+        },
+    ]
+    (subagents / "agent-a1.jsonl").write_text(
+        "".join(json.dumps(line) + "\n" for line in zero_turn)
+    )
+    (subagents / "agent-a2.jsonl").write_text(
+        "".join(json.dumps(line) + "\n" for line in later)
+    )
+
+    db = Database(db_path=str(tmp_path / "data.db"))
+    ClaudeCodeCollector(
+        projects_dir=projects,
+        provider="ichat",
+        data_root=str(tmp_path),
+    ).sync_history(db)
+
+    rows = db.conn.execute(
+        """SELECT session_id, user_turns, input_tokens, output_tokens
+           FROM sessions
+           WHERE agent_type = 'claude_code'
+           ORDER BY session_id"""
+    ).fetchall()
+    assert [tuple(row) for row in rows] == [
+        ("parent-session:agent-a1", 0, 10, 20),
+        ("parent-session:agent-a2", 1, 7, 8),
+    ]
+    db.close()
+
+
 def test_claude_incremental_sync_uses_skipped_files_for_replay_dedupe(tmp_path):
     projects = tmp_path / "projects"
     subagents = projects / "-tmp-project" / "parent-session" / "subagents"
@@ -3341,6 +3725,7 @@ def test_claude_sessions_index_reads_utf8_on_windows_locale(tmp_path):
             "summary": "中文 summary",
         }],
     }, ensure_ascii=False).encode("utf-8"))
+    (project_dir / "indexed-session.jsonl").write_text("")
 
     real_read_text = Path.read_text
 
@@ -3364,6 +3749,24 @@ def test_claude_sessions_index_reads_utf8_on_windows_locale(tmp_path):
     assert row is not None
     assert row["project_path"] == r"C:\Users\Leo\中文项目"
     assert row["message_count"] == 3
+    usage = db.conn.execute(
+        """SELECT message_count, user_turns, input_tokens, output_tokens,
+                  cache_read_tokens, cache_creation_tokens, estimated_cost_usd
+           FROM session_usage WHERE session_id = 'indexed-session'
+             AND agent_type = 'claude_code'"""
+    ).fetchone()
+    assert tuple(usage) == (0, 0, 0, 0, 0, 0, 0.0)
+    orphan = db.conn.execute(
+        """SELECT 1 FROM sessions AS s
+           WHERE NOT EXISTS (
+               SELECT 1 FROM session_usage AS u
+               WHERE u.session_id = s.session_id
+                 AND u.agent_type = s.agent_type
+                 AND u.provider = s.provider
+                 AND u.data_root = s.data_root
+           )"""
+    ).fetchone()
+    assert orphan is None
     db.close()
 
 
@@ -3561,6 +3964,327 @@ def test_codex_forked_session_subtracts_replayed_parent_baseline(tmp_path):
     assert accum.input_tokens == 200
     assert accum.cache_read == 100
     assert accum.output_tokens == 20
+
+
+def test_codex_history_sync_skips_replayed_parent_prefix_with_real_fork_order(tmp_path):
+    sessions_dir = tmp_path / "sessions"
+    day_dir = sessions_dir / "2026" / "07" / "12"
+    day_dir.mkdir(parents=True)
+
+    def token_count(ts, total, last=None):
+        info = {"total_token_usage": total}
+        if last is not None:
+            info["last_token_usage"] = last
+        return {
+            "timestamp": ts,
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": info,
+            },
+        }
+
+    parent_meta = {
+        "timestamp": "2026-07-12T10:00:00Z",
+        "type": "session_meta",
+        "payload": {
+            "id": "parent",
+            "model_provider": "openai",
+            "cwd": "/tmp/project",
+            "source": "cli",
+        },
+    }
+    turn_context = {
+        "timestamp": "2026-07-12T10:00:01Z",
+        "type": "turn_context",
+        "payload": {"model": "gpt-5.6-sol"},
+    }
+    first_last = {
+        "input_tokens": 1_000,
+        "cached_input_tokens": 800,
+        "output_tokens": 100,
+        "total_tokens": 1_100,
+    }
+    first_total = dict(first_last)
+    second_last = {
+        "input_tokens": 1_500,
+        "cached_input_tokens": 1_000,
+        "output_tokens": 200,
+        "total_tokens": 1_700,
+    }
+    second_total = {
+        "input_tokens": 2_500,
+        "cached_input_tokens": 1_800,
+        "output_tokens": 300,
+        "total_tokens": 2_800,
+    }
+    parent_third_last = {
+        "input_tokens": 700,
+        "cached_input_tokens": 500,
+        "output_tokens": 60,
+        "total_tokens": 760,
+    }
+    parent_third_total = {
+        "input_tokens": 3_200,
+        "cached_input_tokens": 2_300,
+        "output_tokens": 360,
+        "total_tokens": 3_560,
+    }
+    child_total = {
+        "input_tokens": 3_100,
+        "cached_input_tokens": 2_200,
+        "output_tokens": 350,
+        "total_tokens": 3_450,
+    }
+    suffix_child_last = {
+        "input_tokens": 500,
+        "cached_input_tokens": 300,
+        "output_tokens": 40,
+        "total_tokens": 540,
+    }
+    suffix_child_total = {
+        "input_tokens": 3_700,
+        "cached_input_tokens": 2_600,
+        "output_tokens": 400,
+        "total_tokens": 4_100,
+    }
+
+    parent_lines = [
+        parent_meta,
+        turn_context,
+        {
+            "timestamp": "2026-07-12T10:00:01Z",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "parent task"},
+        },
+        token_count("2026-07-12T10:00:02Z", first_total, first_last),
+        token_count("2026-07-12T10:00:03Z", second_total, second_last),
+        token_count("2026-07-12T10:00:03Z", second_total, second_last),
+        token_count(
+            "2026-07-12T10:00:20Z",
+            parent_third_total,
+            parent_third_last,
+        ),
+    ]
+    child_lines = [
+        {
+            "timestamp": "2026-07-12T10:00:10Z",
+            "type": "session_meta",
+            "payload": {
+                "id": "child",
+                "model_provider": "openai",
+                "cwd": "/tmp/project",
+                "forked_from_id": "parent",
+                "source": {
+                    "subagent": {
+                        "thread_spawn": {"parent_thread_id": "parent"},
+                    },
+                },
+            },
+        },
+        parent_meta,
+        turn_context,
+        {
+            "timestamp": "2026-07-12T10:00:10Z",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "replayed parent task"},
+        },
+        token_count("2026-07-12T10:00:10Z", first_total, first_last),
+        token_count("2026-07-12T10:00:10Z", second_total, second_last),
+        {
+            "timestamp": "2026-07-12T10:00:10Z",
+            "type": "event_msg",
+            "payload": {"type": "task_started"},
+        },
+        {
+            "timestamp": "2026-07-12T10:00:11Z",
+            "type": "turn_context",
+            "payload": {"model": "gpt-5.6-sol"},
+        },
+        {
+            "timestamp": "2026-07-12T10:00:11Z",
+            "type": "event_msg",
+            "payload": {"type": "agent_message"},
+        },
+        token_count("2026-07-12T10:00:12Z", child_total),
+    ]
+    suffix_child_lines = [
+        {
+            "timestamp": "2026-07-12T10:00:30Z",
+            "type": "session_meta",
+            "payload": {
+                "id": "suffix-child",
+                "model_provider": "openai",
+                "cwd": "/tmp/project",
+                "forked_from_id": "parent",
+                "source": {
+                    "subagent": {
+                        "thread_spawn": {"parent_thread_id": "parent"},
+                    },
+                },
+            },
+        },
+        token_count("2026-07-12T10:00:30Z", second_total, second_last),
+        token_count(
+            "2026-07-12T10:00:30Z",
+            parent_third_total,
+            parent_third_last,
+        ),
+        {
+            "timestamp": "2026-07-12T10:00:31Z",
+            "type": "turn_context",
+            "payload": {"model": "gpt-5.6-sol"},
+        },
+        token_count(
+            "2026-07-12T10:00:32Z",
+            suffix_child_total,
+            suffix_child_last,
+        ),
+    ]
+
+    parent_file = day_dir / "rollout-2026-07-12T10-00-00-parent.jsonl"
+    child_file = day_dir / "rollout-2026-07-12T10-00-10-child.jsonl"
+    suffix_child_file = day_dir / "rollout-2026-07-12T10-00-30-suffix-child.jsonl"
+    child_file.write_text("".join(json.dumps(line) + "\n" for line in child_lines))
+
+    db = Database(db_path=str(tmp_path / "data.db"))
+    collector = CodexCollector(
+        sessions_dir=sessions_dir,
+        provider="openai",
+        data_root=str(tmp_path / "codex"),
+    )
+    collector.sync_history(db)
+    child_without_parent = db.conn.execute(
+        """SELECT user_turns, input_tokens, output_tokens, cache_read_tokens
+           FROM sessions WHERE session_id = 'child'"""
+    ).fetchone()
+    assert tuple(child_without_parent) == (1, 900, 350, 2_200)
+
+    parent_file.write_text(
+        "".join(json.dumps(line) + "\n" for line in parent_lines[:4])
+    )
+    collector.sync_history(db)
+    child_with_partial_parent = db.conn.execute(
+        """SELECT user_turns, input_tokens, output_tokens, cache_read_tokens
+           FROM sessions WHERE session_id = 'child'"""
+    ).fetchone()
+    assert tuple(child_with_partial_parent) == (0, 200, 50, 400)
+
+    parent_file.write_text("".join(json.dumps(line) + "\n" for line in parent_lines))
+    suffix_child_file.write_text(
+        "".join(json.dumps(line) + "\n" for line in suffix_child_lines)
+    )
+    collector.sync_history(db)
+
+    rows = db.conn.execute(
+        """SELECT session_id, user_turns, input_tokens, output_tokens,
+                  cache_read_tokens
+           FROM sessions
+           WHERE agent_type = 'codex'
+           ORDER BY session_id"""
+    ).fetchall()
+    expected = [
+        ("child", 0, 200, 50, 400),
+        ("parent", 1, 900, 360, 2_300),
+        ("suffix-child", 0, 200, 40, 300),
+    ]
+    assert [tuple(row) for row in rows] == expected
+
+    parent_file.rename(tmp_path / "archived-parent.jsonl")
+    collector.sync_history(db)
+    rows = db.conn.execute(
+        """SELECT session_id, user_turns, input_tokens, output_tokens,
+                  cache_read_tokens
+           FROM sessions
+           WHERE agent_type = 'codex'
+           ORDER BY session_id"""
+    ).fetchall()
+    assert [tuple(row) for row in rows] == expected
+    db.close()
+
+
+def test_codex_fork_replay_abort_keeps_observed_child_turn_context(tmp_path):
+    sessions_dir = tmp_path / "sessions"
+    day_dir = sessions_dir / "2026" / "04" / "26"
+    day_dir.mkdir(parents=True)
+
+    def token_count(ts, input_tokens, cached_input_tokens, output_tokens):
+        return {
+            "timestamp": ts,
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": input_tokens,
+                        "cached_input_tokens": cached_input_tokens,
+                        "output_tokens": output_tokens,
+                    },
+                },
+            },
+        }
+
+    parent_lines = [
+        {
+            "timestamp": "2026-04-26T22:16:10Z",
+            "type": "session_meta",
+            "payload": {
+                "id": "parent",
+                "model_provider": "openai",
+                "cwd": "/tmp/project",
+            },
+        },
+        {
+            "timestamp": "2026-04-26T22:16:11Z",
+            "type": "turn_context",
+            "payload": {"model": "gpt-5.4"},
+        },
+        token_count("2026-04-26T22:16:12Z", 1_000, 800, 100),
+        token_count("2026-04-26T22:16:13Z", 2_500, 1_800, 300),
+        token_count("2026-04-26T22:16:14Z", 3_200, 2_300, 360),
+    ]
+    child_lines = [
+        {
+            "timestamp": "2026-04-26T22:22:51Z",
+            "type": "session_meta",
+            "payload": {
+                "id": "child",
+                "model_provider": "openai",
+                "cwd": "/tmp/project",
+                "forked_from_id": "parent",
+            },
+        },
+        token_count("2026-04-26T22:22:52Z", 1_000, 800, 100),
+        {
+            "timestamp": "2026-04-26T22:22:53Z",
+            "type": "turn_context",
+            "payload": {"model": "gpt-5.4"},
+        },
+        token_count("2026-04-26T22:22:54Z", 2_500, 1_800, 300),
+        token_count("2026-04-26T22:22:55Z", 3_100, 2_200, 350),
+    ]
+
+    (day_dir / "rollout-parent.jsonl").write_text(
+        "".join(json.dumps(line) + "\n" for line in parent_lines)
+    )
+    (day_dir / "rollout-child.jsonl").write_text(
+        "".join(json.dumps(line) + "\n" for line in child_lines)
+    )
+
+    db = Database(db_path=str(tmp_path / "data.db"))
+    collector = CodexCollector(
+        sessions_dir=sessions_dir,
+        provider="openai",
+        data_root=str(tmp_path / "codex"),
+    )
+    collector.sync_history(db)
+
+    child = db.conn.execute(
+        """SELECT model, input_tokens, output_tokens, cache_read_tokens
+           FROM sessions WHERE session_id = 'child'"""
+    ).fetchone()
+    assert tuple(child) == ("gpt-5.4", 200, 50, 400)
+    db.close()
 
 
 def test_codex_forked_compatible_session_keeps_separate_input_semantics(tmp_path):

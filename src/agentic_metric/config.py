@@ -96,6 +96,37 @@ def _load_config() -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def config_is_reconcilable() -> bool:
+    try:
+        data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    collectors = data.get("collectors")
+    remotes = data.get("remotes")
+    if collectors is not None and not isinstance(collectors, dict):
+        return False
+    if remotes is not None and not isinstance(remotes, list):
+        return False
+
+    for name in ("claude_code", "codex"):
+        raw = collectors.get(name) if isinstance(collectors, dict) else None
+        if raw is not None and not isinstance(raw, (dict, list)):
+            return False
+        roots = raw.get("roots") if isinstance(raw, dict) else raw
+        if roots is not None and not isinstance(roots, list):
+            return False
+
+    if isinstance(remotes, list):
+        for remote in remotes:
+            if not isinstance(remote, (str, dict)):
+                return False
+            if isinstance(remote, dict) and not str(remote.get("host") or "").strip():
+                return False
+    return True
+
+
 def _raw_collector_roots(config: dict, name: str) -> list[tuple[str, str]]:
     collectors = config.get("collectors")
     raw_collector = collectors.get(name) if isinstance(collectors, dict) else None

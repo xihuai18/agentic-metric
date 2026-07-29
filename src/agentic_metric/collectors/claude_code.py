@@ -10,7 +10,16 @@ from pathlib import Path
 from ..config import PROJECTS_DIR
 from ..pricing import estimate_cost
 from ..usage import estimate_token_usage_cost, normalize_anthropic_usage
-from . import BaseCollector, local_time_bucket
+from . import (
+    BaseCollector,
+    local_time_bucket,
+    reconcile_scope_sessions,
+    reconcile_sync_state_keys,
+    sync_key_identity,
+)
+
+
+CLAUDE_SYNC_VERSION = "v13"
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -560,55 +569,111 @@ class ClaudeCodeCollector(BaseCollector):
         self.data_root = data_root
         self.agent_type = "claude_code"
 
-    def sync_history(self, db) -> None:
+    @property
+    def sync_state_prefix(self) -> str:
+        identity = sync_key_identity(self.provider, self.data_root)
+        return f"cc_jsonl:{CLAUDE_SYNC_VERSION}:{identity}"
+
+    def sync_history(self, db, *, reconcile: bool = True) -> None:
         """Sync Claude Code history into the database.
 
         Parses two data sources:
         1. ``sessions-index.json`` -- session metadata (per project)
         2. ``.jsonl`` files -- per-session token data (incremental via sync_state)
         """
-        self._sync_sessions_index(db)
-        self._sync_jsonl_tokens(db)
+        indexed_ids, index_complete = self._sync_sessions_index(db)
+        jsonl_ids, jsonl_complete = self._sync_jsonl_tokens(
+            db,
+            indexed_ids,
+            reconcile=reconcile,
+        )
+        if reconcile and index_complete and jsonl_complete:
+            reconcile_scope_sessions(
+                db,
+                agent_type=self.agent_type,
+                data_root=self.data_root,
+                active_by_provider={self.provider: indexed_ids | jsonl_ids},
+                owned_providers={self.provider},
+            )
         db.commit()
 
     # ── sessions-index.json ──────────────────────────────────────
 
-    def _sync_sessions_index(self, db) -> None:
+    def _sync_sessions_index(self, db) -> tuple[set[str], bool]:
         """Parse all sessions-index.json files under PROJECTS_DIR."""
         projects_dir = self.projects_dir or PROJECTS_DIR
         if not projects_dir.exists():
-            return
+            return (set(), False)
 
-        for index_file in projects_dir.glob("*/sessions-index.json"):
+        active_ids: set[str] = set()
+        complete = True
+        try:
+            index_files = list(projects_dir.glob("*/sessions-index.json"))
+        except OSError:
+            return (active_ids, False)
+
+        for index_file in index_files:
             try:
                 data = json.loads(index_file.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+                complete = False
+                continue
+            if not isinstance(data, dict) or not isinstance(data.get("entries", []), list):
+                complete = False
                 continue
 
             for entry in data.get("entries", []):
+                if not isinstance(entry, dict):
+                    complete = False
+                    continue
                 session_id = entry.get("sessionId", "")
                 if not session_id:
                     continue
+                active_ids.add(session_id)
 
                 created = entry.get("created", "")
                 modified = entry.get("modified", "")
 
+                project_path = entry.get("projectPath", "")
                 db.upsert_session(
                     session_id,
                     self.agent_type,
                     provider=self.provider,
                     data_root=self.data_root,
-                    project_path=entry.get("projectPath", ""),
+                    project_path=project_path,
                     git_branch=entry.get("gitBranch", ""),
                     message_count=entry.get("messageCount", 0),
                     started_at=created,
                     ended_at=modified,
                     summary=entry.get("summary", ""),
                 )
+                has_usage = db.conn.execute(
+                    """SELECT 1 FROM session_usage
+                       WHERE session_id = ? AND agent_type = ?
+                         AND provider = ? AND data_root = ?
+                       LIMIT 1""",
+                    (session_id, self.agent_type, self.provider, self.data_root),
+                ).fetchone()
+                if has_usage is None:
+                    db.replace_session_usage(
+                        session_id,
+                        self.agent_type,
+                        [_zero_usage_bucket(created, project_path)],
+                        provider=self.provider,
+                        data_root=self.data_root,
+                    )
+
+        return (active_ids, complete)
 
     # ── JSONL token scanning ─────────────────────────────────────
 
-    def _sync_jsonl_tokens(self, db) -> None:
+    def _sync_jsonl_tokens(
+        self,
+        db,
+        indexed_ids: set[str],
+        *,
+        reconcile: bool = True,
+    ) -> tuple[set[str], bool]:
         """Scan .jsonl files for per-session token data.
 
         Uses db sync_state to track which files/offsets have already been
@@ -616,7 +681,11 @@ class ClaudeCodeCollector(BaseCollector):
         """
         projects_dir = self.projects_dir or PROJECTS_DIR
         if not projects_dir.exists():
-            return
+            return (set(), False)
+
+        active_ids: set[str] = set()
+        active_sync_keys: set[str] = set()
+        complete = True
 
         # v7: usage buckets now record the real cwd instead of the on-disk
         # projects/ dir. Bumping the key forces a one-time re-parse so already
@@ -632,10 +701,17 @@ class ClaudeCodeCollector(BaseCollector):
         # owns the same assistant id, replacing stale replayed usage rows.
         # v12: provider is part of the sessions/session_usage primary key;
         # reparse so every usage row has a matching session total row.
-        sync_prefix = "cc_jsonl:v12:"
-        assistant_ids_prefix = "cc_assistant_ids:v12:"
+        # v13: sync state is scoped by provider/data_root and zero-turn files
+        # with unique usage are retained.
+        sync_prefix = f"{self.sync_state_prefix}:"
+        assistant_ids_prefix = f"{self.sync_state_prefix}:assistant_ids:"
 
-        for project_dir in projects_dir.iterdir():
+        try:
+            project_dirs = list(projects_dir.iterdir())
+        except OSError:
+            return (active_ids, False)
+
+        for project_dir in project_dirs:
             if not project_dir.is_dir():
                 continue
 
@@ -645,6 +721,7 @@ class ClaudeCodeCollector(BaseCollector):
                     key=lambda path: (len(path.relative_to(project_dir).parts), str(path)),
                 )
             except OSError:
+                complete = False
                 continue
 
             file_states = []
@@ -653,10 +730,16 @@ class ClaudeCodeCollector(BaseCollector):
                 try:
                     stat = jsonl_file.stat()
                 except OSError:
+                    complete = False
                     continue
                 state = _sync_state_value(stat.st_size, stat.st_mtime_ns)
                 unchanged = db.get_sync_state(sync_key) == state
                 file_states.append((jsonl_file, sync_key, state, unchanged))
+                active_ids.add(
+                    _session_id_for_jsonl(project_dir, jsonl_file, jsonl_file.stem)
+                )
+                active_sync_keys.add(sync_key)
+                active_sync_keys.add(f"{assistant_ids_prefix}{jsonl_file}")
 
             if file_states and all(unchanged for _, _, _, unchanged in file_states):
                 continue
@@ -692,13 +775,53 @@ class ClaudeCodeCollector(BaseCollector):
                     accum.all_assistant_ids,
                 )
 
-                if accum.user_turns == 0:
-                    if reprocess_for_replay:
-                        session_id = _session_id_for_jsonl(
-                            project_dir,
-                            jsonl_file,
-                            accum.session_id,
+                session_id = _session_id_for_jsonl(
+                    project_dir,
+                    jsonl_file,
+                    accum.session_id,
+                )
+                has_token_usage = bool(
+                    accum.input_tokens
+                    or accum.output_tokens
+                    or accum.cache_read
+                    or accum.cache_create
+                )
+                if accum.user_turns == 0 and not has_token_usage:
+                    if session_id in indexed_ids:
+                        db.upsert_session(
+                            session_id,
+                            self.agent_type,
+                            provider=self.provider,
+                            data_root=self.data_root,
+                            input_tokens=0,
+                            output_tokens=0,
+                            cache_read_tokens=0,
+                            cache_creation_tokens=0,
+                            cache_creation_1h_tokens=0,
+                            estimated_cost_usd=0.0,
                         )
+                        session = db.conn.execute(
+                            """SELECT started_at, project_path FROM sessions
+                               WHERE session_id = ? AND agent_type = ?
+                                 AND provider = ? AND data_root = ?""",
+                            (
+                                session_id,
+                                self.agent_type,
+                                self.provider,
+                                self.data_root,
+                            ),
+                        ).fetchone()
+                        db.replace_session_usage(
+                            session_id,
+                            self.agent_type,
+                            [_zero_usage_bucket(
+                                session["started_at"] if session else "",
+                                session["project_path"] if session else project_path,
+                            )],
+                            provider=self.provider,
+                            data_root=self.data_root,
+                        )
+                    else:
                         db.delete_session(
                             session_id,
                             self.agent_type,
@@ -710,8 +833,6 @@ class ClaudeCodeCollector(BaseCollector):
 
                 usage_rows = accum.usage_bucket_rows()
                 cost = _usage_rows_cost(usage_rows)
-
-                session_id = _session_id_for_jsonl(project_dir, jsonl_file, accum.session_id)
 
                 db.upsert_session(
                     session_id,
@@ -743,6 +864,14 @@ class ClaudeCodeCollector(BaseCollector):
                 )
 
                 db.set_sync_state(sync_key, state, commit=False)
+
+        if complete and reconcile:
+            reconcile_sync_state_keys(
+                db,
+                self.sync_state_prefix,
+                active_sync_keys,
+            )
+        return (active_ids, complete)
 
 
 def _sync_state_value(file_size: int, mtime_ns: int) -> str:
@@ -825,6 +954,24 @@ def _session_id_for_jsonl(project_dir: Path, jsonl_file: Path, default: str) -> 
     if len(parts) >= 3 and parts[-2] == "subagents":
         return f"{parts[-3]}:{jsonl_file.stem}"
     return default
+
+
+def _zero_usage_bucket(started_at: str, project_path: str) -> dict:
+    usage_date, usage_hour = local_time_bucket(started_at)
+    return {
+        "usage_date": usage_date,
+        "usage_hour": usage_hour,
+        "project_path": project_path,
+        "model": "",
+        "message_count": 0,
+        "user_turns": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
+        "cache_creation_1h_tokens": 0,
+        "estimated_cost_usd": 0.0,
+    }
 
 
 def _usage_rows_cost(rows: list[dict]) -> float | None:

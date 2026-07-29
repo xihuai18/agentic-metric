@@ -84,9 +84,9 @@ class RemoteHistoryCollector(BaseCollector):
         self.data_root = target.data_root
         self._agent_type = target.agent_type
         self.last_error = ""
-        # (found, cache_changed, manifest_digest) from a prepare_cache() call
+        # (found, cache_changed, manifest_digest, complete) from prepare_cache()
         # awaiting its sync_history(); None when no mirror result is pending.
-        self._prepared: tuple[bool, bool, str] | None = None
+        self._prepared: tuple[bool, bool, str, bool] | None = None
 
         cache_root = _cache_root_for(target)
         if target.agent_type == "codex":
@@ -108,6 +108,10 @@ class RemoteHistoryCollector(BaseCollector):
     def agent_type(self) -> str:
         return self._agent_type
 
+    @property
+    def sync_state_prefix(self) -> str:
+        return self._inner.sync_state_prefix
+
     def prepare_cache(self) -> None:
         """Mirror the remote root into the local cache (no DB access).
 
@@ -116,12 +120,17 @@ class RemoteHistoryCollector(BaseCollector):
         """
         try:
             self._prepared = _sync_target_to_cache(self.target)
-            self.last_error = "" if self._prepared[0] else (
-                f"remote path not found: "
-                f"{self.target.source_root}/{self.target.source_child}"
-            )
+            if not self._prepared[0]:
+                self.last_error = (
+                    f"remote path not found: "
+                    f"{self.target.source_root}/{self.target.source_child}"
+                )
+            elif not self._prepared[3]:
+                self.last_error = f"remote mirror incomplete: {self.data_root}"
+            else:
+                self.last_error = ""
         except Exception as exc:
-            self._prepared = (False, False, "")
+            self._prepared = (False, False, "", False)
             self.last_error = str(exc)
 
     def sync_history(self, db) -> None:
@@ -129,20 +138,21 @@ class RemoteHistoryCollector(BaseCollector):
         self._prepared = None
         if prepared is None:
             self.prepare_cache()
-            prepared = self._prepared or (False, False, "")
+            prepared = self._prepared or (False, False, "", False)
             self._prepared = None
-        found, cache_changed, manifest_digest = prepared
+        found, cache_changed, manifest_digest, complete = prepared
         if not found:
             return
         ready_key = self._ready_state_key()
-        if not cache_changed and db.get_sync_state(ready_key) == manifest_digest:
+        if complete and not cache_changed and db.get_sync_state(ready_key) == manifest_digest:
             # The mirror is byte-identical to the last fully parsed state, so
             # the per-file scan of the whole cache tree can be skipped.
             return
-        if cache_changed:
+        if cache_changed and complete:
             _purge_removed_remote_sessions(db, self.target)
-        self._inner.sync_history(db)
-        db.set_sync_state(ready_key, manifest_digest)
+        self._inner.sync_history(db, reconcile=complete)
+        if complete:
+            db.set_sync_state(ready_key, manifest_digest)
 
     def _ready_state_key(self) -> str:
         """Sync-state key marking a fully parsed mirror state.
@@ -151,8 +161,8 @@ class RemoteHistoryCollector(BaseCollector):
         migrations and history rebuilds invalidate it together with the
         per-file parse states.
         """
-        prefix = "codex_jsonl" if self.target.agent_type == "codex" else "cc_jsonl"
-        return f"{prefix}:remote_ready:v1:{_cache_root_for(self.target).name}"
+        prefix = self._inner.sync_state_prefix
+        return f"{prefix}:remote_ready:{_cache_root_for(self.target).name}"
 
 
 def _cache_root_for(target: RemoteSyncTarget) -> Path:
@@ -176,6 +186,8 @@ def _cache_root_for(target: RemoteSyncTarget) -> Path:
 def _purge_removed_remote_sessions(db, target: RemoteSyncTarget) -> None:
     """Drop derived DB rows whose remote JSONL no longer exists in active cache."""
     active_ids = _active_remote_session_ids(target)
+    if not active_ids:
+        return
     rows = db.conn.execute(
         """SELECT session_id
            FROM sessions
@@ -341,14 +353,14 @@ def _download_command(target: RemoteSyncTarget) -> str:
     )
 
 
-def _sync_target_to_cache(target: RemoteSyncTarget) -> tuple[bool, bool, str]:
-    """Mirror one remote root. Returns (found, cache_changed, manifest_digest)."""
+def _sync_target_to_cache(target: RemoteSyncTarget) -> tuple[bool, bool, str, bool]:
+    """Mirror one remote root and report whether its inventory is complete."""
     cache_root = _cache_root_for(target)
     cache_root.mkdir(parents=True, exist_ok=True)
 
     manifest = _read_remote_manifest(target)
     if manifest is None:
-        return (False, False, "")
+        return (False, False, "", False)
 
     loaded = _load_manifest(cache_root)
     # A partial manifest (left by a download that skipped files) is not
@@ -389,7 +401,7 @@ def _sync_target_to_cache(target: RemoteSyncTarget) -> tuple[bool, bool, str]:
     # Age out expired stale archives on every sync — an unchanged remote must
     # not keep them alive forever. The walk only touches .stale, so it's cheap.
     _prune_old_stale_archives(cache_root)
-    return (True, cache_changed, _manifest_digest(saved_manifest))
+    return (True, cache_changed, _manifest_digest(saved_manifest), not missing)
 
 
 def _download_batches(

@@ -44,6 +44,7 @@ from agentic_metric.tui.widgets import (
     fmt_cost as tui_fmt_cost,
 )
 from agentic_metric.tui.help_screen import HelpScreen, _SECTIONS
+from agentic_metric.tui.pricing_screen import PricingScreen
 from agentic_metric.cli import app as cli_app
 
 
@@ -154,6 +155,17 @@ def test_database_identity_migration_clears_legacy_history(tmp_path):
     assert db.conn.execute("SELECT COUNT(*) AS n FROM sessions").fetchone()["n"] == 0
     assert db.conn.execute("SELECT COUNT(*) AS n FROM session_usage").fetchone()["n"] == 0
     assert db.get_sync_state("history_identity:version") == "provider-data-root-v4"
+    db.close()
+
+
+def test_database_removes_legacy_assistant_id_state(tmp_path):
+    db_path = tmp_path / "legacy-assistant-state.db"
+    db = Database(db_path=str(db_path))
+    db.set_sync_state("cc_assistant_ids:v12:/tmp/session.jsonl", "cached")
+    db.close()
+
+    db = Database(db_path=str(db_path))
+    assert db.get_sync_state("cc_assistant_ids:v12:/tmp/session.jsonl") is None
     db.close()
 
 
@@ -1094,6 +1106,25 @@ def test_unknown_model_cost_stays_null_and_surfaces_as_unknown(tmp_path):
         project_rows = get_range_by_project(db, "2026-04-24", "2026-04-24", limit=1)
         assert project_rows[0]["unknown_cost_count"] == 1
         assert get_unpriced_models(db) == ["gpt-5.4-pro"]
+
+        db.upsert_session(
+            "s_blank",
+            "codex",
+            model="",
+            estimated_cost_usd=None,
+            started_at="2026-04-24T11:00:00Z",
+        )
+        db.replace_session_usage(
+            "s_blank",
+            "codex",
+            [{
+                "usage_date": "2026-04-24",
+                "usage_hour": 11,
+                "model": "",
+                "input_tokens": 100,
+            }],
+        )
+        assert get_unpriced_models(db) == ["(unknown model)", "gpt-5.4-pro"]
 
         db.close()
     pricing._user_cache = None
@@ -2149,6 +2180,7 @@ def test_unknown_models_note_lists_distinct_models():
         {"model": "Unknown", "raw_model": "gpt-6", "unknown_cost_count": 2},
         {"model": "claude-opus-4-8", "unknown_cost_count": 0},
         {"model": "Unknown", "raw_model": "gpt-6", "unknown_cost_count": 1},
+        {"model": "(unknown model)", "unknown_cost_count": 1},
     ])
     assert note is not None
     from rich.console import Console as _C
@@ -2160,8 +2192,25 @@ def test_unknown_models_note_lists_distinct_models():
     assert "Cost totals exclude unpriced models" in text
     assert text.count("gpt-6") == 2  # warning list + setup command
     assert "pricing set" in text
+    assert "pricing set (unknown model)" not in text
+    assert "pricing cannot be" in text
+    assert "configured." in text
     # No unknowns → no note
     assert cli_module._build_unknown_models_note([{"model": "gpt-5.5", "unknown_cost_count": 0}]) is None
+
+
+def test_pricing_screen_does_not_offer_empty_model_pricing():
+    from rich.console import Console as _C
+    import io as _io
+
+    buf = _io.StringIO()
+    _C(file=buf, width=120, no_color=True).print(
+        PricingScreen(["(unknown model)", "gpt-6"])._build_content()
+    )
+    text = buf.getvalue()
+    assert "(unknown model)" in text
+    assert "pricing cannot be configured" in text
+    assert "set with: agentic-metric pricing set" in text
 
 
 def test_cli_mixed_pricing_keeps_costs_numeric_and_warns_once():

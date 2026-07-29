@@ -233,10 +233,12 @@ def get_unpriced_models(db: Database) -> list[str]:
     """Return model ids whose usage has no configured price."""
     usage = _usage_source(db)
     rows = db.conn.execute(
-        f"""SELECT DISTINCT model
+        f"""SELECT DISTINCT CASE
+                   WHEN model = '' THEN '(unknown model)'
+                   ELSE model
+               END AS model
             FROM {usage}
             WHERE estimated_cost_usd IS NULL
-              AND model != ''
             ORDER BY model"""
     ).fetchall()
     return [str(row["model"]) for row in rows]

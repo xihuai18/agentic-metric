@@ -758,14 +758,21 @@ def _build_unknown_models_note(by_agent_model: list[dict]) -> Panel | None:
 def _build_pricing_missing_note(models: list[str]) -> Panel | None:
     if not models:
         return None
+    configurable = [name for name in models if name != "(unknown model)"]
     lines: list[Text] = [
         Text.assemble(
             ("Cost totals exclude unpriced models: ", C_MUTED),
             (", ".join(models), f"bold {C_MAUVE}"),
         ),
-        Text("Set pricing (USD per 1M tokens):", style=C_MUTED),
     ]
-    for name in models:
+    if "(unknown model)" in models:
+        lines.append(Text(
+            "Records labeled (unknown model) have no model id; pricing cannot be configured.",
+            style=C_MUTED,
+        ))
+    if configurable:
+        lines.append(Text("Set pricing (USD per 1M tokens):", style=C_MUTED))
+    for name in configurable:
         lines.append(Text.assemble(
             ("  agentic-metric pricing set ", C_MUTED),
             (name, C_MAUVE),

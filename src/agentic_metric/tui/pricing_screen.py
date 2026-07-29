@@ -44,17 +44,26 @@ class PricingScreen(ModalScreen):
         ]
 
         if self._unknown:
+            configurable = [
+                name for name in self._unknown if name != "(unknown model)"
+            ]
             missing = Text("  Pricing missing: ", style="bright_yellow")
             missing.append(", ".join(self._unknown), style="bold bright_magenta")
             blocks.append(missing)
             blocks.append(Text(
-                "  Cost totals exclude these models until pricing is set.",
+                "  Cost totals exclude usage without applicable pricing.",
                 style="white",
             ))
-            blocks.append(Text(
-                "  set with: agentic-metric pricing set <model> -i <input> -o <output>",
-                style="white",
-            ))
+            if "(unknown model)" in self._unknown:
+                blocks.append(Text(
+                    "  Records labeled (unknown model) have no model id; pricing cannot be configured.",
+                    style="white",
+                ))
+            if configurable:
+                blocks.append(Text(
+                    "  set with: agentic-metric pricing set <model> -i <input> -o <output>",
+                    style="white",
+                ))
 
         blocks.append(self._models_table())
         lc = self._long_context_table()

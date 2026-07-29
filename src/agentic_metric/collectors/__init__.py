@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from datetime import datetime
+import hashlib
+import json
 
 # Both collectors bucket every parsed entry by local date and hour. Converting
 # each ISO timestamp on its own dominated a full reparse (millions of
@@ -47,6 +49,67 @@ def local_time_bucket(ts: str) -> tuple[str, int]:
     return bucket
 
 
+def sync_key_identity(provider: str, data_root: str) -> str:
+    raw = json.dumps(
+        {"provider": provider or "", "data_root": data_root or ""},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def reconcile_scope_sessions(
+    db,
+    *,
+    agent_type: str,
+    data_root: str,
+    active_by_provider: dict[str, set[str]],
+    owned_providers: set[str] | None = None,
+) -> None:
+    if not any(active_by_provider.values()):
+        return
+
+    providers = set(active_by_provider)
+    if owned_providers is None:
+        rows = db.conn.execute(
+            "SELECT DISTINCT provider FROM sessions WHERE agent_type = ? AND data_root = ?",
+            (agent_type, data_root),
+        ).fetchall()
+        providers.update(str(row["provider"] or "") for row in rows)
+    else:
+        providers.update(owned_providers)
+
+    for provider in providers:
+        active_ids = active_by_provider.get(provider, set())
+        rows = db.conn.execute(
+            """SELECT session_id FROM sessions
+               WHERE agent_type = ? AND provider = ? AND data_root = ?""",
+            (agent_type, provider, data_root),
+        ).fetchall()
+        for row in rows:
+            session_id = str(row["session_id"] or "")
+            if session_id in active_ids:
+                continue
+            db.delete_session(
+                session_id,
+                agent_type,
+                provider=provider,
+                data_root=data_root,
+            )
+
+
+def reconcile_sync_state_keys(db, prefix: str, active_keys: set[str]) -> None:
+    rows = db.conn.execute(
+        "SELECT key FROM sync_state WHERE key LIKE ?",
+        (f"{prefix}:%",),
+    ).fetchall()
+    for row in rows:
+        key = str(row["key"])
+        if key in active_keys or ":remote_ready:" in key:
+            continue
+        db.conn.execute("DELETE FROM sync_state WHERE key = ?", (key,))
+
+
 class BaseCollector(ABC):
     """Abstract base class for agent collectors."""
 
@@ -63,9 +126,10 @@ class BaseCollector(ABC):
 class CollectorRegistry:
     """Registry of all available collectors."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, reconcile_scopes: bool = False) -> None:
         self._collectors: list[BaseCollector] = []
         self._sync_errors: list[str] = []
+        self._reconcile_scopes = reconcile_scopes
 
     def register(self, collector: BaseCollector) -> None:
         self._collectors.append(collector)
@@ -96,6 +160,7 @@ class CollectorRegistry:
 
         if not remote:
             self._sync_collectors(db, local)
+            self._reconcile_derived_state(db)
             return
 
         from concurrent.futures import ThreadPoolExecutor
@@ -116,6 +181,64 @@ class CollectorRegistry:
                     # ``last_error``; a raising one must not abort the sync.
                     self._sync_errors.append(f"{self._label(collector)}: {exc}")
         self._sync_collectors(db, remote)
+        self._reconcile_derived_state(db)
+
+    def _reconcile_derived_state(self, db) -> None:
+        if not self._reconcile_scopes or self.get_sync_errors():
+            return
+
+        scopes = [
+            (
+                str(getattr(collector, "agent_type", "")),
+                str(getattr(collector, "provider", "") or ""),
+                str(getattr(collector, "data_root", "") or ""),
+            )
+            for collector in self._collectors
+        ]
+        rows = db.conn.execute(
+            """SELECT agent_type, provider, data_root
+               FROM sessions
+               WHERE agent_type IN ('claude_code', 'codex')
+               UNION
+               SELECT agent_type, provider, data_root
+               FROM session_usage
+               WHERE agent_type IN ('claude_code', 'codex')"""
+        ).fetchall()
+        for row in rows:
+            agent_type = str(row["agent_type"])
+            provider = str(row["provider"] or "")
+            data_root = str(row["data_root"] or "")
+            active = any(
+                scope_agent == agent_type
+                and scope_root == data_root
+                and (not scope_provider or scope_provider == provider)
+                for scope_agent, scope_provider, scope_root in scopes
+            )
+            if active:
+                continue
+            db.conn.execute(
+                "DELETE FROM session_usage WHERE agent_type = ? AND provider = ? AND data_root = ?",
+                (agent_type, provider, data_root),
+            )
+            db.conn.execute(
+                "DELETE FROM sessions WHERE agent_type = ? AND provider = ? AND data_root = ?",
+                (agent_type, provider, data_root),
+            )
+
+        prefixes = {
+            str(getattr(collector, "sync_state_prefix"))
+            for collector in self._collectors
+            if getattr(collector, "sync_state_prefix", None)
+        }
+        state_rows = db.conn.execute(
+            """SELECT key FROM sync_state
+               WHERE key LIKE 'cc_jsonl:%' OR key LIKE 'codex_jsonl:%'"""
+        ).fetchall()
+        for row in state_rows:
+            key = str(row["key"])
+            if any(key.startswith(f"{prefix}:") for prefix in prefixes):
+                continue
+            db.conn.execute("DELETE FROM sync_state WHERE key = ?", (key,))
 
     def _sync_collectors(self, db, collectors: list[BaseCollector]) -> None:
         for collector in collectors:
@@ -142,9 +265,14 @@ def create_default_registry() -> CollectorRegistry:
     - Claude Code (Anthropic CLI)
     - Codex (OpenAI CLI)
     """
-    registry = CollectorRegistry()
+    from ..config import (
+        config_is_reconcilable,
+        get_claude_code_roots,
+        get_codex_roots,
+        get_remote_specs,
+    )
 
-    from ..config import get_claude_code_roots, get_codex_roots, get_remote_specs
+    registry = CollectorRegistry(reconcile_scopes=config_is_reconcilable())
 
     from .claude_code import ClaudeCodeCollector
     for root in get_claude_code_roots():

@@ -135,6 +135,10 @@ class Database:
         """)
         self._ensure_history_identity_current()
         self._purge_unscoped_legacy_history()
+        self._conn.execute(
+            "DELETE FROM sync_state WHERE key LIKE 'cc_assistant_ids:%'"
+        )
+        self._conn.commit()
 
     @staticmethod
     def _column_expr(cols: set[str], column: str, default_sql: str) -> str:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
 
 from ..config import CODEX_SESSIONS_DIR
@@ -16,7 +16,16 @@ from ..usage import (
     openai_input_tokens_are_separate,
     normalize_openai_usage,
 )
-from . import BaseCollector, local_time_bucket
+from . import (
+    BaseCollector,
+    local_time_bucket,
+    reconcile_scope_sessions,
+    reconcile_sync_state_keys,
+    sync_key_identity,
+)
+
+
+CODEX_SYNC_VERSION = "v17"
 
 
 # ── Incremental JSONL accumulator ────────────────────────────────────────
@@ -82,6 +91,10 @@ class _SessionAccum:
         "provider_locked",
         "observed_provider",
         "data_root",
+        "replayed_token_signatures",
+        "_replay_signature_index",
+        "_replay_pending_entries",
+        "_replay_model",
     )
 
     def __init__(
@@ -90,6 +103,7 @@ class _SessionAccum:
         project_path: str,
         provider: str = "",
         data_root: str = "",
+        replayed_token_signatures: tuple[bytes, ...] | None = None,
     ) -> None:
         self.file_path = file_path
         self.project_path = project_path
@@ -140,6 +154,10 @@ class _SessionAccum:
         self.provider_locked = bool(self.provider)
         self.observed_provider = ""
         self.data_root = data_root
+        self.replayed_token_signatures = replayed_token_signatures
+        self._replay_signature_index = -1
+        self._replay_pending_entries: list[dict] = []
+        self._replay_model = ""
 
     def read_new_lines(self) -> None:
         """Read only bytes appended since last call.
@@ -228,6 +246,9 @@ class _SessionAccum:
         self.fork_baseline_total_tokens = 0
         self.usage_buckets.clear()
         self.observed_provider = ""
+        self._replay_signature_index = -1
+        self._replay_pending_entries.clear()
+        self._replay_model = ""
         self._reset_today_counters(today_str)
 
     def _reset_today_counters(self, today_str: str) -> None:
@@ -361,6 +382,84 @@ class _SessionAccum:
         return True
 
     def _process_entry(self, entry: dict) -> None:
+        if (
+            self.session_id
+            and self.replayed_token_signatures
+            and self._replay_signature_index < len(self.replayed_token_signatures)
+        ):
+            self._process_entry_while_matching_replay(entry)
+            return
+        self._process_entry_after_replay(entry)
+
+    def _process_entry_while_matching_replay(self, entry: dict) -> None:
+        entry_type = entry.get("type", "")
+        payload = entry.get("payload", {})
+
+        if entry_type == "turn_context":
+            model = payload.get("model", "") if isinstance(payload, dict) else ""
+            if model:
+                self._replay_model = model
+            self._replay_pending_entries.append(entry)
+            return
+
+        if entry_type != "event_msg" or not isinstance(payload, dict):
+            self._replay_pending_entries.append(entry)
+            return
+
+        msg_type = payload.get("type", "")
+        if msg_type == "thread_settings_applied":
+            self._process_event_msg(payload, False, "")
+            return
+
+        if msg_type != "token_count":
+            self._replay_pending_entries.append(entry)
+            return
+
+        signature = _token_count_signature(payload)
+        if signature is None:
+            self._replay_pending_entries.append(entry)
+            return
+
+        if self._replay_signature_index < 0:
+            try:
+                self._replay_signature_index = self.replayed_token_signatures.index(
+                    signature
+                )
+            except ValueError:
+                pass
+
+        if self._replay_signature_index >= 0:
+            while (
+                self._replay_signature_index > 0
+                and self._replay_signature_index < len(self.replayed_token_signatures)
+                and signature
+                != self.replayed_token_signatures[self._replay_signature_index]
+                and self.replayed_token_signatures[self._replay_signature_index]
+                == self.replayed_token_signatures[self._replay_signature_index - 1]
+            ):
+                self._replay_signature_index += 1
+
+            if self._replay_signature_index < len(self.replayed_token_signatures):
+                expected = self.replayed_token_signatures[self._replay_signature_index]
+                if signature == expected:
+                    self._update_fork_baseline(payload)
+                    self._replay_signature_index += 1
+                    self._replay_pending_entries.clear()
+                    if self._replay_signature_index == len(self.replayed_token_signatures):
+                        self.model = self._replay_model
+                    return
+
+        pending = self._replay_pending_entries
+        self._replay_pending_entries = []
+        self._replay_signature_index = len(self.replayed_token_signatures)
+        self.model = self._replay_model
+        if self._replay_model:
+            self.seen_turn_context = True
+        for pending_entry in pending:
+            self._process_entry_after_replay(pending_entry)
+        self._process_entry_after_replay(entry)
+
+    def _process_entry_after_replay(self, entry: dict) -> None:
         ts = entry.get("timestamp", "")
         if ts:
             if not self.first_ts:
@@ -636,6 +735,74 @@ class _SessionAccum:
             self.fork_baseline_total_tokens = total
 
 
+def _token_count_signature(payload: dict) -> bytes | None:
+    info = payload.get("info")
+    if not isinstance(info, dict):
+        return None
+    total = info.get("total_token_usage")
+    if not isinstance(total, dict) or not total:
+        return None
+    raw = json.dumps(
+        {
+            "total_token_usage": total,
+            "last_token_usage": info.get("last_token_usage"),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha1(raw.encode("utf-8")).digest()
+
+
+def _session_file_identity(jsonl_file: Path) -> tuple[str, str, str]:
+    try:
+        with jsonl_file.open(encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    entry = json.loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if entry.get("type") != "session_meta":
+                    continue
+                payload = entry.get("payload")
+                if not isinstance(payload, dict):
+                    return ("", "", "")
+                session_id = str(payload.get("id") or "")
+                parent_id = str(payload.get("forked_from_id") or "")
+                observed_provider = str(payload.get("model_provider") or "").strip()
+                if not parent_id:
+                    source = payload.get("source")
+                    subagent = source.get("subagent") if isinstance(source, dict) else None
+                    spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+                    if isinstance(spawn, dict):
+                        parent_id = str(spawn.get("parent_thread_id") or "")
+                return (session_id, parent_id, observed_provider)
+    except OSError:
+        pass
+    return ("", "", "")
+
+
+def _read_token_signatures(jsonl_file: Path) -> tuple[bytes, ...]:
+    signatures: list[bytes] = []
+    try:
+        with jsonl_file.open(encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    entry = json.loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                payload = entry.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+                if entry.get("type") != "event_msg" or payload.get("type") != "token_count":
+                    continue
+                signature = _token_count_signature(payload)
+                if signature is not None:
+                    signatures.append(signature)
+    except OSError:
+        pass
+    return tuple(signatures)
+
+
 # ── Collector implementation ─────────────────────────────────────────────
 
 
@@ -661,12 +828,17 @@ class CodexCollector(BaseCollector):
     def _sessions_dir(self) -> Path:
         return self.sessions_dir or CODEX_SESSIONS_DIR
 
-    def sync_history(self, db) -> None:
+    @property
+    def sync_state_prefix(self) -> str:
+        identity = sync_key_identity(self.provider, self.data_root)
+        return f"codex_jsonl:{CODEX_SYNC_VERSION}:{identity}"
+
+    def sync_history(self, db, *, reconcile: bool = True) -> None:
         """Sync Codex session history into the database."""
-        self._sync_jsonl_sessions(db)
+        self._sync_jsonl_sessions(db, reconcile=reconcile)
         db.commit()
 
-    def _sync_jsonl_sessions(self, db) -> None:
+    def _sync_jsonl_sessions(self, db, *, reconcile: bool = True) -> None:
         """Walk all ~/.codex/sessions/**/*.jsonl and upsert session data."""
         sessions_dir = self._sessions_dir()
         if not sessions_dir.exists():
@@ -683,9 +855,40 @@ class CodexCollector(BaseCollector):
         # 1h cache-write splits.
         # v13: provider is part of the sessions/session_usage primary key;
         # reparse so every usage row has a matching session total row.
-        sync_prefix = f"codex_jsonl:v13:{_sync_key_identity(self.provider, self.data_root)}:"
+        # v14: forked rollouts skip the exact token prefix replayed from a parent
+        # file in the same root instead of treating copied history as new usage.
+        # v15: replay matching may start from any parent token snapshot because
+        # newer Codex forks can embed only a suffix and omit its turn_context.
+        # v16: parent-side duplicate snapshots may be collapsed by fork replay.
+        # v17: partial replay aborts retain an observed child turn context.
+        sync_prefix = f"{self.sync_state_prefix}:"
 
-        for jsonl_file in sessions_dir.rglob("rollout-*.jsonl"):
+        try:
+            jsonl_files = sorted(sessions_dir.rglob("rollout-*.jsonl"))
+        except OSError:
+            return
+        identities = {path: _session_file_identity(path) for path in jsonl_files}
+        inventory_complete = all(identity[0] for identity in identities.values())
+        files_by_session_id = {
+            session_id: path
+            for path, (session_id, _parent_id, _provider) in identities.items()
+            if session_id
+        }
+        signature_cache: dict[Path, tuple[bytes, ...]] = {}
+        active_by_provider: dict[str, set[str]] = {}
+        for session_id, parent_id, observed_provider in identities.values():
+            if self.provider and observed_provider and observed_provider != self.provider:
+                continue
+            effective_provider = self.provider or observed_provider
+            active_ids = active_by_provider.setdefault(effective_provider, set())
+            active_ids.add(session_id)
+            if parent_id and parent_id not in files_by_session_id:
+                active_ids.add(parent_id)
+        active_sync_keys = {
+            f"{self.sync_state_prefix}:{jsonl_file}" for jsonl_file in jsonl_files
+        }
+
+        for jsonl_file in jsonl_files:
             sync_key = f"{sync_prefix}{jsonl_file}"
             prev_state = db.get_sync_state(sync_key)
 
@@ -696,8 +899,38 @@ class CodexCollector(BaseCollector):
             file_size = stat.st_size
             mtime_ns = stat.st_mtime_ns
 
-            if _sync_state_matches(prev_state, file_size, mtime_ns):
+            parent_id = identities[jsonl_file][1]
+            parent_file = files_by_session_id.get(parent_id)
+            parent_state = f"missing:{parent_id}" if parent_id else ""
+            if parent_file is not None and parent_file != jsonl_file:
+                try:
+                    parent_stat = parent_file.stat()
+                    parent_state = (
+                        f"{parent_file}:{parent_stat.st_size}:{parent_stat.st_mtime_ns}"
+                    )
+                except OSError:
+                    parent_file = None
+
+            if _sync_state_matches(
+                prev_state,
+                file_size,
+                mtime_ns,
+                parent_state=parent_state,
+            ):
                 continue
+
+            replayed_token_signatures = None
+            if parent_file is not None and parent_file != jsonl_file:
+                replayed_token_signatures = signature_cache.get(parent_file)
+                if replayed_token_signatures is None:
+                    replayed_token_signatures = _read_token_signatures(parent_file)
+                    signature_cache[parent_file] = replayed_token_signatures
+
+            state = _sync_state_value(
+                file_size,
+                mtime_ns,
+                parent_state=parent_state,
+            )
 
             # Full parse to get cumulative totals
             accum = _SessionAccum(
@@ -705,6 +938,7 @@ class CodexCollector(BaseCollector):
                 project_path="",
                 provider=self.provider,
                 data_root=self.data_root,
+                replayed_token_signatures=replayed_token_signatures,
             )
             accum.read_new_lines()
 
@@ -719,20 +953,31 @@ class CodexCollector(BaseCollector):
                     )
                 db.set_sync_state(
                     sync_key,
-                    _sync_state_value(file_size, mtime_ns),
-                    commit=False,
-                )
-                continue
-
-            if accum.user_turns == 0:
-                db.set_sync_state(
-                    sync_key,
-                    _sync_state_value(file_size, mtime_ns),
+                    state,
                     commit=False,
                 )
                 continue
 
             session_id = accum.session_id or jsonl_file.stem
+            has_token_usage = bool(
+                accum.input_tokens
+                or accum.output_tokens
+                or accum.cache_read
+                or accum.cache_create
+            )
+            if accum.user_turns == 0 and not has_token_usage:
+                db.delete_session(
+                    session_id,
+                    self.agent_type,
+                    provider=self.provider,
+                    data_root=self.data_root,
+                )
+                db.set_sync_state(
+                    sync_key,
+                    state,
+                    commit=False,
+                )
+                continue
 
             usage_rows = accum.usage_bucket_rows()
             cost = _usage_rows_cost(usage_rows)
@@ -768,37 +1013,68 @@ class CodexCollector(BaseCollector):
 
             db.set_sync_state(
                 sync_key,
-                _sync_state_value(file_size, mtime_ns),
+                state,
                 commit=False,
             )
 
+        if inventory_complete and reconcile:
+            owned_providers = {self.provider} if self.provider else None
+            reconcile_scope_sessions(
+                db,
+                agent_type=self.agent_type,
+                data_root=self.data_root,
+                active_by_provider=active_by_provider,
+                owned_providers=owned_providers,
+            )
+            reconcile_sync_state_keys(
+                db,
+                self.sync_state_prefix,
+                active_sync_keys,
+            )
 
-def _sync_key_identity(provider: str, data_root: str) -> str:
-    """Return a stable sync identity for one configured Codex root/provider."""
-    raw = json.dumps(
-        {"provider": provider or "", "data_root": data_root or ""},
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+def _sync_state_value(
+    file_size: int,
+    mtime_ns: int,
+    *,
+    parent_state: str = "",
+) -> str:
+    """Return the on-disk sync stamp for a JSONL file and its parent dependency."""
+    value = f"{file_size}:{mtime_ns}"
+    if parent_state:
+        dependency = hashlib.sha1(parent_state.encode("utf-8")).hexdigest()[:16]
+        value = f"{value}:{dependency}"
+    return value
 
 
-def _sync_state_value(file_size: int, mtime_ns: int) -> str:
-    """Return the on-disk sync stamp for a JSONL file."""
-    return f"{file_size}:{mtime_ns}"
-
-
-def _sync_state_matches(state: str | None, file_size: int, mtime_ns: int) -> bool:
+def _sync_state_matches(
+    state: str | None,
+    file_size: int,
+    mtime_ns: int,
+    *,
+    parent_state: str = "",
+) -> bool:
     """Return True when the persisted sync stamp matches the current file."""
     if not state:
         return False
-    parts = state.split(":", 1)
-    if len(parts) != 2:
+    parts = state.split(":", 2)
+    if len(parts) < 2:
         return False
     try:
-        return int(parts[0]) == file_size and int(parts[1]) == mtime_ns
+        base_matches = int(parts[0]) == file_size and int(parts[1]) == mtime_ns
     except ValueError:
         return False
+    if not base_matches:
+        return False
+    if parent_state.startswith("missing:"):
+        return True
+    if parent_state:
+        return state == _sync_state_value(
+            file_size,
+            mtime_ns,
+            parent_state=parent_state,
+        )
+    return len(parts) == 2
 
 
 def _input_tokens_default_separate(provider: str) -> bool:
