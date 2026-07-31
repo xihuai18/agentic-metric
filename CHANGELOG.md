@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.8.10 (2026-07-31)
+
+### Improvements
+
+- **GPT-5.6 Terra and Luna repriced after OpenAI's cut**: on 2026-07-30 OpenAI
+  reduced Luna by 80% and Terra by 20%. Terra is now billed at $2.00 input /
+  $12.00 output ($0.20 cache read, $2.50 cache write) and Luna at $0.20 /
+  $1.20 ($0.02, $0.25) per 1M tokens. The premium and long-context tiers move
+  with them: fast/priority requests bill at $4.00 / $24.00 (Terra) and $0.40 /
+  $2.40 (Luna), and requests over 272k input tokens at $4.00 / $18.00 and
+  $0.40 / $1.80. Sol is unchanged at $5.00 / $30.00. The pricing fingerprint is
+  bumped, so stored sessions are repriced on the next sync.
+
+  The builtin table holds one current price per model, so Terra and Luna usage
+  recorded before 2026-07-30 is also repriced at the new lower rates. Pin the
+  old rates with `agentic-metric pricing set` if a historical total needs to
+  match what was actually invoiced.
+
 ## v0.8.8 (2026-07-28)
 
 ### Fixes

@@ -195,7 +195,8 @@ Refresh intervals can be overridden in the config file (`$DATA/agentic_metric/co
 
 Prices are USD per 1M tokens. Verified against official pricing docs
 (2026-04-25; Claude Fable 5 on 2026-06-12; Claude Opus 4.8 on 2026-06-02;
-Claude Opus 5 on 2026-07-28).
+Claude Opus 5 on 2026-07-28; GPT-5.6 on 2026-07-31, after OpenAI's
+2026-07-30 price cut).
 
 <details>
 <summary>Anthropic Claude</summary>
@@ -221,8 +222,8 @@ Claude Opus 5 on 2026-07-28).
 |-------|------:|-------:|-----------:|------------:|
 <!-- pricing:openai:start -->
 | gpt-5.6-sol | $5.00 | $30.00 | $0.50 | $6.25 |
-| gpt-5.6-terra | $2.50 | $15.00 | $0.25 | $3.125 |
-| gpt-5.6-luna | $1.00 | $6.00 | $0.10 | $1.25 |
+| gpt-5.6-terra | $2.00 | $12.00 | $0.20 | $2.50 |
+| gpt-5.6-luna | $0.20 | $1.20 | $0.02 | $0.25 |
 | gpt-5.5 | $5.00 | $30.00 | $0.50 | — |
 | gpt-5.4-mini | $0.75 | $4.50 | $0.075 | — |
 | gpt-5.4-nano | $0.20 | $1.25 | $0.02 | — |

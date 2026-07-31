@@ -163,8 +163,8 @@ def test_gpt_56_family_pricing(tmp_path):
     with _patch_empty_user_pricing(tmp_path):
         assert get_pricing("gpt-5.6") == (5.0, 30.0, 0.50, 6.25)
         assert get_pricing("gpt-5.6-sol") == (5.0, 30.0, 0.50, 6.25)
-        assert get_pricing("gpt-5.6-terra") == (2.5, 15.0, 0.25, 3.125)
-        assert get_pricing("gpt-5.6-luna") == (1.0, 6.0, 0.10, 1.25)
+        assert get_pricing("gpt-5.6-terra") == (2.0, 12.0, 0.20, 2.50)
+        assert get_pricing("gpt-5.6-luna") == (0.20, 1.20, 0.02, 0.25)
 
 
 def test_longest_prefix_match():
@@ -259,8 +259,8 @@ def test_gpt_55_long_context_uses_long_context_rate(tmp_path):
     [
         ("gpt-5.6", (10.0, 45.0, 1.0, 12.5)),
         ("gpt-5.6-sol", (10.0, 45.0, 1.0, 12.5)),
-        ("gpt-5.6-terra", (5.0, 22.5, 0.5, 6.25)),
-        ("gpt-5.6-luna", (2.0, 9.0, 0.2, 2.5)),
+        ("gpt-5.6-terra", (4.0, 18.0, 0.40, 5.0)),
+        ("gpt-5.6-luna", (0.40, 1.80, 0.04, 0.50)),
     ],
 )
 def test_gpt_56_long_context_uses_model_rate(tmp_path, model, prices):

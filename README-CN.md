@@ -171,7 +171,7 @@ agentic-metric pricing cache reset claude-sonnet-4                # 删除覆盖
 
 ## 内置模型定价
 
-价格为 USD / 1M tokens。数据来源为官方定价页面(2026-04-25 核实；Claude Fable 5 于 2026-06-12 核实；Claude Opus 4.8 于 2026-06-02 核实；Claude Opus 5 于 2026-07-28 核实)。
+价格为 USD / 1M tokens。数据来源为官方定价页面(2026-04-25 核实；Claude Fable 5 于 2026-06-12 核实；Claude Opus 4.8 于 2026-06-02 核实；Claude Opus 5 于 2026-07-28 核实；GPT-5.6 于 2026-07-31 核实,已包含 OpenAI 2026-07-30 的降价)。
 
 <details>
 <summary>Anthropic Claude</summary>
@@ -197,8 +197,8 @@ agentic-metric pricing cache reset claude-sonnet-4                # 删除覆盖
 |------|------:|-------:|-----------:|------------:|
 <!-- pricing:openai:start -->
 | gpt-5.6-sol | $5.00 | $30.00 | $0.50 | $6.25 |
-| gpt-5.6-terra | $2.50 | $15.00 | $0.25 | $3.125 |
-| gpt-5.6-luna | $1.00 | $6.00 | $0.10 | $1.25 |
+| gpt-5.6-terra | $2.00 | $12.00 | $0.20 | $2.50 |
+| gpt-5.6-luna | $0.20 | $1.20 | $0.02 | $0.25 |
 | gpt-5.5 | $5.00 | $30.00 | $0.50 | — |
 | gpt-5.4-mini | $0.75 | $4.50 | $0.075 | — |
 | gpt-5.4-nano | $0.20 | $1.25 | $0.02 | — |

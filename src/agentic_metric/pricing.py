@@ -15,7 +15,8 @@ PriceTuple = tuple[float, float, float, float]
 # (input, output, cache_read, cache_write) — USD per million tokens.
 # Core Anthropic / Google Gemini prices were verified against official pricing
 # docs on 2026-04-25, with GPT-5.6 pricing verified against OpenAI's official
-# pricing and model docs on 2026-07-11, Claude Fable 5 verified
+# pricing and model docs on 2026-07-11 and re-verified on 2026-07-31 after the
+# 2026-07-30 cut (Luna -80%, Terra -20%, Sol unchanged), Claude Fable 5 verified
 # against Anthropic's pricing docs on 2026-06-12, Claude Sonnet 5
 # standard pricing verified against Anthropic's pricing docs on
 # 2026-07-01, Claude Opus 4.8 verified against Anthropic's
@@ -59,8 +60,8 @@ _BUILTIN_PRICING: dict[str, PriceTuple] = {
     "claude-3-haiku":        (0.25, 1.25, 0.03,  0.30),
     # ── OpenAI ──
     "gpt-5.6-sol":           (5.0,  30.0,  0.50,  6.25),
-    "gpt-5.6-terra":         (2.5,  15.0,  0.25,  3.125),
-    "gpt-5.6-luna":          (1.0,   6.0,  0.10,  1.25),
+    "gpt-5.6-terra":         (2.0,  12.0,  0.20,  2.50),
+    "gpt-5.6-luna":          (0.20,  1.20, 0.02,  0.25),
     "gpt-5.5":               (5.0,  30.0,  0.50,  0.0),
     "gpt-5.4-mini":          (0.75,   4.5, 0.075, 0.0),
     "gpt-5.4-nano":          (0.20,  1.25, 0.02,  0.0),
@@ -106,7 +107,10 @@ _MODEL_ALIASES: dict[str, str] = {
 # requests at standard speed and standard rates, and Claude Opus 4.7 rejects
 # them outright, so neither can produce fast-marked history).
 # Verified against OpenAI's pricing page and Anthropic's fast-mode docs on
-# 2026-07-21, with Claude Opus 5 fast mode verified on 2026-07-28:
+# 2026-07-21, with Claude Opus 5 fast mode verified on 2026-07-28 and the
+# GPT-5.6 premium rates re-verified on 2026-07-31 (OpenAI renamed priority
+# processing to fast mode on 2026-07-30; both ``service_tier`` values remain
+# valid, and the premium stays 2x the standard rate):
 #   https://developers.openai.com/api/docs/pricing/
 #   https://developers.openai.com/api/docs/guides/priority-processing
 #   https://platform.claude.com/docs/en/build-with-claude/fast-mode
@@ -115,8 +119,8 @@ _NON_STANDARD_MODE_PRICING: dict[str, dict[str, PriceTuple | None]] = {
     # with an API key it bills at the priority token rate).
     "priority": {
         "gpt-5.6-sol":   (10.0, 60.0, 1.0,  12.5),
-        "gpt-5.6-terra": (5.0,  30.0, 0.50,  6.25),
-        "gpt-5.6-luna":  (2.0,  12.0, 0.20,  2.50),
+        "gpt-5.6-terra": (4.0,  24.0, 0.40,  5.0),
+        "gpt-5.6-luna":  (0.40,  2.40, 0.04, 0.50),
         "gpt-5.5":       (12.5, 75.0, 1.25,  0.0),
         "gpt-5.4-mini":  (1.50,  9.0, 0.15,  0.0),
         "gpt-5.4-nano":  None,
@@ -155,7 +159,7 @@ _UNKNOWN_MODEL_PREFIXES = (
     "gpt-5-pro",
 )
 
-_PRICING_FINGERPRINT_VERSION = 17
+_PRICING_FINGERPRINT_VERSION = 18
 
 # Long-context pricing applies per request/prompt, not per stored hour/session.
 # Collectors pass single-event usage into ``estimate_cost`` before aggregating
@@ -170,13 +174,13 @@ _LONG_CONTEXT_RULES: list[dict[str, object]] = [
     {
         "prefixes": ("gpt-5.6-terra",),
         "tiers": (
-            {"threshold": 272_000, "prices": (5.0, 22.5, 0.50, 6.25)},
+            {"threshold": 272_000, "prices": (4.0, 18.0, 0.40, 5.0)},
         ),
     },
     {
         "prefixes": ("gpt-5.6-luna",),
         "tiers": (
-            {"threshold": 272_000, "prices": (2.0, 9.0, 0.20, 2.50)},
+            {"threshold": 272_000, "prices": (0.40, 1.80, 0.04, 0.50)},
         ),
     },
     {
