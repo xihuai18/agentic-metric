@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 
 from .config import PRICING_FILE
@@ -59,6 +60,7 @@ _BUILTIN_PRICING: dict[str, PriceTuple] = {
     "claude-3-opus":         (15.0, 75.0, 1.50, 18.75),
     "claude-3-haiku":        (0.25, 1.25, 0.03,  0.30),
     # ── OpenAI ──
+    "gpt-6-astra":           (10.0, 50.0,  1.00, 12.50),
     "gpt-5.6-sol":           (5.0,  30.0,  0.50,  6.25),
     "gpt-5.6-terra":         (2.0,  12.0,  0.20,  2.50),
     "gpt-5.6-luna":          (0.20,  1.20, 0.02,  0.25),
@@ -73,6 +75,7 @@ _BUILTIN_PRICING: dict[str, PriceTuple] = {
     "gpt-5.1-codex":         (1.25, 10.0,  0.125, 0.0),
     "gpt-5.1-chat-latest":   (1.25, 10.0,  0.125, 0.0),
     "gpt-5.1":               (1.25, 10.0,  0.125, 0.0),
+    "gpt-5-mini":            (0.25,  2.0,  0.025, 0.0),
     "gpt-5-codex":           (1.25, 10.0,  0.125, 0.0),
     "gpt-5-chat-latest":     (1.25, 10.0,  0.125, 0.0),
     "gpt-5":                 (1.25, 10.0,  0.125, 0.0),
@@ -80,6 +83,8 @@ _BUILTIN_PRICING: dict[str, PriceTuple] = {
     "gpt-5.3-chat-latest":   (1.75, 14.0,  0.175, 0.0),
     "gpt-5.3":               (1.75, 14.0,  0.175, 0.0),
     # ── Google Gemini ──
+    "gemini-3.8-flash":      (0.75,  3.75, 0.075, 0.0),
+    "gemini-3.7-flash":      (0.75,  3.75, 0.075, 0.0),
     "gemini-3.6-flash":      (1.50,  7.50, 0.15, 0.0),
     "gemini-3.5-flash":      (1.50,  9.00, 0.15, 0.0),
     "gemini-3.1-pro":        (2.00, 12.00, 0.20, 0.0),
@@ -97,6 +102,7 @@ _MODEL_ALIASES: dict[str, str] = {
     "claude-4.5-opus-high-thinking": "claude-opus-4-5",
     "codex-auto-review": "gpt-5.3-codex",
     "gpt-5.6": "gpt-5.6-sol",
+    "gpt-6": "gpt-6-astra",
 }
 
 # Official premium prices for observable non-standard modes, keyed by mode →
@@ -118,6 +124,7 @@ _NON_STANDARD_MODE_PRICING: dict[str, dict[str, PriceTuple | None]] = {
     # OpenAI priority processing (Codex fast mode uses priority processing;
     # with an API key it bills at the priority token rate).
     "priority": {
+        "gpt-6-astra":   (20.0, 100.0, 2.0, 25.0),
         "gpt-5.6-sol":   (10.0, 60.0, 1.0,  12.5),
         "gpt-5.6-terra": (4.0,  24.0, 0.40,  5.0),
         "gpt-5.6-luna":  (0.40,  2.40, 0.04, 0.50),
@@ -159,12 +166,18 @@ _UNKNOWN_MODEL_PREFIXES = (
     "gpt-5-pro",
 )
 
-_PRICING_FINGERPRINT_VERSION = 18
+_PRICING_FINGERPRINT_VERSION = 19
 
 # Long-context pricing applies per request/prompt, not per stored hour/session.
 # Collectors pass single-event usage into ``estimate_cost`` before aggregating
 # buckets; aggregate-only callers get a best-effort fallback.
 _LONG_CONTEXT_RULES: list[dict[str, object]] = [
+    {
+        "prefixes": ("gpt-6-astra",),
+        "tiers": (
+            {"threshold": 272_000, "prices": (20.0, 75.0, 2.0, 25.0)},
+        ),
+    },
     {
         "prefixes": ("gpt-5.6-sol",),
         "tiers": (
@@ -243,6 +256,50 @@ def _matches_model_prefix(model: str, prefix: str) -> bool:
     return model == prefix or model.startswith(f"{prefix}-")
 
 
+_EFFORT_SUFFIX_RE = re.compile(r"-(?:none|minimal|low|medium|high|xhigh|ultra)$")
+_BEDROCK_SUFFIX_RE = re.compile(r"-v\d+:\d+$")
+_BEDROCK_PREFIX_RE = re.compile(r"^(?:[a-z0-9-]+\.)*anthropic\.")
+
+
+def _decompose_model_name(name: str) -> tuple[str, str]:
+    """Decompose external model name into (base_model, mode)."""
+    if not name:
+        return "", ""
+    mode = ""
+    clean = name.strip()
+    if "[fast]" in clean:
+        mode = "fast"
+        clean = clean.replace("[fast]", "")
+    elif clean.endswith("-fast"):
+        mode = "fast"
+        clean = clean[:-5]
+
+    # Strip any registry / gateway / platform namespace prefix ending with "/" (e.g. codex/..., cursor/...)
+    if "/" in clean:
+        clean = clean.split("/")[-1]
+
+    # Strip cloud vendor prefixes (e.g. anthropic., us.anthropic.)
+    clean = _BEDROCK_PREFIX_RE.sub("", clean)
+    clean = _BEDROCK_SUFFIX_RE.sub("", clean)
+    clean = _EFFORT_SUFFIX_RE.sub("", clean)
+    clean = _MODEL_ALIASES.get(clean, clean)
+    return clean, mode
+
+
+def _get_standard_pricing(model: str) -> PriceTuple | None:
+    if model in _NON_BILLABLE_MODELS:
+        return (0.0, 0.0, 0.0, 0.0)
+    user = _load_user_pricing()
+    if model in user:
+        return user[model]
+    if _matches_any_model_prefix(model, _UNKNOWN_MODEL_PREFIXES):
+        return None
+    for prefix, pricing in _SORTED_BUILTIN_PRICING:
+        if _matches_model_prefix(model, prefix):
+            return pricing
+    return None
+
+
 def _normalize_mode(mode: str) -> str:
     return (mode or "").strip().lower()
 
@@ -284,8 +341,9 @@ def _compute_non_standard_mode_prices(
     speed_mode: str,
     tier_mode: str,
 ) -> tuple[float, float, float, float] | None:
-    if get_pricing(model) is None or _matches_any_model_prefix(
-        model, _UNKNOWN_MODEL_PREFIXES
+    base_model = normalize_model(model)
+    if _get_standard_pricing(base_model) is None or _matches_any_model_prefix(
+        base_model, _UNKNOWN_MODEL_PREFIXES
     ):
         return None
 
@@ -301,7 +359,7 @@ def _compute_non_standard_mode_prices(
         if not table:
             continue
         for prefix, prices in sorted(table.items(), key=lambda x: len(x[0]), reverse=True):
-            if _matches_model_prefix(model, prefix):
+            if _matches_model_prefix(base_model, prefix):
                 return prices
     return None
 
@@ -670,7 +728,8 @@ def normalize_model(name: str) -> str:
     """Normalize external model names to our pricing keys."""
     if not name:
         return ""
-    return _MODEL_ALIASES.get(name, name)
+    base_model, _ = _decompose_model_name(name)
+    return base_model
 
 
 def get_pricing(model: str) -> tuple[float, float, float, float] | None:
@@ -680,7 +739,6 @@ def get_pricing(model: str) -> tuple[float, float, float, float] | None:
     matches its own entry before falling back to ``gpt-5.4``. Results are
     memoized per model because collectors price every usage event.
     """
-    model = normalize_model(model)
     _fresh_derived_caches()
     try:
         return _pricing_memo[model]
@@ -694,18 +752,27 @@ def _compute_pricing(model: str) -> tuple[float, float, float, float] | None:
     if model in _NON_BILLABLE_MODELS:
         return (0.0, 0.0, 0.0, 0.0)
 
-    # 1. User overrides (exact match only)
+    # 1. User overrides (exact match on input model first)
     user = _load_user_pricing()
     if model in user:
         return user[model]
 
-    if _matches_any_model_prefix(model, _UNKNOWN_MODEL_PREFIXES):
+    base_model, embedded_mode = _decompose_model_name(model)
+    if base_model in user:
+        return user[base_model]
+
+    if _matches_any_model_prefix(base_model, _UNKNOWN_MODEL_PREFIXES):
         return None
 
-    # 2. Builtin (prefix match — longest prefix first)
-    for prefix, pricing in _SORTED_BUILTIN_PRICING:
-        if _matches_model_prefix(model, prefix):
-            return pricing
+    if embedded_mode:
+        premium = _compute_non_standard_mode_prices(base_model, embedded_mode, embedded_mode)
+        if premium is not None:
+            return premium
+
+    # 2. Builtin (prefix match on base_model)
+    pricing = _get_standard_pricing(base_model)
+    if pricing is not None:
+        return pricing
 
     if model and model not in _warned_models:
         _warned_models.add(model)
@@ -932,10 +999,14 @@ def estimate_cost(
 
     cache_creation_1h_tokens = max(0, min(cache_creation_1h_tokens, cache_creation_tokens))
     cache_creation_5m_tokens = cache_creation_tokens - cache_creation_1h_tokens
-    pricing = _non_standard_mode_prices(model, service_tier, speed)
+
+    base_model, embedded_mode = _decompose_model_name(model)
+    effective_service_tier = service_tier or embedded_mode
+    effective_speed = speed or embedded_mode
+    pricing = _non_standard_mode_prices(base_model, effective_service_tier, effective_speed)
     if pricing is None and apply_long_context:
         pricing = _long_context_prices(
-            model,
+            base_model,
             input_tokens=input_tokens,
             cache_read_tokens=cache_read_tokens,
             cache_creation_tokens=cache_creation_tokens,
@@ -949,6 +1020,6 @@ def estimate_cost(
         + output_tokens * p_out
         + cache_read_tokens * p_cr
         + cache_creation_5m_tokens * p_cw
-        + cache_creation_1h_tokens * get_cache_write_1h_price(model, p_in)
+        + cache_creation_1h_tokens * get_cache_write_1h_price(base_model, p_in)
     ) / 1_000_000
     return cost

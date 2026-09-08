@@ -597,6 +597,60 @@ def test_estimate_cost_zero_usage_unknown_model_is_silent(caplog):
     assert "Unknown model" not in caplog.text
 
 
+def test_gpt_6_astra_pricing(tmp_path):
+    with _patch_empty_user_pricing(tmp_path):
+        assert get_pricing("gpt-6-astra") == (10.0, 50.0, 1.00, 12.50)
+        assert get_pricing("gpt-6") == (10.0, 50.0, 1.00, 12.50)
+
+        # Priority mode doubles base token prices
+        assert get_pricing("codex/gpt-6-astra[fast]") == (20.0, 100.0, 2.0, 25.0)
+
+        # Long context tier (>272k)
+        cost_normal = estimate_cost("gpt-6-astra", input_tokens=100_000, output_tokens=10_000)
+        assert abs(cost_normal - (100_000 * 10.0 + 10_000 * 50.0) / 1_000_000) < 1e-9
+
+        cost_long = estimate_cost("gpt-6-astra", input_tokens=300_000, output_tokens=10_000)
+        assert abs(cost_long - (300_000 * 20.0 + 10_000 * 75.0) / 1_000_000) < 1e-9
+
+
+def test_gemini_37_and_38_flash_pricing(tmp_path):
+    with _patch_empty_user_pricing(tmp_path):
+        assert get_pricing("gemini-3.7-flash") == (0.75, 3.75, 0.075, 0.0)
+        assert get_pricing("gemini-3.8-flash") == (0.75, 3.75, 0.075, 0.0)
+
+
+def test_gpt_5_mini_pricing(tmp_path):
+    with _patch_empty_user_pricing(tmp_path):
+        assert get_pricing("gpt-5-mini") == (0.25, 2.0, 0.025, 0.0)
+        assert get_pricing("cursor/gpt-5-mini-medium") == (0.25, 2.0, 0.025, 0.0)
+
+
+def test_wrapped_model_decomposition(tmp_path):
+    with _patch_empty_user_pricing(tmp_path):
+        # Prefixes and effort suffixes
+        assert get_pricing("cursor/claude-sonnet-5-high") == (3.0, 15.0, 0.30, 3.75)
+        assert get_pricing("cursor/claude-opus-5-medium") == (5.0, 25.0, 0.50, 6.25)
+        assert get_pricing("cursor/gemini-3-flash-high") == (0.50, 3.00, 0.05, 0.0)
+        assert get_pricing("openrouter/openai/gpt-5.6-sol") == (5.0, 30.0, 0.50, 6.25)
+        assert get_pricing("my-proxy/gemini-3.8-flash") == (0.75, 3.75, 0.075, 0.0)
+
+        # Bedrock prefix and version suffix
+        assert get_pricing("anthropic.claude-haiku-4-5-20251001-v1:0") == (1.0, 5.0, 0.10, 1.25)
+        assert get_pricing("us.anthropic.claude-sonnet-4-6-v1:0") == (3.0, 15.0, 0.30, 3.75)
+        assert get_pricing("anthropic/claude-opus-5") == (5.0, 25.0, 0.50, 6.25)
+
+        # Fast mode markers on wrapped models
+        assert get_pricing("codex/gpt-5.6-sol[fast]") == (10.0, 60.0, 1.0, 12.5)
+        assert get_pricing("cursor/gpt-5.6-sol-high-fast") == (10.0, 60.0, 1.0, 12.5)
+        assert get_pricing("cursor/gpt-5.6-terra-high-fast") == (4.0, 24.0, 0.40, 5.0)
+
+        # Non-supported / unknown models remain None
+        assert get_pricing("cursor/cursor-grok-4.6-xhigh-fast") is None
+        assert get_pricing("cursor/default") is None
+        assert get_pricing("600a22_256k_new_sft_0803_glm_agent_w_sp_mtp3_lr_2e-5_agentic_test_id_parser") is None
+
+
+
 def test_synthetic_model_is_non_billable(caplog):
     import agentic_metric.pricing as p
 

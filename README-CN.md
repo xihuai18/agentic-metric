@@ -196,6 +196,7 @@ agentic-metric pricing cache reset claude-sonnet-4                # 删除覆盖
 | 模型 | Input | Output | Cache Read | Cache Write |
 |------|------:|-------:|-----------:|------------:|
 <!-- pricing:openai:start -->
+| gpt-6-astra | $10.00 | $50.00 | $1.00 | $12.50 |
 | gpt-5.6-sol | $5.00 | $30.00 | $0.50 | $6.25 |
 | gpt-5.6-terra | $2.00 | $12.00 | $0.20 | $2.50 |
 | gpt-5.6-luna | $0.20 | $1.20 | $0.02 | $0.25 |
@@ -205,6 +206,7 @@ agentic-metric pricing cache reset claude-sonnet-4                # 删除覆盖
 | gpt-5.4 | $2.50 | $15.00 | $0.25 | — |
 | gpt-5.2-codex / gpt-5.2-chat-latest / gpt-5.2 / gpt-5.3-codex / gpt-5.3-chat-latest / gpt-5.3 | $1.75 | $14.00 | $0.175 | — |
 | gpt-5.1-codex-max / gpt-5.1-codex / gpt-5.1-chat-latest / gpt-5.1 / gpt-5-codex / gpt-5-chat-latest / gpt-5 | $1.25 | $10.00 | $0.125 | — |
+| gpt-5-mini | $0.25 | $2.00 | $0.025 | — |
 <!-- pricing:openai:end -->
 
 </details>
@@ -215,6 +217,7 @@ agentic-metric pricing cache reset claude-sonnet-4                # 删除覆盖
 | 模型 | Input | Output | Cache Read | Cache Write |
 |------|------:|-------:|-----------:|------------:|
 <!-- pricing:gemini:start -->
+| gemini-3.8-flash / gemini-3.7-flash | $0.75 | $3.75 | $0.075 | — |
 | gemini-3.6-flash | $1.50 | $7.50 | $0.15 | — |
 | gemini-3.5-flash | $1.50 | $9.00 | $0.15 | — |
 | gemini-3.1-pro / gemini-3-pro | $2.00 | $12.00 | $0.20 | — |
