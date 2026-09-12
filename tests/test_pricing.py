@@ -645,10 +645,35 @@ def test_wrapped_model_decomposition(tmp_path):
         assert get_pricing("cursor/gpt-5.6-terra-high-fast") == (4.0, 24.0, 0.40, 5.0)
 
         # Non-supported / unknown models remain None
-        assert get_pricing("cursor/cursor-grok-4.6-xhigh-fast") is None
         assert get_pricing("cursor/default") is None
         assert get_pricing("600a22_256k_new_sft_0803_glm_agent_w_sp_mtp3_lr_2e-5_agentic_test_id_parser") is None
 
+        # Cursor-wrapped Grok resolves via alias
+        assert get_pricing("cursor/cursor-grok-4.6-xhigh-fast") == (2.0, 6.0, 0.5, 0.0)
+        assert get_pricing("cursor/cursor-grok-4.6-high") == (2.0, 6.0, 0.5, 0.0)
+        assert get_pricing("grok-4.6") == (2.0, 6.0, 0.5, 0.0)
+
+
+def test_model_name_normalization_ignores_case_and_separators(tmp_path):
+    with _patch_empty_user_pricing(tmp_path):
+        grok = (2.0, 6.0, 0.5, 0.0)
+        assert get_pricing("GROK_4_6") == grok
+        assert get_pricing("grok-4-6") == grok
+        assert get_pricing("grok.4_6") == grok
+        assert get_pricing("cursor/cursor_grok_4_6_xhigh_fast") == grok
+        assert get_pricing("cursor.cursor-grok-4.6-high") == grok
+        assert get_pricing("grok-4.6:latest") == grok
+        assert get_pricing("openrouter.openai/GPT_5_6_SOL") == (5.0, 30.0, 0.5, 6.25)
+        assert get_pricing("gpt.5.6.sol") == (5.0, 30.0, 0.5, 6.25)
+        assert get_pricing("cursor/GPT_6_MAX") == (10.0, 50.0, 1.0, 12.5)
+        assert get_pricing("codex/gpt_5_6_sol_fast_20260912") == (10.0, 60.0, 1.0, 12.5)
+
+
+def test_model_name_normalization_respects_token_boundaries(tmp_path):
+    with _patch_empty_user_pricing(tmp_path):
+        assert get_pricing("notgrok-4.6") is None
+        assert get_pricing("GPT_5_4_PRO") is None
+        assert get_pricing("other-gpt-5.4-pro-preview") is None
 
 
 def test_synthetic_model_is_non_billable(caplog):

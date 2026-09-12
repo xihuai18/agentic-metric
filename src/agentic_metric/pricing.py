@@ -23,13 +23,15 @@ PriceTuple = tuple[float, float, float, float]
 # 2026-07-01, Claude Opus 4.8 verified against Anthropic's
 # 2026-05-28 launch note, Claude Opus 5 verified against Anthropic's
 # pricing docs on 2026-07-28, and Gemini 3.5 Flash verified against
-# Google AI Dev pricing on 2026-06-05 (Gemini 3.6 Flash on 2026-07-28):
+# Google AI Dev pricing on 2026-06-05 (Gemini 3.6 Flash on 2026-07-28),
+# and Grok 4.6 verified against xAI pricing docs on 2026-09-12:
 #   https://developers.openai.com/api/docs/pricing/
 #   https://developers.openai.com/api/docs/models/gpt-5.6-sol/
 #   https://developers.openai.com/api/docs/models/gpt-5.6-terra/
 #   https://developers.openai.com/api/docs/models/gpt-5.6-luna/
 #   https://platform.claude.com/docs/en/docs/about-claude/pricing
 #   https://ai.google.dev/gemini-api/docs/pricing
+#   https://docs.x.ai/developers/pricing
 # Cache-write uses the 5-minute rate for Anthropic unless a collector observes
 # a different cache duration. Costs are always API list prices: gateway-reported
 # per-request costs in session logs (possible vendor discounts) are ignored.
@@ -82,6 +84,8 @@ _BUILTIN_PRICING: dict[str, PriceTuple] = {
     "gpt-5.3-codex":         (1.75, 14.0,  0.175, 0.0),
     "gpt-5.3-chat-latest":   (1.75, 14.0,  0.175, 0.0),
     "gpt-5.3":               (1.75, 14.0,  0.175, 0.0),
+    # ── xAI Grok ──
+    "grok-4.6":              (2.0,   6.0,  0.50, 0.0),
     # ── Google Gemini ──
     "gemini-3.8-flash":      (0.75,  3.75, 0.075, 0.0),
     "gemini-3.7-flash":      (0.75,  3.75, 0.075, 0.0),
@@ -100,6 +104,7 @@ _BUILTIN_PRICING: dict[str, PriceTuple] = {
 _MODEL_ALIASES: dict[str, str] = {
     "claude-4.5-sonnet-thinking": "claude-sonnet-4-5",
     "claude-4.5-opus-high-thinking": "claude-opus-4-5",
+    "claude-fable-5-1": "claude-fable-5",
     "codex-auto-review": "gpt-5.3-codex",
     "gpt-5.6": "gpt-5.6-sol",
     "gpt-6": "gpt-6-astra",
@@ -166,7 +171,7 @@ _UNKNOWN_MODEL_PREFIXES = (
     "gpt-5-pro",
 )
 
-_PRICING_FINGERPRINT_VERSION = 19
+_PRICING_FINGERPRINT_VERSION = 20
 
 # Long-context pricing applies per request/prompt, not per stored hour/session.
 # Collectors pass single-event usage into ``estimate_cost`` before aggregating
@@ -207,6 +212,12 @@ _LONG_CONTEXT_RULES: list[dict[str, object]] = [
         "excluded_prefixes": ("gpt-5.4-mini", "gpt-5.4-nano"),
         "tiers": (
             {"threshold": 272_000, "prices": (5.0, 22.5, 0.50, 0.0)},
+        ),
+    },
+    {
+        "prefixes": ("grok-4.6",),
+        "tiers": (
+            {"threshold": 200_000, "prices": (4.0, 12.0, 1.0, 0.0)},
         ),
     },
     {
@@ -252,37 +263,79 @@ def _matched_tier_prices(total_input_tokens: int, tiers: list[dict[str, object]]
 
 
 def _matches_model_prefix(model: str, prefix: str) -> bool:
-    """Return True for an exact model id or a dated/preview variant."""
-    return model == prefix or model.startswith(f"{prefix}-")
+    """Return True when model starts with the complete prefix token sequence."""
+    model_tokens = _model_tokens(model)
+    prefix_tokens = _model_tokens(prefix)
+    return model_tokens[:len(prefix_tokens)] == prefix_tokens
 
 
-_EFFORT_SUFFIX_RE = re.compile(r"-(?:none|minimal|low|medium|high|xhigh|ultra)$")
-_BEDROCK_SUFFIX_RE = re.compile(r"-v\d+:\d+$")
-_BEDROCK_PREFIX_RE = re.compile(r"^(?:[a-z0-9-]+\.)*anthropic\.")
+def _matches_priced_model_tokens(
+    tokens: tuple[str, ...], candidate: tuple[str, ...], start: int = 0
+) -> bool:
+    end = start + len(candidate)
+    if tokens[start:end] != candidate:
+        return False
+    if end == len(tokens):
+        return True
+    suffix = tokens[end]
+    return not suffix.isdecimal() or len(suffix) == 8
+
+
+_MODEL_TOKEN_RE = re.compile(r"[-_./:]+")
+_TRAILING_MODE_OR_EFFORT_RE = re.compile(
+    r"(?:[-_.]+)(fast|none|minimal|low|medium|high|xhigh|ultra|max)$"
+)
+_TRAILING_DATE_OR_VERSION_RE = re.compile(r"(?:[-_.]+)(?:\d{8}|v\d+(?::\d+)?)$")
+_BRACKET_FAST_RE = re.compile(r"\[fast\]")
+
+
+def _model_tokens(name: str) -> tuple[str, ...]:
+    return tuple(token for token in _MODEL_TOKEN_RE.split(name.lower()) if token)
+
+
+def _contains_model_tokens(
+    tokens: tuple[str, ...], candidate: tuple[str, ...]
+) -> bool:
+    return any(
+        _matches_priced_model_tokens(tokens, candidate, index)
+        for index in range(len(tokens) - len(candidate) + 1)
+    )
 
 
 def _decompose_model_name(name: str) -> tuple[str, str]:
-    """Decompose external model name into (base_model, mode)."""
+    """Decompose external model name into a registered base model and mode."""
     if not name:
         return "", ""
+
     mode = ""
-    clean = name.strip()
-    if "[fast]" in clean:
-        mode = "fast"
-        clean = clean.replace("[fast]", "")
-    elif clean.endswith("-fast"):
-        mode = "fast"
-        clean = clean[:-5]
+    clean = name.strip().lower()
+    while True:
+        if _BRACKET_FAST_RE.search(clean):
+            mode = "fast"
+            clean = _BRACKET_FAST_RE.sub("", clean)
+            continue
+        match = _TRAILING_MODE_OR_EFFORT_RE.search(clean)
+        if match:
+            if match.group(1) == "fast":
+                mode = "fast"
+            clean = clean[:match.start()]
+            continue
+        match = _TRAILING_DATE_OR_VERSION_RE.search(clean)
+        if not match:
+            break
+        clean = clean[:match.start()]
 
-    # Strip any registry / gateway / platform namespace prefix ending with "/" (e.g. codex/..., cursor/...)
-    if "/" in clean:
-        clean = clean.split("/")[-1]
+    tokens = _model_tokens(clean)
+    for candidate, model in _SORTED_UNKNOWN_MODEL_TOKENS:
+        if _contains_model_tokens(tokens, candidate):
+            return model, mode
+    for candidate, target in _SORTED_ALIAS_TOKENS:
+        if tokens[-len(candidate):] == candidate:
+            return target, mode
+    for candidate, model in _SORTED_BUILTIN_MODEL_TOKENS:
+        if _contains_model_tokens(tokens, candidate):
+            return model, mode
 
-    # Strip cloud vendor prefixes (e.g. anthropic., us.anthropic.)
-    clean = _BEDROCK_PREFIX_RE.sub("", clean)
-    clean = _BEDROCK_SUFFIX_RE.sub("", clean)
-    clean = _EFFORT_SUFFIX_RE.sub("", clean)
-    clean = _MODEL_ALIASES.get(clean, clean)
     return clean, mode
 
 
@@ -294,8 +347,9 @@ def _get_standard_pricing(model: str) -> PriceTuple | None:
         return user[model]
     if _matches_any_model_prefix(model, _UNKNOWN_MODEL_PREFIXES):
         return None
+    model_tokens = _model_tokens(model)
     for prefix, pricing in _SORTED_BUILTIN_PRICING:
-        if _matches_model_prefix(model, prefix):
+        if _matches_priced_model_tokens(model_tokens, _model_tokens(prefix)):
             return pricing
     return None
 
@@ -388,6 +442,27 @@ _cache_rule_memo: dict[str, dict[str, float] | None] = {}
 # Builtin prefixes are static, so order them once instead of per lookup.
 _SORTED_BUILTIN_PRICING: tuple[tuple[str, PriceTuple], ...] = tuple(
     sorted(_BUILTIN_PRICING.items(), key=lambda item: len(item[0]), reverse=True)
+)
+_SORTED_BUILTIN_MODEL_TOKENS: tuple[tuple[tuple[str, ...], str], ...] = tuple(
+    sorted(
+        ((_model_tokens(model), model) for model in _BUILTIN_PRICING),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    )
+)
+_SORTED_UNKNOWN_MODEL_TOKENS: tuple[tuple[tuple[str, ...], str], ...] = tuple(
+    sorted(
+        ((_model_tokens(model), model) for model in _UNKNOWN_MODEL_PREFIXES),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    )
+)
+_SORTED_ALIAS_TOKENS: tuple[tuple[tuple[str, ...], str], ...] = tuple(
+    sorted(
+        ((_model_tokens(alias), target) for alias, target in _MODEL_ALIASES.items()),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    )
 )
 
 
