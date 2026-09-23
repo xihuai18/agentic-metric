@@ -21,6 +21,7 @@ README_FILES = [REPO_ROOT / "README.md", REPO_ROOT / "README-CN.md"]
 _VENDORS = [
     ("anthropic", "claude-"),
     ("openai", "gpt-"),
+    ("grok", "grok-"),
     ("gemini", "gemini-"),
 ]
 

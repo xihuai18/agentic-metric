@@ -68,10 +68,18 @@ def test_claude_fable_5_pricing(tmp_path):
         assert get_pricing("claude-fable-5-20260609") == (10.0, 50.0, 1.00, 12.50)
 
 
+def test_claude_fable_5_1_has_its_own_cache_read_price(tmp_path):
+    with _patch_empty_user_pricing(tmp_path):
+        assert get_pricing("claude-fable-5-1") == (10.0, 50.0, 0.25, 12.50)
+        assert get_pricing("claude-fable-5-1-20260901") == (10.0, 50.0, 0.25, 12.50)
+        assert estimate_cost("claude-fable-5-1", cache_read_tokens=1_000_000) == 0.25
+        assert estimate_cost("claude-fable-5", cache_read_tokens=1_000_000) == 1.0
+
+
 def test_claude_sonnet_5_pricing(tmp_path):
     with _patch_empty_user_pricing(tmp_path):
-        assert get_pricing("claude-sonnet-5") == (3.0, 15.0, 0.30, 3.75)
-        assert get_pricing("claude-sonnet-5-20260701") == (3.0, 15.0, 0.30, 3.75)
+        assert get_pricing("claude-sonnet-5") == (2.0, 10.0, 0.20, 2.50)
+        assert get_pricing("claude-sonnet-5-20260701") == (2.0, 10.0, 0.20, 2.50)
 
 
 def test_claude_opus_5_pricing(tmp_path):
@@ -627,8 +635,17 @@ def test_new_model_pricing(tmp_path):
 
 def test_gemini_37_and_38_flash_pricing(tmp_path):
     with _patch_empty_user_pricing(tmp_path):
-        assert get_pricing("gemini-3.7-flash") == (0.75, 3.75, 0.075, 0.0)
-        assert get_pricing("gemini-3.8-flash") == (0.75, 3.75, 0.075, 0.0)
+        assert get_pricing("gemini-3.7-flash") == (1.50, 7.50, 0.15, 0.0)
+        assert get_pricing("gemini-3.8-flash") == (1.50, 7.50, 0.15, 0.0)
+
+
+def test_grok_45_and_47_standard_prices(tmp_path):
+    with _patch_empty_user_pricing(tmp_path):
+        assert get_pricing("custom/xyai-grokcli/grok-4.5") == (2.0, 6.0, 0.30, 0.0)
+        assert get_pricing("cursor/grok-4.7") == (2.0, 6.0, 0.50, 0.0)
+        assert get_pricing("cursor/grok-4.7[fast]") == (4.0, 12.0, 1.0, 0.0)
+        assert estimate_cost("grok-4.5", input_tokens=200_001) == 200_001 * 4 / 1_000_000
+        assert estimate_cost("grok-4.7", input_tokens=200_001) == 200_001 * 4 / 1_000_000
 
 
 def test_gpt_5_mini_pricing(tmp_path):
@@ -640,11 +657,11 @@ def test_gpt_5_mini_pricing(tmp_path):
 def test_wrapped_model_decomposition(tmp_path):
     with _patch_empty_user_pricing(tmp_path):
         # Prefixes and effort suffixes
-        assert get_pricing("cursor/claude-sonnet-5-high") == (3.0, 15.0, 0.30, 3.75)
+        assert get_pricing("cursor/claude-sonnet-5-high") == (2.0, 10.0, 0.20, 2.50)
         assert get_pricing("cursor/claude-opus-5-medium") == (5.0, 25.0, 0.50, 6.25)
         assert get_pricing("cursor/gemini-3-flash-high") == (0.50, 3.00, 0.05, 0.0)
         assert get_pricing("openrouter/openai/gpt-5.6-sol") == (5.0, 30.0, 0.50, 6.25)
-        assert get_pricing("my-proxy/gemini-3.8-flash") == (0.75, 3.75, 0.075, 0.0)
+        assert get_pricing("my-proxy/gemini-3.8-flash") == (1.50, 7.50, 0.15, 0.0)
 
         # Bedrock prefix and version suffix
         assert get_pricing("anthropic.claude-haiku-4-5-20251001-v1:0") == (1.0, 5.0, 0.10, 1.25)

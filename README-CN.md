@@ -172,6 +172,7 @@ agentic-metric pricing cache reset claude-sonnet-4                # 删除覆盖
 ## 内置模型定价
 
 价格为 USD / 1M tokens。数据来源为官方定价页面(2026-04-25 核实；Claude Fable 5 于 2026-06-12 核实；Claude Opus 4.8 于 2026-06-02 核实；Claude Opus 5 于 2026-07-28 核实；GPT-5.6 于 2026-07-31 核实,已包含 OpenAI 2026-07-30 的降价；GPT-6 Sol/Luna 和 Claude Opus 5.5 于 2026-09-23 核实)。
+表中采用公布的常规价格，不计入限时优惠。
 
 <details>
 <summary>Anthropic Claude</summary>
@@ -179,11 +180,13 @@ agentic-metric pricing cache reset claude-sonnet-4                # 删除覆盖
 | 模型 | Input | Output | Cache Read | Cache Write |
 |------|------:|-------:|-----------:|------------:|
 <!-- pricing:anthropic:start -->
+| claude-fable-5-1 | $10.00 | $50.00 | $0.25 | $12.50 |
 | claude-fable-5 | $10.00 | $50.00 | $1.00 | $12.50 |
-| claude-sonnet-5 / claude-sonnet-4-6 / claude-sonnet-4-5 / claude-sonnet-4 / claude-sonnet-3-7 / claude-3-7-sonnet / claude-3-5-sonnet | $3.00 | $15.00 | $0.30 | $3.75 |
+| claude-sonnet-5 | $2.00 | $10.00 | $0.20 | $2.50 |
 | claude-opus-5-5 | $4.00 | $20.00 | $0.20 | $5.00 |
 | claude-opus-5 / claude-opus-4-8 / claude-opus-4-7 / claude-opus-4-6 / claude-opus-4-5 | $5.00 | $25.00 | $0.50 | $6.25 |
 | claude-opus-4-1 / claude-opus-4 / claude-3-opus | $15.00 | $75.00 | $1.50 | $18.75 |
+| claude-sonnet-4-6 / claude-sonnet-4-5 / claude-sonnet-4 / claude-sonnet-3-7 / claude-3-7-sonnet / claude-3-5-sonnet | $3.00 | $15.00 | $0.30 | $3.75 |
 | claude-haiku-4-5 | $1.00 | $5.00 | $0.10 | $1.25 |
 | claude-haiku-3-5 / claude-3-5-haiku | $0.80 | $4.00 | $0.08 | $1.00 |
 | claude-3-haiku | $0.25 | $1.25 | $0.03 | $0.30 |
@@ -215,13 +218,24 @@ agentic-metric pricing cache reset claude-sonnet-4                # 删除覆盖
 </details>
 
 <details>
+<summary>xAI Grok</summary>
+
+| 模型 | Input | Output | Cache Read | Cache Write |
+|------|------:|-------:|-----------:|------------:|
+<!-- pricing:grok:start -->
+| grok-4.7 / grok-4.6 | $2.00 | $6.00 | $0.50 | — |
+| grok-4.5 | $2.00 | $6.00 | $0.30 | — |
+<!-- pricing:grok:end -->
+
+</details>
+
+<details>
 <summary>Google Gemini</summary>
 
 | 模型 | Input | Output | Cache Read | Cache Write |
 |------|------:|-------:|-----------:|------------:|
 <!-- pricing:gemini:start -->
-| gemini-3.8-flash / gemini-3.7-flash | $0.75 | $3.75 | $0.075 | — |
-| gemini-3.6-flash | $1.50 | $7.50 | $0.15 | — |
+| gemini-3.8-flash / gemini-3.7-flash / gemini-3.6-flash | $1.50 | $7.50 | $0.15 | — |
 | gemini-3.5-flash | $1.50 | $9.00 | $0.15 | — |
 | gemini-3.1-pro / gemini-3-pro | $2.00 | $12.00 | $0.20 | — |
 | gemini-3.1-flash-lite | $0.25 | $1.50 | $0.025 | — |

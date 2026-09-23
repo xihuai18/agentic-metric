@@ -26,10 +26,17 @@ PriceTuple = tuple[float, float, float, float]
 # Google AI Dev pricing on 2026-06-05 (Gemini 3.6 Flash on 2026-07-28),
 # Grok 4.6 verified against xAI pricing docs on 2026-09-12, and GPT-6 Sol,
 # GPT-6 Luna, and Claude Opus 5.5 verified on 2026-09-23:
+# Claude Fable 5.1's distinct $0.25/MTok cache-read rate and Sonnet 5's
+# permanent $2/$10 standard rate were rechecked on 2026-09-23. GPT-5.6 Sol
+# retains its $5/$30 regular rate; the current $4/$20 rate is promotional.
+# Gemini 3.7/3.8 Flash use their published post-introductory standard rates;
+# Grok 4.5/4.7 use xAI's standard text rates, checked on 2026-09-23.
 #   https://developers.openai.com/api/docs/pricing/
 #   https://developers.openai.com/api/docs/models/gpt-6-sol/
 #   https://developers.openai.com/api/docs/models/gpt-6-luna/
 #   https://platform.claude.com/docs/en/models/opus-5-5/overview
+#   https://platform.claude.com/docs/en/models/fable-5-1/overview
+#   https://platform.claude.com/docs/en/models/sonnet-5/overview
 #   https://developers.openai.com/api/docs/models/gpt-5.6-sol/
 #   https://developers.openai.com/api/docs/models/gpt-5.6-terra/
 #   https://developers.openai.com/api/docs/models/gpt-5.6-luna/
@@ -45,8 +52,9 @@ PriceTuple = tuple[float, float, float, float]
 # ``usage.speed``); unmarked history stays at standard rates.
 _BUILTIN_PRICING: dict[str, PriceTuple] = {
     # ── Anthropic Claude ──
+    "claude-fable-5-1":      (10.0, 50.0, 0.25, 12.50),
     "claude-fable-5":        (10.0, 50.0, 1.00, 12.50),
-    "claude-sonnet-5":       (3.0,  15.0, 0.30,  3.75),
+    "claude-sonnet-5":       (2.0,  10.0, 0.20,  2.50),
     "claude-opus-5-5":       (4.0,  20.0, 0.20,  5.0),
     "claude-opus-5":         (5.0,  25.0, 0.50,  6.25),
     "claude-opus-4-8":       (5.0,  25.0, 0.50,  6.25),
@@ -92,10 +100,12 @@ _BUILTIN_PRICING: dict[str, PriceTuple] = {
     "gpt-5.3-chat-latest":   (1.75, 14.0,  0.175, 0.0),
     "gpt-5.3":               (1.75, 14.0,  0.175, 0.0),
     # ── xAI Grok ──
+    "grok-4.7":              (2.0,   6.0,  0.50, 0.0),
     "grok-4.6":              (2.0,   6.0,  0.50, 0.0),
+    "grok-4.5":              (2.0,   6.0,  0.30, 0.0),
     # ── Google Gemini ──
-    "gemini-3.8-flash":      (0.75,  3.75, 0.075, 0.0),
-    "gemini-3.7-flash":      (0.75,  3.75, 0.075, 0.0),
+    "gemini-3.8-flash":      (1.50,  7.50, 0.15, 0.0),
+    "gemini-3.7-flash":      (1.50,  7.50, 0.15, 0.0),
     "gemini-3.6-flash":      (1.50,  7.50, 0.15, 0.0),
     "gemini-3.5-flash":      (1.50,  9.00, 0.15, 0.0),
     "gemini-3.1-pro":        (2.00, 12.00, 0.20, 0.0),
@@ -111,7 +121,6 @@ _BUILTIN_PRICING: dict[str, PriceTuple] = {
 _MODEL_ALIASES: dict[str, str] = {
     "claude-4.5-sonnet-thinking": "claude-sonnet-4-5",
     "claude-4.5-opus-high-thinking": "claude-opus-4-5",
-    "claude-fable-5-1": "claude-fable-5",
     "codex-auto-review": "gpt-5.3-codex",
     "gpt-5.6": "gpt-5.6-sol",
     "gpt-6": "gpt-6-astra",
@@ -134,8 +143,8 @@ _MODEL_ALIASES: dict[str, str] = {
 #   https://developers.openai.com/api/docs/guides/priority-processing
 #   https://platform.claude.com/docs/en/build-with-claude/fast-mode
 _NON_STANDARD_MODE_PRICING: dict[str, dict[str, PriceTuple | None]] = {
-    # OpenAI priority processing (Codex fast mode uses priority processing;
-    # with an API key it bills at the priority token rate).
+    # OpenAI priority processing (Codex fast mode with an API key) and Grok
+    # 4.7 Fast, which Cursor bills at twice xAI's standard token rates.
     "priority": {
         "gpt-6-astra":   (20.0, 100.0, 2.0, 25.0),
         "gpt-6-sol":     (4.0,  20.0, 0.40, 5.0),
@@ -148,6 +157,7 @@ _NON_STANDARD_MODE_PRICING: dict[str, dict[str, PriceTuple | None]] = {
         "gpt-5.4-nano":  None,
         "gpt-5.4":       (5.0,  30.0, 0.50,  0.0),
         "gpt-5.3-codex": (3.50, 28.0, 0.35,  0.0),
+        "grok-4.7":     (4.0,  12.0, 1.0,   0.0),
     },
     # Anthropic fast mode (research preview); cache multipliers stack on the
     # fast base input price, so cache_read = 0.1x and cache_write = 1.25x.
@@ -234,10 +244,14 @@ _LONG_CONTEXT_RULES: list[dict[str, object]] = [
         ),
     },
     {
-        "prefixes": ("grok-4.6",),
+        "prefixes": ("grok-4.7", "grok-4.6"),
         "tiers": (
             {"threshold": 200_000, "prices": (4.0, 12.0, 1.0, 0.0)},
         ),
+    },
+    {
+        "prefixes": ("grok-4.5",),
+        "tiers": ({"threshold": 200_000, "prices": (4.0, 12.0, 0.60, 0.0)},),
     },
     {
         "prefixes": ("gemini-3.1-pro",),
@@ -367,8 +381,8 @@ def _get_standard_pricing(model: str) -> PriceTuple | None:
     if _matches_any_model_prefix(model, _UNKNOWN_MODEL_PREFIXES):
         return None
     model_tokens = _model_tokens(model)
-    for prefix, pricing in _SORTED_BUILTIN_PRICING:
-        if _matches_priced_model_tokens(model_tokens, _model_tokens(prefix)):
+    for prefix_tokens, pricing in _SORTED_BUILTIN_PRICING_TOKENS:
+        if _matches_priced_model_tokens(model_tokens, prefix_tokens):
             return pricing
     return None
 
@@ -458,9 +472,12 @@ _mode_price_memo: dict[tuple[str, str, str], PriceTuple | None] = {}
 _long_context_memo: dict[str, tuple[tuple[bool, tuple[tuple[int, PriceTuple], ...]], ...]] = {}
 _cache_rule_memo: dict[str, dict[str, float] | None] = {}
 
-# Builtin prefixes are static, so order them once instead of per lookup.
-_SORTED_BUILTIN_PRICING: tuple[tuple[str, PriceTuple], ...] = tuple(
-    sorted(_BUILTIN_PRICING.items(), key=lambda item: len(item[0]), reverse=True)
+# Builtin prefixes are static, so order and tokenize them once.
+_SORTED_BUILTIN_PRICING_TOKENS: tuple[tuple[tuple[str, ...], PriceTuple], ...] = tuple(
+    (_model_tokens(model), prices)
+    for model, prices in sorted(
+        _BUILTIN_PRICING.items(), key=lambda item: len(item[0]), reverse=True
+    )
 )
 _SORTED_BUILTIN_MODEL_TOKENS: tuple[tuple[tuple[str, ...], str], ...] = tuple(
     sorted(
