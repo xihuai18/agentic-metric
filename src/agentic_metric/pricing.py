@@ -24,8 +24,12 @@ PriceTuple = tuple[float, float, float, float]
 # 2026-05-28 launch note, Claude Opus 5 verified against Anthropic's
 # pricing docs on 2026-07-28, and Gemini 3.5 Flash verified against
 # Google AI Dev pricing on 2026-06-05 (Gemini 3.6 Flash on 2026-07-28),
-# and Grok 4.6 verified against xAI pricing docs on 2026-09-12:
+# Grok 4.6 verified against xAI pricing docs on 2026-09-12, and GPT-6 Sol,
+# GPT-6 Luna, and Claude Opus 5.5 verified on 2026-09-23:
 #   https://developers.openai.com/api/docs/pricing/
+#   https://developers.openai.com/api/docs/models/gpt-6-sol/
+#   https://developers.openai.com/api/docs/models/gpt-6-luna/
+#   https://platform.claude.com/docs/en/models/opus-5-5/overview
 #   https://developers.openai.com/api/docs/models/gpt-5.6-sol/
 #   https://developers.openai.com/api/docs/models/gpt-5.6-terra/
 #   https://developers.openai.com/api/docs/models/gpt-5.6-luna/
@@ -43,6 +47,7 @@ _BUILTIN_PRICING: dict[str, PriceTuple] = {
     # ── Anthropic Claude ──
     "claude-fable-5":        (10.0, 50.0, 1.00, 12.50),
     "claude-sonnet-5":       (3.0,  15.0, 0.30,  3.75),
+    "claude-opus-5-5":       (4.0,  20.0, 0.20,  5.0),
     "claude-opus-5":         (5.0,  25.0, 0.50,  6.25),
     "claude-opus-4-8":       (5.0,  25.0, 0.50,  6.25),
     "claude-opus-4-7":       (5.0,  25.0, 0.50,  6.25),
@@ -63,6 +68,8 @@ _BUILTIN_PRICING: dict[str, PriceTuple] = {
     "claude-3-haiku":        (0.25, 1.25, 0.03,  0.30),
     # ── OpenAI ──
     "gpt-6-astra":           (10.0, 50.0,  1.00, 12.50),
+    "gpt-6-sol":             (2.0,  10.0,  0.20,  2.50),
+    "gpt-6-luna":            (0.10, 0.50,  0.01,  0.125),
     "gpt-5.6-sol":           (5.0,  30.0,  0.50,  6.25),
     "gpt-5.6-terra":         (2.0,  12.0,  0.20,  2.50),
     "gpt-5.6-luna":          (0.20,  1.20, 0.02,  0.25),
@@ -121,7 +128,8 @@ _MODEL_ALIASES: dict[str, str] = {
 # 2026-07-21, with Claude Opus 5 fast mode verified on 2026-07-28 and the
 # GPT-5.6 premium rates re-verified on 2026-07-31 (OpenAI renamed priority
 # processing to fast mode on 2026-07-30; both ``service_tier`` values remain
-# valid, and the premium stays 2x the standard rate):
+# valid, and the premium stays 2x the standard rate), with GPT-6 Sol/Luna
+# and Claude Opus 5.5 premium rates verified on 2026-09-23:
 #   https://developers.openai.com/api/docs/pricing/
 #   https://developers.openai.com/api/docs/guides/priority-processing
 #   https://platform.claude.com/docs/en/build-with-claude/fast-mode
@@ -130,6 +138,8 @@ _NON_STANDARD_MODE_PRICING: dict[str, dict[str, PriceTuple | None]] = {
     # with an API key it bills at the priority token rate).
     "priority": {
         "gpt-6-astra":   (20.0, 100.0, 2.0, 25.0),
+        "gpt-6-sol":     (4.0,  20.0, 0.40, 5.0),
+        "gpt-6-luna":    (0.20, 1.0,  0.02, 0.25),
         "gpt-5.6-sol":   (10.0, 60.0, 1.0,  12.5),
         "gpt-5.6-terra": (4.0,  24.0, 0.40,  5.0),
         "gpt-5.6-luna":  (0.40,  2.40, 0.04, 0.50),
@@ -142,6 +152,7 @@ _NON_STANDARD_MODE_PRICING: dict[str, dict[str, PriceTuple | None]] = {
     # Anthropic fast mode (research preview); cache multipliers stack on the
     # fast base input price, so cache_read = 0.1x and cache_write = 1.25x.
     "fast": {
+        "claude-opus-5-5": (8.0, 40.0, 0.40, 10.0),
         "claude-opus-5":   (10.0,  50.0, 1.0,  12.5),
         "claude-opus-4-8": (10.0,  50.0, 1.0,  12.5),
         "claude-opus-4-7": None,
@@ -177,6 +188,14 @@ _PRICING_FINGERPRINT_VERSION = 20
 # Collectors pass single-event usage into ``estimate_cost`` before aggregating
 # buckets; aggregate-only callers get a best-effort fallback.
 _LONG_CONTEXT_RULES: list[dict[str, object]] = [
+    {
+        "prefixes": ("gpt-6-sol",),
+        "tiers": ({"threshold": 272_000, "prices": (4.0, 15.0, 0.40, 5.0)},),
+    },
+    {
+        "prefixes": ("gpt-6-luna",),
+        "tiers": ({"threshold": 272_000, "prices": (0.20, 0.75, 0.02, 0.25)},),
+    },
     {
         "prefixes": ("gpt-6-astra",),
         "tiers": (

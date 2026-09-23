@@ -613,6 +613,18 @@ def test_gpt_6_astra_pricing(tmp_path):
         assert abs(cost_long - (300_000 * 20.0 + 10_000 * 75.0) / 1_000_000) < 1e-9
 
 
+def test_new_model_pricing(tmp_path):
+    with _patch_empty_user_pricing(tmp_path):
+        assert get_pricing("gpt-6-sol") == (2.0, 10.0, 0.20, 2.50)
+        assert get_pricing("gpt-6-luna") == (0.10, 0.50, 0.01, 0.125)
+        assert get_pricing("claude-opus-5-5") == (4.0, 20.0, 0.20, 5.0)
+        assert get_pricing("codex/gpt-6-sol[fast]") == (4.0, 20.0, 0.40, 5.0)
+        assert get_pricing("codex/gpt-6-luna[fast]") == (0.20, 1.0, 0.02, 0.25)
+        assert estimate_cost("claude-opus-5-5", input_tokens=1_000_000, speed="fast") == 8.0
+        assert estimate_cost("gpt-6-sol", input_tokens=272_001) == 272_001 * 4 / 1_000_000
+        assert estimate_cost("gpt-6-luna", input_tokens=272_001) == 272_001 * 0.2 / 1_000_000
+
+
 def test_gemini_37_and_38_flash_pricing(tmp_path):
     with _patch_empty_user_pricing(tmp_path):
         assert get_pricing("gemini-3.7-flash") == (0.75, 3.75, 0.075, 0.0)
