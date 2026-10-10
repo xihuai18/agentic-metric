@@ -160,6 +160,8 @@ _BUILTIN_PRICING: dict[str, PriceTuple] = {
 _MODEL_ALIASES: dict[str, str] = {
     "claude-4.5-sonnet-thinking": "claude-sonnet-4-5",
     "claude-4.5-opus-high-thinking": "claude-opus-4-5",
+    "claude-4.6-opus": "claude-opus-4-6",
+    "claude-4.6-sonnet": "claude-sonnet-4-6",
     "codex-auto-review": "gpt-5.3-codex",
     "gpt-5.6": "gpt-5.6-sol",
     "gpt-6": "gpt-6-astra",

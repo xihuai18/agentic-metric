@@ -715,6 +715,7 @@ def test_wrapped_model_decomposition(tmp_path):
     with _patch_empty_user_pricing(tmp_path):
         # Prefixes and effort suffixes
         assert get_pricing("cursor/claude-sonnet-5-high") == (2.0, 10.0, 0.20, 2.50)
+        assert get_pricing("cursor/claude-4.6-opus") == (5.0, 25.0, 0.50, 6.25)
         assert get_pricing("cursor/claude-opus-5-medium") == (5.0, 25.0, 0.50, 6.25)
         assert get_pricing("cursor/gemini-3-flash-high") == (0.50, 3.00, 0.05, 0.0)
         assert get_pricing("openrouter/openai/gpt-5.6-sol") == (4.0, 20.0, 0.40, 5.0)
