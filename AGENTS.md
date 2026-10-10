@@ -43,7 +43,7 @@ src/agentic_metric/
     app.py            # Textual TUI app
     widgets.py        # SummaryCell, PeriodicHeatmap, TrendBlocks, Breakdown
     help_screen.py    # Keybinding cheatsheet modal
-    pricing_screen.py # Read-only pricing view
+    pricing_screen.py # Pricing for used models, with in-app price update
     styles.tcss       # Textual CSS
 ```
 

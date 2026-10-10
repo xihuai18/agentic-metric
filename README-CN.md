@@ -155,7 +155,7 @@ agentic-metric pricing cache reset claude-sonnet-4                # 删除覆盖
 | `.` | Now | 回到"现在"(清空 offset) |
 | `↑` / `↓` | — | 滚动明细面板 |
 | `r` | Auto-refresh | 切换快速自动刷新;开启时暂停慢速周期 sync |
-| `p` | Pricing | 打开只读价格视图(标出缺少价格的模型) |
+| `p` | Pricing | 查看已用模型的价格(标出缺少价格的模型;按 `u` 更新价格) |
 | `?` | Help | 显示快捷键速查表 |
 | `q` | Quit | 退出 |
 
@@ -272,7 +272,7 @@ src/agentic_metric/
     ├── app.py            # Textual TUI 应用
     ├── widgets.py        # 自定义 TUI 组件(汇总卡片、热图、趋势)
     ├── help_screen.py    # 快捷键速查表弹窗
-    ├── pricing_screen.py # 只读定价视图(标出缺少价格的模型)
+    ├── pricing_screen.py # 已用模型的定价视图,可在应用内更新价格
     └── styles.tcss       # Textual CSS
 ```
 

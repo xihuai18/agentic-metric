@@ -179,8 +179,28 @@ PricingScreen {
     padding: 1 2;
 }
 
-#pricing-content {
+#pricing-header {
+    height: 1;
+    margin-bottom: 1;
+}
+
+#pricing-title {
+    width: 1fr;
+}
+
+#pricing-update {
     width: auto;
+    min-width: 0;
+    height: 1;
+    border: none;
+    padding: 0 1;
+}
+
+#pricing-scroll {
+    height: 1fr;
+}
+
+#pricing-content {
     height: auto;
 }
 

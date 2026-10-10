@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from collections.abc import Iterable
 import json
 import logging
 import re
@@ -1447,6 +1448,89 @@ def get_all_pricing() -> dict[str, tuple[float, float, float, float]]:
             merged[model] = pricing
     merged.update(_load_user_pricing())
     return merged
+
+
+def get_observed_model_pricing(models: Iterable[str]) -> list[dict[str, object]]:
+    """Return effective list prices for observed model ids, one row per price key.
+
+    Raw ids collapse to their normalized pricing key; an embedded premium mode
+    (e.g. ``[fast]``) gets its own row only when it changes the rates.
+    Unpriced and non-billable models are omitted.
+    """
+    rows: dict[str, dict[str, object]] = {}
+    for model in models:
+        if not model or model in _NON_BILLABLE_MODELS:
+            continue
+        prices = get_pricing(model)
+        if prices is None:
+            continue
+        base, mode = _decompose_model_name(model)
+        premium = mode if mode and prices != _get_standard_pricing(base) else ""
+        name = f"{base} ({premium})" if premium else base
+        if name not in rows:
+            rows[name] = {
+                "model": name,
+                "base_model": base,
+                "prices": prices,
+                "source": _pricing_source(model, base, premium),
+            }
+    return [rows[name] for name in sorted(rows)]
+
+
+def _pricing_source(model: str, base_model: str, premium_mode: str) -> str:
+    user = _load_user_pricing()
+    key = model if model in user else base_model if base_model in user else None
+    if key is not None:
+        builtin = _BUILTIN_PRICING.get(key)
+        if builtin is None:
+            return "custom"
+        return "builtin" if tuple(user[key]) == tuple(builtin) else "override"
+    if premium_mode:
+        tables = (
+            _NON_STANDARD_MODE_PRICING.get(premium_mode) or {},
+            _NON_STANDARD_MODE_PRICING.get(
+                _MODE_ALIASES.get(premium_mode, premium_mode)
+            ) or {},
+        )
+        builtin_mode = any(
+            _matches_model_prefix(base_model, prefix)
+            for table in tables
+            for prefix in table
+        )
+        return "builtin" if builtin_mode else "catalog"
+    tokens = _model_tokens(base_model)
+    if any(
+        _matches_priced_model_tokens(tokens, prefix)
+        for prefix, _ in _SORTED_BUILTIN_PRICING_TOKENS
+    ):
+        return "builtin"
+    return "catalog"
+
+
+def long_context_rule_applies(rule: dict[str, object], models: Iterable[str]) -> bool:
+    """Return True when a long-context rule can price any given normalized model.
+
+    Mirrors ``_long_context_prices``: only user rules cover unknown-family
+    models, and catalog tiers apply only to their exact model and only when no
+    builtin standard price exists for it.
+    """
+    prefixes = tuple(str(p) for p in rule["prefixes"])
+    source = rule.get("source")
+    if source != "user":
+        models = [
+            model for model in models
+            if not _matches_any_model_prefix(model, _UNKNOWN_MODEL_PREFIXES)
+        ]
+    if source == "catalog":
+        return any(
+            model == prefixes[0] and model not in _BUILTIN_PRICING for model in models
+        )
+    excluded = tuple(str(p) for p in rule.get("excluded_prefixes", ()))
+    return any(
+        _matches_any_model_prefix(model, prefixes)
+        and not (excluded and _matches_any_model_prefix(model, excluded))
+        for model in models
+    )
 
 
 def _user_cache_rule(model: str) -> dict[str, float] | None:

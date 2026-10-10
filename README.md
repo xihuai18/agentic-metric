@@ -179,7 +179,7 @@ Shown in the footer as: `PgUp/PgDn Range · ←→ View · . Now · r Auto-refre
 | `.` | Now | Jump back to "now" (reset offset) |
 | `↑` / `↓` | — | Scroll the breakdown panel |
 | `r` | Auto-refresh | Toggle fast auto-refresh; pauses the slow periodic sync while active |
-| `p` | Pricing | Open the read-only pricing view (flags models with missing prices) |
+| `p` | Pricing | Show pricing for models you have used (flags missing prices; `u` updates prices) |
 | `?` | Help | Show the keybinding cheatsheet |
 | `q` | Quit | Quit |
 
@@ -300,7 +300,7 @@ src/agentic_metric/
     ├── app.py            # Textual TUI application
     ├── widgets.py        # Custom TUI widgets (summary cells, heatmap, trend)
     ├── help_screen.py    # Keybinding cheatsheet modal
-    ├── pricing_screen.py # Read-only pricing view (flags missing prices)
+    ├── pricing_screen.py # Pricing for used models, with in-app price update
     └── styles.tcss       # Textual CSS
 ```
 

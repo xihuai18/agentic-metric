@@ -2213,6 +2213,86 @@ def test_pricing_screen_does_not_offer_empty_model_pricing():
     assert "set with: agentic-metric pricing set" in text
 
 
+def test_pricing_screen_lists_only_observed_models():
+    from rich.console import Console as _C
+    import io as _io
+
+    buf = _io.StringIO()
+    _C(file=buf, width=120, no_color=True).print(
+        PricingScreen(
+            ["cursor/default"],
+            ["codex/gpt-6-astra", "codex/gpt-6-astra[fast]", "cursor/default", "<synthetic>"],
+        )._build_content()
+    )
+    text = buf.getvalue()
+    model_rows = [
+        line.split()[0] for line in text.splitlines()
+        if line.strip().startswith("gpt-") and "$" in line
+    ]
+    assert "gpt-6-astra" in model_rows
+    assert any("gpt-6-astra (fast)" in line for line in text.splitlines())
+    assert "claude-opus-5" not in text
+    assert "<synthetic>" not in text
+    # Catalog long-context tiers never apply to builtin-priced models.
+    lc_lines = [line for line in text.splitlines() if "272,000" in line]
+    assert lc_lines and all("catalog" not in line for line in lc_lines)
+
+
+def test_pricing_screen_update_refreshes_catalog_and_resyncs(tmp_path, monkeypatch):
+    import asyncio
+    import threading
+
+    from textual.widgets import Button
+
+    from agentic_metric.collectors import CollectorRegistry
+    from agentic_metric.tui import app as app_module
+
+    class _Collectors(CollectorRegistry):
+        def __init__(self):
+            self.syncs = 0
+
+        def sync_all(self, db):
+            self.syncs += 1
+
+        def get_sync_errors(self):
+            return []
+
+    refreshed = []
+    release = threading.Event()
+
+    def _refresh():
+        release.wait(5)
+        refreshed.append(True)
+        return 1
+
+    db_path = str(tmp_path / "tui.db")
+    monkeypatch.setattr(app_module, "refresh_pricing_catalog", _refresh)
+    monkeypatch.setattr(app_module, "Database", lambda: Database(db_path=db_path))
+    collectors = _Collectors()
+
+    async def _run():
+        db = Database(db_path=db_path)
+        app = app_module.AgenticMetricApp(
+            db=db, collectors=collectors, sync_on_mount=False, show_clock=False
+        )
+        async with app.run_test(size=(120, 40), notifications=False) as pilot:
+            await pilot.press("p")
+            await pilot.press("u")
+            await pilot.press("u")
+            button = app.screen.query_one("#pricing-update", Button)
+            assert button.disabled
+            release.set()
+            for _ in range(100):
+                await asyncio.sleep(0.02)
+                if not button.disabled:
+                    break
+            assert isinstance(app.screen, PricingScreen)
+            assert not button.disabled
+
+    asyncio.run(_run())
+    assert refreshed == [True]
+    assert collectors.syncs == 1
+
 def test_cli_mixed_pricing_keeps_costs_numeric_and_warns_once():
     rows = [
         {

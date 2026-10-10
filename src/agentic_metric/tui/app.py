@@ -27,8 +27,10 @@ from ..store.aggregator import (
     get_trend,
     get_unpriced_models,
     get_trend_provider_totals,
+    get_used_models,
     resolve_range,
 )
+from ..pricing import refresh_pricing_catalog
 from ..store.database import Database
 from .widgets import Breakdown, PeriodicHeatmap, SummaryCell, TrendBlocks
 from .pricing_screen import PricingScreen
@@ -177,6 +179,8 @@ class AgenticMetricApp(App):
         self._initial_sync_pending = sync_on_mount
         self._unpriced_models: list[str] = []
         self._last_pricing_warning: tuple[str, ...] = ()
+        self._pricing_update_requested = False
+        self._pricing_update_running = False
 
     # ── Layout ────────────────────────────────────────────────────────
 
@@ -499,6 +503,58 @@ class AgenticMetricApp(App):
         else:
             self.call_from_thread(self._on_sync_done)
 
+    async def _pricing_update_worker(self) -> None:
+        # Fetch the catalog on the sync thread so pricing caches never change
+        # under a concurrent sync; the sync that follows reprices history.
+        try:
+            count = refresh_pricing_catalog()
+        except Exception as exc:
+            self.call_from_thread(
+                self.notify,
+                str(exc),
+                title="Pricing update failed",
+                severity="error",
+                timeout=10,
+                markup=False,
+            )
+        else:
+            self.call_from_thread(
+                self.notify,
+                f"Pricing catalog updated ({count:,} model aliases).",
+                title="Pricing updated",
+            )
+        self._run_sync()
+
+    def request_pricing_update(self) -> None:
+        """Refresh catalog prices and reprice history, queued behind any running sync."""
+        if self._pricing_update_requested or self._pricing_update_running:
+            return
+        self._pricing_update_requested = True
+        self._refresh_pricing_screen()
+        self._maybe_start_pricing_update()
+
+    def _maybe_start_pricing_update(self) -> None:
+        if not self._pricing_update_requested or self._sync_in_progress:
+            return
+        self._pricing_update_requested = False
+        self._pricing_update_running = True
+        self._start_sync(self._pricing_update_worker)
+
+    def _after_sync(self) -> None:
+        self._pricing_update_running = False
+        self._maybe_start_pricing_update()
+        self._refresh_pricing_screen()
+
+    def _refresh_pricing_screen(self) -> None:
+        updating = self._pricing_update_requested or self._pricing_update_running
+        for screen in self.screen_stack:
+            if isinstance(screen, PricingScreen):
+                screen.update_view(
+                    self._unpriced_models,
+                    get_used_models(self._db),
+                    updating=updating,
+                )
+
     def _refresh_pricing_warning(self) -> None:
         models = tuple(get_unpriced_models(self._db))
         self._unpriced_models = list(models)
@@ -540,6 +596,7 @@ class AgenticMetricApp(App):
                 markup=False,
             )
         self._finish_initial_sync()
+        self._after_sync()
 
     def _on_sync_failed(self, error: str) -> None:
         self._sync_in_progress = False
@@ -555,6 +612,7 @@ class AgenticMetricApp(App):
             markup=False,
         )
         self._finish_initial_sync()
+        self._after_sync()
 
     # ── Actions ───────────────────────────────────────────────────────
 
@@ -601,8 +659,12 @@ class AgenticMetricApp(App):
         self.query_one("#breakdown-scroll", VerticalScroll).scroll_page_down(animate=False)
 
     def action_show_pricing(self) -> None:
-        """Open the read-only pricing view, flagging unpriced models."""
-        self.push_screen(PricingScreen(self._unpriced_models))
+        """Open the pricing view for recorded models, flagging unpriced ones."""
+        self.push_screen(PricingScreen(
+            self._unpriced_models,
+            get_used_models(self._db),
+            updating=self._pricing_update_requested or self._pricing_update_running,
+        ))
 
     def action_show_help(self) -> None:
         """Open the keybinding cheatsheet."""

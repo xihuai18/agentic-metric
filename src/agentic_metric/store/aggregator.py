@@ -244,6 +244,15 @@ def get_unpriced_models(db: Database) -> list[str]:
     return [str(row["model"]) for row in rows]
 
 
+def get_used_models(db: Database) -> list[str]:
+    """Return every raw model id that has recorded usage."""
+    usage = _usage_source(db)
+    rows = db.conn.execute(
+        f"SELECT DISTINCT model FROM {usage} WHERE model != '' ORDER BY model"
+    ).fetchall()
+    return [str(row["model"]) for row in rows]
+
+
 def get_range_totals(db: Database, from_date: str, to_date: str) -> dict:
     """Return summary totals for sessions within ``[from_date, to_date]`` inclusive."""
     usage = _usage_source(db)

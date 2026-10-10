@@ -23,7 +23,7 @@ _SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
     ]),
     ("Data", [
         ("r", "Toggle fast auto-refresh"),
-        ("p", "Pricing (read-only; flags missing prices)"),
+        ("p", "Pricing for recorded models (u updates prices)"),
     ]),
     ("Other", [
         ("?", "This help"),
