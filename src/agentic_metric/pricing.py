@@ -207,6 +207,9 @@ _NON_STANDARD_MODE_PRICING: dict[str, dict[str, PriceTuple | None]] = {
         "claude-opus-4-7": None,
         "claude-opus-4-6": None,
     },
+    "ultrafast": {
+        "gpt-6-astra": (60.0, 300.0, 6.0, 75.0),
+    },
 }
 
 # Codex persists its fast mode as ``service_tier = "fast"``; with API-key

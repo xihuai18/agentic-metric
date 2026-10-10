@@ -61,9 +61,13 @@ def _reset_pricing_state():
 
 
 def _patch_empty_user_pricing(tmp_path):
-    """Isolate builtin pricing tests from the real local pricing.json."""
+    """Isolate builtin pricing tests from local pricing files."""
     _reset_cache()
-    return patch("agentic_metric.pricing.PRICING_FILE", tmp_path / "pricing.json")
+    return patch.multiple(
+        "agentic_metric.pricing",
+        PRICING_FILE=tmp_path / "pricing.json",
+        PRICING_CATALOG_FILE=tmp_path / "pricing-catalog.json",
+    )
 
 
 def test_known_model_pricing():
