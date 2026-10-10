@@ -49,6 +49,7 @@ DATA_DIR = (
 )
 DB_PATH = DATA_DIR / "data.db"
 PRICING_FILE = DATA_DIR / "pricing.json"
+PRICING_CATALOG_FILE = DATA_DIR / "pricing-catalog.json"
 CONFIG_FILE = _env_path("AGENTIC_METRIC_CONFIG", DATA_DIR / "config.json")
 
 

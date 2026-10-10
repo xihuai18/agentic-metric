@@ -284,6 +284,9 @@ def tui(
 
 def _run_tui(*, sync_on_mount: bool = True) -> None:
     """Launch the interactive TUI dashboard."""
+    from .pricing import refresh_pricing_catalog_if_stale
+
+    refresh_pricing_catalog_if_stale()
     from .tui.app import AgenticMetricApp
     AgenticMetricApp(sync_on_mount=sync_on_mount).run()
 
@@ -297,7 +300,10 @@ def sync(
     ),
 ) -> None:
     """Force sync all collectors to the database."""
+    from .pricing import refresh_pricing_catalog_if_stale
     from .collectors import create_default_registry
+
+    refresh_pricing_catalog_if_stale()
     from .config import DB_PATH
     from .store import aggregator
     from .store.database import Database
@@ -410,6 +416,9 @@ def report(
             label, frm, to = aggregator.resolve_range("today")
 
     def _once() -> None:
+        from .pricing import refresh_pricing_catalog_if_stale
+
+        refresh_pricing_catalog_if_stale()
         db = Database()
         sync_errors: list[str] = []
         if db.pricing_changed and no_sync:
@@ -1592,6 +1601,22 @@ def _refresh_history_after_pricing_change() -> None:
         db.close()
 
 
+@pricing_app.command("update")
+def pricing_update() -> None:
+    """Refresh the local model pricing catalog from models.dev."""
+    from .pricing import refresh_pricing_catalog
+
+    try:
+        count = refresh_pricing_catalog()
+    except Exception as exc:
+        console.print(f"[{C_RED}]Pricing catalog update failed: {exc}[/]")
+        raise typer.Exit(1)
+    console.print(
+        f"[bold {C_GREEN}]✓[/] Updated pricing catalog with {count:,} model aliases."
+    )
+    _refresh_history_after_pricing_change()
+
+
 @pricing_app.command("list")
 def pricing_list(
     json_: bool = typer.Option(False, "--json", help="Output pricing as machine-readable JSON."),
@@ -1601,11 +1626,13 @@ def pricing_list(
         _BUILTIN_PRICING,
         _load_user_pricing,
         get_all_pricing,
+        get_catalog_pricing,
         get_long_context_rules,
         get_user_cache_pricing,
     )
 
     user = _load_user_pricing()
+    catalog = get_catalog_pricing()
 
     if json_:
         merged = get_all_pricing()
@@ -1617,7 +1644,8 @@ def pricing_list(
                     "source": (
                         "custom" if m in user and m not in _BUILTIN_PRICING
                         else "override" if m in user and tuple(p) != tuple(_BUILTIN_PRICING.get(m, ()))
-                        else "builtin"
+                        else "builtin" if m in _BUILTIN_PRICING
+                        else "catalog"
                     ),
                 }
                 for m, p in sorted(merged.items())
@@ -1651,8 +1679,7 @@ def pricing_list(
     table.add_column("Cache Write", justify="right", style=C_SKY)
     table.add_column("Source", style=C_MUTED)
 
-    all_models = dict(_BUILTIN_PRICING)
-    all_models.update(user)
+    all_models = get_all_pricing()
 
     for model in sorted(all_models):
         p = all_models[model]
@@ -1664,6 +1691,8 @@ def pricing_list(
                 source = Text("override", style=C_PEACH)
         elif model in user:
             source = Text("custom", style=C_GREEN)
+        elif model in catalog:
+            source = Text("catalog", style=C_SKY)
         else:
             source = Text("builtin", style=C_MUTED)
         table.add_row(

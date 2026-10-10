@@ -16,6 +16,7 @@ from ..pricing import (
     _BUILTIN_PRICING,
     _load_user_pricing,
     get_all_pricing,
+    get_catalog_pricing,
     get_long_context_rules,
     get_user_cache_pricing,
 )
@@ -76,6 +77,7 @@ class PricingScreen(ModalScreen):
 
     def _models_table(self) -> Table:
         user = _load_user_pricing()
+        catalog = get_catalog_pricing()
         merged = get_all_pricing()
         tbl = Table(
             title="Models",
@@ -101,6 +103,8 @@ class PricingScreen(ModalScreen):
                 )
             elif model in user:
                 source = Text("custom", style="bright_green")
+            elif model in catalog:
+                source = Text("catalog", style="bright_blue")
             else:
                 source = Text("builtin", style="white")
             tbl.add_row(

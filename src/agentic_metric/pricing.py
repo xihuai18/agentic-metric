@@ -2,18 +2,54 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 import logging
 import re
 import threading
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
-from .config import PRICING_FILE
+from .config import PRICING_CATALOG_FILE, PRICING_FILE
 
 log = logging.getLogger(__name__)
 
 PriceTuple = tuple[float, float, float, float]
 
+PRICING_CATALOG_URL = "https://models.dev/api.json"
+_PRICING_CATALOG_TTL_SECONDS = 24 * 60 * 60
+_CATALOG_EXCLUDED_PROVIDERS = {
+    "amazon-bedrock",
+    "azure",
+    "cloudflare-workers-ai",
+    "deepinfra",
+    "fireworks-ai",
+    "github-copilot",
+    "groq",
+    "huggingface",
+    "llmgateway",
+    "openrouter",
+    "perplexity-agent",
+    "poe",
+    "togetherai",
+}
+_CATALOG_FIRST_PARTY_PROVIDERS = {
+    "alibaba",
+    "anthropic",
+    "cohere",
+    "deepseek",
+    "google",
+    "minimax",
+    "mistral",
+    "moonshot",
+    "openai",
+    "xai",
+    "zai",
+}
+
 # (input, output, cache_read, cache_write) — USD per million tokens.
+# Pricing policy: use provider standard/list rates and ignore introductory,
+# promotional, sale, gateway-discount, and subscription prices.
 # Core Anthropic / Google Gemini prices were verified against official pricing
 # docs on 2026-04-25, with GPT-5.6 pricing verified against OpenAI's official
 # pricing and model docs on 2026-07-11 and re-verified on 2026-07-31 after the
@@ -46,76 +82,79 @@ PriceTuple = tuple[float, float, float, float]
 # Cache-write uses the 5-minute rate for Anthropic unless a collector observes
 # a different cache duration. Costs are always API list prices: gateway-reported
 # per-request costs in session logs (possible vendor discounts) are ignored.
+# GPT-6 Astra follows the ChatGPT Work/Codex rate card: cache writes are not
+# separately billed, so the fourth price field is zero for this model.
 # Non-standard speed/priority modes are billed from the official premium tables
 # below only when a collector observes an explicit per-session/per-request
 # marker (Codex ``thread_settings_applied.service_tier``, Anthropic
 # ``usage.speed``); unmarked history stays at standard rates.
 _BUILTIN_PRICING: dict[str, PriceTuple] = {
     # ── Anthropic Claude ──
-    "claude-fable-5-1":      (10.0, 50.0, 0.25, 12.50),
-    "claude-fable-5":        (10.0, 50.0, 1.00, 12.50),
-    "claude-sonnet-5":       (2.0,  10.0, 0.20,  2.50),
-    "claude-opus-5-5":       (4.0,  20.0, 0.20,  5.0),
-    "claude-opus-5":         (5.0,  25.0, 0.50,  6.25),
-    "claude-opus-4-8":       (5.0,  25.0, 0.50,  6.25),
-    "claude-opus-4-7":       (5.0,  25.0, 0.50,  6.25),
-    "claude-opus-4-6":       (5.0,  25.0, 0.50,  6.25),
-    "claude-opus-4-5":       (5.0,  25.0, 0.50,  6.25),
-    "claude-opus-4-1":       (15.0, 75.0, 1.50, 18.75),
-    "claude-opus-4":         (15.0, 75.0, 1.50, 18.75),
-    "claude-sonnet-4-6":     (3.0,  15.0, 0.30,  3.75),
-    "claude-sonnet-4-5":     (3.0,  15.0, 0.30,  3.75),
-    "claude-sonnet-4":       (3.0,  15.0, 0.30,  3.75),
-    "claude-sonnet-3-7":     (3.0,  15.0, 0.30,  3.75),
-    "claude-3-7-sonnet":     (3.0,  15.0, 0.30,  3.75),
-    "claude-3-5-sonnet":     (3.0,  15.0, 0.30,  3.75),
-    "claude-haiku-4-5":      (1.0,   5.0, 0.10,  1.25),
-    "claude-haiku-3-5":      (0.80,  4.0, 0.08,  1.00),
-    "claude-3-5-haiku":      (0.80,  4.0, 0.08,  1.00),
-    "claude-3-opus":         (15.0, 75.0, 1.50, 18.75),
-    "claude-3-haiku":        (0.25, 1.25, 0.03,  0.30),
+    "claude-fable-5-1": (10.0, 50.0, 0.25, 12.50),
+    "claude-fable-5": (10.0, 50.0, 1.00, 12.50),
+    "claude-sonnet-5": (2.0, 10.0, 0.20, 2.50),
+    "claude-opus-5-5": (4.0, 20.0, 0.20, 5.0),
+    "claude-opus-5": (5.0, 25.0, 0.50, 6.25),
+    "claude-opus-4-8": (5.0, 25.0, 0.50, 6.25),
+    "claude-opus-4-7": (5.0, 25.0, 0.50, 6.25),
+    "claude-opus-4-6": (5.0, 25.0, 0.50, 6.25),
+    "claude-opus-4-5": (5.0, 25.0, 0.50, 6.25),
+    "claude-opus-4-1": (15.0, 75.0, 1.50, 18.75),
+    "claude-opus-4": (15.0, 75.0, 1.50, 18.75),
+    "claude-sonnet-4-6": (3.0, 15.0, 0.30, 3.75),
+    "claude-sonnet-4-5": (3.0, 15.0, 0.30, 3.75),
+    "claude-sonnet-4": (3.0, 15.0, 0.30, 3.75),
+    "claude-sonnet-3-7": (3.0, 15.0, 0.30, 3.75),
+    "claude-3-7-sonnet": (3.0, 15.0, 0.30, 3.75),
+    "claude-3-5-sonnet": (3.0, 15.0, 0.30, 3.75),
+    "claude-haiku-4-5": (1.0, 5.0, 0.10, 1.25),
+    "claude-haiku-3-5": (0.80, 4.0, 0.08, 1.00),
+    "claude-3-5-haiku": (0.80, 4.0, 0.08, 1.00),
+    "claude-3-opus": (15.0, 75.0, 1.50, 18.75),
+    "claude-3-haiku": (0.25, 1.25, 0.03, 0.30),
     # ── OpenAI ──
-    "gpt-6-astra":           (10.0, 50.0,  1.00, 12.50),
-    "gpt-6-sol":             (2.0,  10.0,  0.20,  2.50),
-    "gpt-6-luna":            (0.10, 0.50,  0.01,  0.125),
-    "gpt-5.6-sol":           (5.0,  30.0,  0.50,  6.25),
-    "gpt-5.6-terra":         (2.0,  12.0,  0.20,  2.50),
-    "gpt-5.6-luna":          (0.20,  1.20, 0.02,  0.25),
-    "gpt-5.5":               (5.0,  30.0,  0.50,  0.0),
-    "gpt-5.4-mini":          (0.75,   4.5, 0.075, 0.0),
-    "gpt-5.4-nano":          (0.20,  1.25, 0.02,  0.0),
-    "gpt-5.4":               (2.5,  15.0,  0.25,  0.0),
-    "gpt-5.2-codex":         (1.75, 14.0,  0.175, 0.0),
-    "gpt-5.2-chat-latest":   (1.75, 14.0,  0.175, 0.0),
-    "gpt-5.2":               (1.75, 14.0,  0.175, 0.0),
-    "gpt-5.1-codex-max":     (1.25, 10.0,  0.125, 0.0),
-    "gpt-5.1-codex":         (1.25, 10.0,  0.125, 0.0),
-    "gpt-5.1-chat-latest":   (1.25, 10.0,  0.125, 0.0),
-    "gpt-5.1":               (1.25, 10.0,  0.125, 0.0),
-    "gpt-5-mini":            (0.25,  2.0,  0.025, 0.0),
-    "gpt-5-codex":           (1.25, 10.0,  0.125, 0.0),
-    "gpt-5-chat-latest":     (1.25, 10.0,  0.125, 0.0),
-    "gpt-5":                 (1.25, 10.0,  0.125, 0.0),
-    "gpt-5.3-codex":         (1.75, 14.0,  0.175, 0.0),
-    "gpt-5.3-chat-latest":   (1.75, 14.0,  0.175, 0.0),
-    "gpt-5.3":               (1.75, 14.0,  0.175, 0.0),
+    "gpt-6-astra": (10.0, 50.0, 1.00, 12.50),
+    "gpt-6-sol": (2.0, 10.0, 0.20, 2.50),
+    "gpt-6-luna": (0.10, 0.50, 0.01, 0.125),
+    # Ignore the current introductory/promotion price; use the standard list rate.
+    "gpt-5.6-sol": (4.0, 20.0, 0.40, 5.0),
+    "gpt-5.6-terra": (2.0, 12.0, 0.20, 2.50),
+    "gpt-5.6-luna": (0.20, 1.20, 0.02, 0.25),
+    "gpt-5.5": (5.0, 30.0, 0.50, 0.0),
+    "gpt-5.4-mini": (0.75, 4.5, 0.075, 0.0),
+    "gpt-5.4-nano": (0.20, 1.25, 0.02, 0.0),
+    "gpt-5.4": (2.5, 15.0, 0.25, 0.0),
+    "gpt-5.2-codex": (1.75, 14.0, 0.175, 0.0),
+    "gpt-5.2-chat-latest": (1.75, 14.0, 0.175, 0.0),
+    "gpt-5.2": (1.75, 14.0, 0.175, 0.0),
+    "gpt-5.1-codex-max": (1.25, 10.0, 0.125, 0.0),
+    "gpt-5.1-codex": (1.25, 10.0, 0.125, 0.0),
+    "gpt-5.1-chat-latest": (1.25, 10.0, 0.125, 0.0),
+    "gpt-5.1": (1.25, 10.0, 0.125, 0.0),
+    "gpt-5-mini": (0.25, 2.0, 0.025, 0.0),
+    "gpt-5-codex": (1.25, 10.0, 0.125, 0.0),
+    "gpt-5-chat-latest": (1.25, 10.0, 0.125, 0.0),
+    "gpt-5": (1.25, 10.0, 0.125, 0.0),
+    "gpt-5.3-codex": (1.75, 14.0, 0.175, 0.0),
+    "gpt-5.3-chat-latest": (1.75, 14.0, 0.175, 0.0),
+    "gpt-5.3": (1.75, 14.0, 0.175, 0.0),
     # ── xAI Grok ──
-    "grok-4.7":              (2.0,   6.0,  0.50, 0.0),
-    "grok-4.6":              (2.0,   6.0,  0.50, 0.0),
-    "grok-4.5":              (2.0,   6.0,  0.30, 0.0),
+    "grok-4.7": (2.0, 6.0, 0.50, 0.0),
+    "grok-4.6": (2.0, 6.0, 0.50, 0.0),
+    "grok-4.5": (2.0, 6.0, 0.30, 0.0),
     # ── Google Gemini ──
-    "gemini-3.8-flash":      (1.50,  7.50, 0.15, 0.0),
-    "gemini-3.7-flash":      (1.50,  7.50, 0.15, 0.0),
-    "gemini-3.6-flash":      (1.50,  7.50, 0.15, 0.0),
-    "gemini-3.5-flash":      (1.50,  9.00, 0.15, 0.0),
-    "gemini-3.1-pro":        (2.00, 12.00, 0.20, 0.0),
-    "gemini-3.1-flash-lite": (0.25,  1.50, 0.025, 0.0),
-    "gemini-3-pro":          (2.00, 12.00, 0.20, 0.0),
-    "gemini-3-flash":        (0.50,  3.00, 0.05, 0.0),
-    "gemini-2.5-flash":      (0.30,  2.50, 0.03, 0.0),
-    "gemini-2.5-flash-lite": (0.10,  0.40, 0.01, 0.0),
-    "gemini-2.0-flash":      (0.10,  0.40, 0.025, 0.0),
-    "gemini-2.0-flash-lite": (0.075, 0.30, 0.0,  0.0),
+    "gemini-3.8-flash": (1.50, 7.50, 0.15, 0.0),
+    "gemini-3.7-flash": (1.50, 7.50, 0.15, 0.0),
+    "gemini-3.6-flash": (1.50, 7.50, 0.15, 0.0),
+    "gemini-3.5-flash": (1.50, 9.00, 0.15, 0.0),
+    "gemini-3.1-pro": (2.00, 12.00, 0.20, 0.0),
+    "gemini-3.1-flash-lite": (0.25, 1.50, 0.025, 0.0),
+    "gemini-3-pro": (2.00, 12.00, 0.20, 0.0),
+    "gemini-3-flash": (0.50, 3.00, 0.05, 0.0),
+    "gemini-2.5-flash": (0.30, 2.50, 0.03, 0.0),
+    "gemini-2.5-flash-lite": (0.10, 0.40, 0.01, 0.0),
+    "gemini-2.0-flash": (0.10, 0.40, 0.025, 0.0),
+    "gemini-2.0-flash-lite": (0.075, 0.30, 0.0, 0.0),
 }
 
 _MODEL_ALIASES: dict[str, str] = {
@@ -146,25 +185,25 @@ _NON_STANDARD_MODE_PRICING: dict[str, dict[str, PriceTuple | None]] = {
     # OpenAI priority processing (Codex fast mode with an API key) and Grok
     # 4.7 Fast, which Cursor bills at twice xAI's standard token rates.
     "priority": {
-        "gpt-6-astra":   (20.0, 100.0, 2.0, 25.0),
-        "gpt-6-sol":     (4.0,  20.0, 0.40, 5.0),
-        "gpt-6-luna":    (0.20, 1.0,  0.02, 0.25),
-        "gpt-5.6-sol":   (10.0, 60.0, 1.0,  12.5),
-        "gpt-5.6-terra": (4.0,  24.0, 0.40,  5.0),
-        "gpt-5.6-luna":  (0.40,  2.40, 0.04, 0.50),
-        "gpt-5.5":       (12.5, 75.0, 1.25,  0.0),
-        "gpt-5.4-mini":  (1.50,  9.0, 0.15,  0.0),
-        "gpt-5.4-nano":  None,
-        "gpt-5.4":       (5.0,  30.0, 0.50,  0.0),
-        "gpt-5.3-codex": (3.50, 28.0, 0.35,  0.0),
-        "grok-4.7":     (4.0,  12.0, 1.0,   0.0),
+        "gpt-6-astra": (20.0, 100.0, 2.0, 25.0),
+        "gpt-6-sol": (4.0, 20.0, 0.40, 5.0),
+        "gpt-6-luna": (0.20, 1.0, 0.02, 0.25),
+        "gpt-5.6-sol": (8.0, 40.0, 0.8, 10.0),
+        "gpt-5.6-terra": (4.0, 24.0, 0.40, 5.0),
+        "gpt-5.6-luna": (0.40, 2.40, 0.04, 0.50),
+        "gpt-5.5": (12.5, 75.0, 1.25, 0.0),
+        "gpt-5.4-mini": (1.50, 9.0, 0.15, 0.0),
+        "gpt-5.4-nano": None,
+        "gpt-5.4": (5.0, 30.0, 0.50, 0.0),
+        "gpt-5.3-codex": (3.50, 28.0, 0.35, 0.0),
+        "grok-4.7": (4.0, 12.0, 1.0, 0.0),
     },
     # Anthropic fast mode (research preview); cache multipliers stack on the
     # fast base input price, so cache_read = 0.1x and cache_write = 1.25x.
     "fast": {
         "claude-opus-5-5": (8.0, 40.0, 0.40, 10.0),
-        "claude-opus-5":   (10.0,  50.0, 1.0,  12.5),
-        "claude-opus-4-8": (10.0,  50.0, 1.0,  12.5),
+        "claude-opus-5": (10.0, 50.0, 1.0, 12.5),
+        "claude-opus-4-8": (10.0, 50.0, 1.0, 12.5),
         "claude-opus-4-7": None,
         "claude-opus-4-6": None,
     },
@@ -173,6 +212,18 @@ _NON_STANDARD_MODE_PRICING: dict[str, dict[str, PriceTuple | None]] = {
 # Codex persists its fast mode as ``service_tier = "fast"``; with API-key
 # billing that is OpenAI priority processing.
 _MODE_ALIASES: dict[str, str] = {"fast": "priority"}
+
+# Official long-context prices for OpenAI premium modes. These are separate
+# from standard long-context tiers because Fast/Ultrafast have their own rates.
+_NON_STANDARD_MODE_LONG_CONTEXT_PRICING: dict[str, dict[str, PriceTuple]] = {
+    "priority": {
+        "gpt-6-astra": (40.0, 150.0, 4.0, 50.0),
+        "gpt-5.6-sol": (16.0, 60.0, 1.6, 20.0),
+    },
+    "ultrafast": {
+        "gpt-6-astra": (120.0, 450.0, 12.0, 150.0),
+    },
+}
 
 _STANDARD_MODES = {"", "standard", "default"}
 
@@ -199,6 +250,10 @@ _PRICING_FINGERPRINT_VERSION = 20
 # buckets; aggregate-only callers get a best-effort fallback.
 _LONG_CONTEXT_RULES: list[dict[str, object]] = [
     {
+        "prefixes": ("gpt-6-astra",),
+        "tiers": ({"threshold": 272_000, "prices": (20.0, 75.0, 2.0, 25.0)},),
+    },
+    {
         "prefixes": ("gpt-6-sol",),
         "tiers": ({"threshold": 272_000, "prices": (4.0, 15.0, 0.40, 5.0)},),
     },
@@ -207,47 +262,29 @@ _LONG_CONTEXT_RULES: list[dict[str, object]] = [
         "tiers": ({"threshold": 272_000, "prices": (0.20, 0.75, 0.02, 0.25)},),
     },
     {
-        "prefixes": ("gpt-6-astra",),
-        "tiers": (
-            {"threshold": 272_000, "prices": (20.0, 75.0, 2.0, 25.0)},
-        ),
-    },
-    {
         "prefixes": ("gpt-5.6-sol",),
-        "tiers": (
-            {"threshold": 272_000, "prices": (10.0, 45.0, 1.0, 12.5)},
-        ),
+        "tiers": ({"threshold": 272_000, "prices": (8.0, 30.0, 0.8, 10.0)},),
     },
     {
         "prefixes": ("gpt-5.6-terra",),
-        "tiers": (
-            {"threshold": 272_000, "prices": (4.0, 18.0, 0.40, 5.0)},
-        ),
+        "tiers": ({"threshold": 272_000, "prices": (4.0, 18.0, 0.40, 5.0)},),
     },
     {
         "prefixes": ("gpt-5.6-luna",),
-        "tiers": (
-            {"threshold": 272_000, "prices": (0.40, 1.80, 0.04, 0.50)},
-        ),
+        "tiers": ({"threshold": 272_000, "prices": (0.40, 1.80, 0.04, 0.50)},),
     },
     {
         "prefixes": ("gpt-5.5",),
-        "tiers": (
-            {"threshold": 272_000, "prices": (10.0, 45.0, 1.0, 0.0)},
-        ),
+        "tiers": ({"threshold": 272_000, "prices": (10.0, 45.0, 1.0, 0.0)},),
     },
     {
         "prefixes": ("gpt-5.4",),
         "excluded_prefixes": ("gpt-5.4-mini", "gpt-5.4-nano"),
-        "tiers": (
-            {"threshold": 272_000, "prices": (5.0, 22.5, 0.50, 0.0)},
-        ),
+        "tiers": ({"threshold": 272_000, "prices": (5.0, 22.5, 0.50, 0.0)},),
     },
     {
         "prefixes": ("grok-4.7", "grok-4.6"),
-        "tiers": (
-            {"threshold": 200_000, "prices": (4.0, 12.0, 1.0, 0.0)},
-        ),
+        "tiers": ({"threshold": 200_000, "prices": (4.0, 12.0, 1.0, 0.0)},),
     },
     {
         "prefixes": ("grok-4.5",),
@@ -255,16 +292,12 @@ _LONG_CONTEXT_RULES: list[dict[str, object]] = [
     },
     {
         "prefixes": ("gemini-3.1-pro",),
-        "tiers": (
-            {"threshold": 200_000, "prices": (4.0, 18.0, 0.40, 0.0)},
-        ),
+        "tiers": ({"threshold": 200_000, "prices": (4.0, 18.0, 0.40, 0.0)},),
     },
     {
         "prefixes": ("claude-sonnet-4",),
         "excluded_prefixes": ("claude-sonnet-4-5", "claude-sonnet-4-6"),
-        "tiers": (
-            {"threshold": 200_000, "prices": (6.0, 22.5, 0.60, 7.5)},
-        ),
+        "tiers": ({"threshold": 200_000, "prices": (6.0, 22.5, 0.60, 7.5)},),
     },
 ]
 
@@ -279,15 +312,19 @@ def _normalize_long_context_tiers(value: object) -> list[dict[str, object]]:
     for tier in value:
         if not isinstance(tier, dict):
             raise ValueError("long-context tier must be an object")
-        tiers.append({
-            "threshold": int(tier["threshold"]),
-            "prices": _price_tuple(tier["prices"]),
-        })
+        tiers.append(
+            {
+                "threshold": int(tier["threshold"]),
+                "prices": _price_tuple(tier["prices"]),
+            }
+        )
     tiers.sort(key=lambda t: int(t["threshold"]))
     return tiers
 
 
-def _matched_tier_prices(total_input_tokens: int, tiers: list[dict[str, object]]) -> tuple[float, float, float, float] | None:
+def _matched_tier_prices(
+    total_input_tokens: int, tiers: list[dict[str, object]]
+) -> tuple[float, float, float, float] | None:
     matched: tuple[float, float, float, float] | None = None
     for tier in tiers:
         if total_input_tokens > int(tier["threshold"]):
@@ -299,7 +336,7 @@ def _matches_model_prefix(model: str, prefix: str) -> bool:
     """Return True when model starts with the complete prefix token sequence."""
     model_tokens = _model_tokens(model)
     prefix_tokens = _model_tokens(prefix)
-    return model_tokens[:len(prefix_tokens)] == prefix_tokens
+    return model_tokens[: len(prefix_tokens)] == prefix_tokens
 
 
 def _matches_priced_model_tokens(
@@ -316,7 +353,7 @@ def _matches_priced_model_tokens(
 
 _MODEL_TOKEN_RE = re.compile(r"[-_./:]+")
 _TRAILING_MODE_OR_EFFORT_RE = re.compile(
-    r"(?:[-_.]+)(fast|none|minimal|low|medium|high|xhigh|ultra|max)$"
+    r"(?:[-_./:]+)(fast|priority|ultrafast|flex|none|minimal|low|medium|high|xhigh|ultra|max)$"
 )
 _TRAILING_DATE_OR_VERSION_RE = re.compile(r"(?:[-_.]+)(?:\d{8}|v\d+(?::\d+)?)$")
 _BRACKET_FAST_RE = re.compile(r"\[fast\]")
@@ -326,13 +363,23 @@ def _model_tokens(name: str) -> tuple[str, ...]:
     return tuple(token for token in _MODEL_TOKEN_RE.split(name.lower()) if token)
 
 
-def _contains_model_tokens(
-    tokens: tuple[str, ...], candidate: tuple[str, ...]
-) -> bool:
+def _contains_model_tokens(tokens: tuple[str, ...], candidate: tuple[str, ...]) -> bool:
     return any(
         _matches_priced_model_tokens(tokens, candidate, index)
         for index in range(len(tokens) - len(candidate) + 1)
     )
+
+
+def _embedded_mode(
+    tokens: tuple[str, ...], candidate: tuple[str, ...], mode: str
+) -> str:
+    if mode:
+        return mode
+    candidate_set = set(candidate)
+    for marker in ("fast", "priority", "ultrafast", "flex"):
+        if marker in tokens and marker not in candidate_set:
+            return marker
+    return ""
 
 
 def _decompose_model_name(name: str) -> tuple[str, str]:
@@ -349,25 +396,27 @@ def _decompose_model_name(name: str) -> tuple[str, str]:
             continue
         match = _TRAILING_MODE_OR_EFFORT_RE.search(clean)
         if match:
-            if match.group(1) == "fast":
-                mode = "fast"
-            clean = clean[:match.start()]
+            mode = match.group(1) if match.group(1) in {"fast", "priority", "ultrafast", "flex"} else mode
+            clean = clean[: match.start()]
             continue
         match = _TRAILING_DATE_OR_VERSION_RE.search(clean)
         if not match:
             break
-        clean = clean[:match.start()]
+        clean = clean[: match.start()]
 
     tokens = _model_tokens(clean)
+    for candidate, model in _SORTED_ALIAS_TOKENS:
+        if tokens[-len(candidate) :] == candidate:
+            return model, _embedded_mode(tokens, candidate, mode)
     for candidate, model in _SORTED_UNKNOWN_MODEL_TOKENS:
         if _contains_model_tokens(tokens, candidate):
-            return model, mode
-    for candidate, target in _SORTED_ALIAS_TOKENS:
-        if tokens[-len(candidate):] == candidate:
-            return target, mode
+            return model, _embedded_mode(tokens, candidate, mode)
     for candidate, model in _SORTED_BUILTIN_MODEL_TOKENS:
         if _contains_model_tokens(tokens, candidate):
-            return model, mode
+            return model, _embedded_mode(tokens, candidate, mode)
+    for candidate, model in _catalog_model_tokens():
+        if _contains_model_tokens(tokens, candidate):
+            return model, _embedded_mode(tokens, candidate, mode)
 
     return clean, mode
 
@@ -384,7 +433,7 @@ def _get_standard_pricing(model: str) -> PriceTuple | None:
     for prefix_tokens, pricing in _SORTED_BUILTIN_PRICING_TOKENS:
         if _matches_priced_model_tokens(model_tokens, prefix_tokens):
             return pricing
-    return None
+    return _catalog_standard_pricing(model)
 
 
 def _normalize_mode(mode: str) -> str:
@@ -429,11 +478,13 @@ def _compute_non_standard_mode_prices(
     tier_mode: str,
 ) -> tuple[float, float, float, float] | None:
     base_model = normalize_model(model)
-    if _get_standard_pricing(base_model) is None or _matches_any_model_prefix(
-        base_model, _UNKNOWN_MODEL_PREFIXES
-    ):
+    if base_model in _load_user_pricing():
+        return None
+    if _get_standard_pricing(base_model) is None:
         return None
 
+    if _matches_any_model_prefix(base_model, _UNKNOWN_MODEL_PREFIXES):
+        return None
     lookups: list[str] = []
     if speed_mode not in _STANDARD_MODES:
         lookups.append(speed_mode)
@@ -445,17 +496,26 @@ def _compute_non_standard_mode_prices(
         table = _NON_STANDARD_MODE_PRICING.get(mode)
         if not table:
             continue
-        for prefix, prices in sorted(table.items(), key=lambda x: len(x[0]), reverse=True):
+        for prefix, prices in sorted(
+            table.items(), key=lambda x: len(x[0]), reverse=True
+        ):
             if _matches_model_prefix(base_model, prefix):
                 return prices
-    return None
+
+    return _catalog_mode_pricing(base_model, tier_mode, speed_mode)
 
 
 def _matches_any_model_prefix(model: str, prefixes: tuple[str, ...]) -> bool:
     return any(_matches_model_prefix(model, prefix) for prefix in prefixes)
 
-# ── User pricing file I/O (with mtime-based memo cache) ────────────
 
+# ── Pricing catalog and user pricing file I/O ──────────────────────
+
+
+_catalog_cache: dict[str, object] | None = None
+_catalog_cache_mtime: float = -1.0
+_catalog_cache_lock = threading.Lock()
+_catalog_generation = 0
 
 _user_cache: dict[str, object] | None = None
 _user_cache_mtime: float = -1.0
@@ -466,10 +526,15 @@ _user_cache_lock = threading.Lock()
 # still re-stats the config file, so an external edit takes effect at once.
 _config_generation = 0
 
-_derived_generation = -1
+_derived_generation: tuple[int, int] = (-1, -1)
+_catalog_model_tokens_generation = -1
+_sorted_catalog_model_tokens: tuple[tuple[tuple[str, ...], str], ...] = ()
+
 _pricing_memo: dict[str, PriceTuple | None] = {}
 _mode_price_memo: dict[tuple[str, str, str], PriceTuple | None] = {}
-_long_context_memo: dict[str, tuple[tuple[bool, tuple[tuple[int, PriceTuple], ...]], ...]] = {}
+_long_context_memo: dict[
+    str, tuple[tuple[bool, tuple[tuple[int, PriceTuple], ...]], ...]
+] = {}
 _cache_rule_memo: dict[str, dict[str, float] | None] = {}
 
 # Builtin prefixes are static, so order and tokenize them once.
@@ -502,6 +567,293 @@ _SORTED_ALIAS_TOKENS: tuple[tuple[tuple[str, ...], str], ...] = tuple(
 )
 
 
+def _empty_catalog_config() -> dict[str, object]:
+    return {"models": {}, "retrieved_at": "", "source": "models.dev"}
+
+
+def _catalog_price_tuple(value: object) -> PriceTuple | None:
+    if not isinstance(value, dict):
+        return None
+    try:
+        input_price = float(value["input"])
+        output_price = float(value["output"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    try:
+        cache_read = float(value.get("cache_read", 0.0))
+        cache_write = float(value.get("cache_write", 0.0))
+    except (TypeError, ValueError):
+        return None
+    prices = (input_price, output_price, cache_read, cache_write)
+    if any(price < 0 for price in prices):
+        return None
+    return prices
+
+
+def _catalog_tiers(cost: dict[str, object]) -> list[dict[str, object]]:
+    raw_tiers = cost.get("tiers")
+    if not isinstance(raw_tiers, list):
+        context_over = cost.get("context_over_200k")
+        prices = _catalog_price_tuple(context_over)
+        return [{"threshold": 200_000, "prices": prices}] if prices else []
+
+    tiers: list[dict[str, object]] = []
+    for raw_tier in raw_tiers:
+        if not isinstance(raw_tier, dict):
+            continue
+        tier = raw_tier.get("tier")
+        size = tier.get("size") if isinstance(tier, dict) else None
+        prices = _catalog_price_tuple(raw_tier)
+        if prices is None or not isinstance(size, (int, float)):
+            continue
+        tiers.append({"threshold": int(size), "prices": prices})
+    tiers.sort(key=lambda item: int(item["threshold"]))
+    return tiers
+
+
+def _catalog_record(raw: dict[str, object], provider: str) -> dict[str, object] | None:
+    cost = raw.get("cost")
+    prices = _catalog_price_tuple(cost)
+    if prices is None or not isinstance(cost, dict):
+        return None
+
+    modes: dict[str, dict[str, object]] = {}
+    experimental = raw.get("experimental")
+    mode_values = experimental.get("modes") if isinstance(experimental, dict) else None
+    if isinstance(mode_values, dict):
+        for mode, value in mode_values.items():
+            if not isinstance(value, dict):
+                continue
+            mode_prices = _catalog_price_tuple(value.get("cost"))
+            if mode_prices is None:
+                continue
+            markers: dict[str, str] = {}
+            mode_provider = value.get("provider")
+            body = mode_provider.get("body") if isinstance(mode_provider, dict) else None
+            if isinstance(body, dict):
+                for key in ("service_tier", "speed"):
+                    marker = body.get(key)
+                    if isinstance(marker, str) and marker:
+                        markers[key] = marker.strip().lower()
+            modes[str(mode).strip().lower()] = {
+                "prices": list(mode_prices),
+                "markers": markers,
+            }
+
+    aliases = {str(raw.get("id") or "").strip()}
+    canonical = raw.get("canonical_model_id")
+    if isinstance(canonical, str) and "/" in canonical:
+        aliases.add(canonical.split("/", 1)[1].strip())
+    aliases = {alias for alias in aliases if alias}
+    if not aliases:
+        return None
+    return {
+        "provider": provider,
+        "aliases": sorted(aliases),
+        "prices": list(prices),
+        "long_context": _catalog_tiers(cost),
+        "modes": modes,
+        "last_updated": str(raw.get("last_updated") or ""),
+    }
+
+
+def _normalize_catalog_payload(data: object) -> dict[str, object]:
+    if not isinstance(data, dict):
+        raise ValueError("pricing catalog must be an object")
+    models: dict[str, dict[str, object]] = {}
+    for provider, provider_data in data.items():
+        if not isinstance(provider_data, dict):
+            continue
+        provider_name = str(provider).strip().lower()
+        raw_models = provider_data.get("models")
+        if not isinstance(raw_models, dict):
+            continue
+        for model_id, raw_model in raw_models.items():
+            if not isinstance(raw_model, dict):
+                continue
+            canonical = raw_model.get("canonical_model_id")
+            if isinstance(canonical, str) and canonical:
+                canonical_provider = canonical.split("/", 1)[0].lower()
+                if canonical_provider != provider_name:
+                    continue
+            elif provider_name in _CATALOG_EXCLUDED_PROVIDERS:
+                continue
+            record = _catalog_record(raw_model, provider_name)
+            if record is None:
+                continue
+            aliases = set(record["aliases"])  # type: ignore[arg-type]
+            aliases.add(str(model_id).strip())
+            for alias in aliases:
+                if not alias:
+                    continue
+                existing = models.get(alias)
+                if existing is None or (
+                    provider_name in _CATALOG_FIRST_PARTY_PROVIDERS
+                    and str(existing.get("provider") or "")
+                    not in _CATALOG_FIRST_PARTY_PROVIDERS
+                ):
+                    models[alias] = record
+    if not models:
+        raise ValueError("pricing catalog contains no usable token prices")
+    return {
+        "source": "models.dev",
+        "url": PRICING_CATALOG_URL,
+        "retrieved_at": datetime.now(timezone.utc).isoformat(),
+        "models": models,
+    }
+
+
+def _load_catalog_config() -> dict[str, object]:
+    global _catalog_cache, _catalog_cache_mtime, _catalog_generation
+
+    with _catalog_cache_lock:
+        try:
+            mtime = PRICING_CATALOG_FILE.stat().st_mtime
+        except OSError:
+            if _catalog_cache is not None and _catalog_cache_mtime == -1.0:
+                return _catalog_cache
+            _catalog_cache = _empty_catalog_config()
+            _catalog_cache_mtime = -1.0
+            _catalog_generation += 1
+            return _catalog_cache
+
+        if _catalog_cache is not None and mtime == _catalog_cache_mtime:
+            return _catalog_cache
+        try:
+            data = json.loads(PRICING_CATALOG_FILE.read_text())
+            if not isinstance(data, dict) or not isinstance(data.get("models"), dict):
+                raise ValueError("pricing catalog must contain models")
+            _catalog_cache = data
+            _catalog_cache_mtime = mtime
+            _catalog_generation += 1
+            return data
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            log.warning("Failed to parse %s, ignoring catalog", PRICING_CATALOG_FILE)
+            _catalog_cache = _empty_catalog_config()
+            _catalog_cache_mtime = mtime
+            _catalog_generation += 1
+            return _catalog_cache
+
+
+def refresh_pricing_catalog(*, timeout: float = 15.0) -> int:
+    """Fetch models.dev pricing and replace the local generated catalog."""
+    request = Request(PRICING_CATALOG_URL, headers={"User-Agent": "agentic-metric"})
+    with urlopen(request, timeout=timeout) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    catalog = _normalize_catalog_payload(payload)
+    PRICING_CATALOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temporary = PRICING_CATALOG_FILE.with_name(PRICING_CATALOG_FILE.name + ".tmp")
+    temporary.write_text(json.dumps(catalog, ensure_ascii=False, indent=2) + "\n")
+    temporary.replace(PRICING_CATALOG_FILE)
+    global _catalog_cache, _catalog_cache_mtime
+    _catalog_cache = None
+    _catalog_cache_mtime = -1.0
+    _load_catalog_config()
+    _reset_derived_caches()
+    return len(catalog["models"])  # type: ignore[arg-type]
+
+
+def refresh_pricing_catalog_if_stale() -> bool:
+    """Refresh the catalog once per day, retaining the last good snapshot on failure."""
+    catalog = _load_catalog_config()
+    retrieved_at = catalog.get("retrieved_at")
+    try:
+        age = datetime.now(timezone.utc) - datetime.fromisoformat(str(retrieved_at))
+    except (TypeError, ValueError):
+        age = None
+    if age is not None and age.total_seconds() < _PRICING_CATALOG_TTL_SECONDS:
+        return False
+    try:
+        refresh_pricing_catalog()
+        return True
+    except (OSError, URLError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
+        log.warning("Failed to refresh pricing catalog: %s", exc)
+        return False
+
+
+def _catalog_models() -> dict[str, dict[str, object]]:
+    models = _load_catalog_config().get("models")
+    return models if isinstance(models, dict) else {}
+
+
+def _catalog_record_for_model(model: str) -> dict[str, object] | None:
+    record = _catalog_models().get(model)
+    return record if isinstance(record, dict) else None
+
+
+def _catalog_model_tokens() -> tuple[tuple[tuple[str, ...], str], ...]:
+    global _catalog_model_tokens_generation, _sorted_catalog_model_tokens
+    _load_catalog_config()
+    if _catalog_model_tokens_generation != _catalog_generation:
+        _sorted_catalog_model_tokens = tuple(
+            sorted(
+                ((_model_tokens(model), model) for model in _catalog_models()),
+                key=lambda item: (len(item[0]), len(item[1])),
+                reverse=True,
+            )
+        )
+        _catalog_model_tokens_generation = _catalog_generation
+    return _sorted_catalog_model_tokens
+
+
+def _catalog_standard_pricing(model: str) -> PriceTuple | None:
+    record = _catalog_record_for_model(model)
+    if record is None:
+        return None
+    prices = record.get("prices")
+    return _price_tuple(prices) if prices is not None else None
+
+
+def _catalog_mode_pricing(
+    model: str, service_tier: str, speed: str
+) -> PriceTuple | None:
+    record = _catalog_record_for_model(model)
+    modes = record.get("modes") if record else None
+    if not isinstance(modes, dict):
+        return None
+    markers = [
+        ("speed", _normalize_mode(speed)),
+        ("service_tier", _normalize_mode(service_tier)),
+    ]
+    for marker_key, marker in markers:
+        if marker in _STANDARD_MODES:
+            continue
+        for mode, value in modes.items():
+            if not isinstance(value, dict):
+                continue
+            mode_markers = value.get("markers")
+            mode_name = str(mode).lower()
+            provider_marker = _MODE_ALIASES.get(marker, marker) if marker_key == "service_tier" else marker
+            if isinstance(mode_markers, dict) and mode_markers:
+                if mode_markers.get(marker_key) != provider_marker:
+                    continue
+            elif marker != mode_name:
+                continue
+            prices = value.get("prices")
+            parsed = _price_tuple(prices)
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def _catalog_long_context_pricing(
+    model: str, total_input_tokens: int
+) -> PriceTuple | None:
+    record = _catalog_record_for_model(model)
+    tiers = record.get("long_context") if record else None
+    if not isinstance(tiers, list):
+        return None
+    matched: PriceTuple | None = None
+    for tier in tiers:
+        if not isinstance(tier, dict):
+            continue
+        if total_input_tokens > int(tier.get("threshold", 0)):
+            prices = _price_tuple(tier.get("prices"))
+            if prices is not None:
+                matched = prices
+    return matched
+
+
 def _reset_derived_caches() -> None:
     """Drop memoized lookups. Needed when module tables are patched in tests."""
     global _derived_generation
@@ -509,19 +861,21 @@ def _reset_derived_caches() -> None:
     _mode_price_memo.clear()
     _long_context_memo.clear()
     _cache_rule_memo.clear()
-    _derived_generation = -1
+    _derived_generation = (-1, -1)
 
 
 def _fresh_derived_caches() -> None:
-    """Drop memoized lookups when a different user config became effective."""
+    """Drop memoized lookups when a different pricing config became effective."""
     global _derived_generation
     _load_user_config()
-    if _derived_generation != _config_generation:
+    _load_catalog_config()
+    generation = (_config_generation, _catalog_generation)
+    if _derived_generation != generation:
         _pricing_memo.clear()
         _mode_price_memo.clear()
         _long_context_memo.clear()
         _cache_rule_memo.clear()
-        _derived_generation = _config_generation
+        _derived_generation = generation
 
 
 def _empty_user_config() -> dict[str, object]:
@@ -537,8 +891,10 @@ def _price_tuple(vals: object) -> PriceTuple:
     if not isinstance(vals, (list, tuple)) or len(vals) != 4:
         raise ValueError("pricing values must be a 4-item list")
     return (
-        float(vals[0]), float(vals[1]),
-        float(vals[2]), float(vals[3]),
+        float(vals[0]),
+        float(vals[1]),
+        float(vals[2]),
+        float(vals[3]),
     )
 
 
@@ -586,10 +942,14 @@ def _load_user_config() -> dict[str, object]:
                 if "tiers" in rule:
                     tiers = _normalize_long_context_tiers(rule["tiers"])
                 else:
-                    tiers = _normalize_long_context_tiers([{
-                        "threshold": rule["threshold"],
-                        "prices": rule["prices"],
-                    }])
+                    tiers = _normalize_long_context_tiers(
+                        [
+                            {
+                                "threshold": rule["threshold"],
+                                "prices": rule["prices"],
+                            }
+                        ]
+                    )
                 long_context[normalize_model(str(model))] = {"tiers": tiers}
             result["long_context"] = long_context
 
@@ -669,7 +1029,9 @@ def _save_user_config(config: dict[str, object]) -> None:
                 (config.get("cache") or {}).items()  # type: ignore[union-attr]
             )
         }
-        disabled = sorted(str(model) for model in config.get("disabled_builtin_long_context") or [])
+        disabled = sorted(
+            str(model) for model in config.get("disabled_builtin_long_context") or []
+        )
         data: dict[str, object] = {
             "models": models,
             "long_context": long_context,
@@ -742,10 +1104,12 @@ def set_user_long_context_pricing(
     existing = dict(rules.get(model) or {})
     tiers = _normalize_long_context_tiers(existing.get("tiers") or [])
     tiers = [tier for tier in tiers if int(tier["threshold"]) != int(threshold)]
-    tiers.append({
-        "threshold": int(threshold),
-        "prices": (input_price, output_price, cache_read_price, cache_write_price),
-    })
+    tiers.append(
+        {
+            "threshold": int(threshold),
+            "prices": (input_price, output_price, cache_read_price, cache_write_price),
+        }
+    )
     tiers.sort(key=lambda tier: int(tier["threshold"]))
     rules[model] = {"tiers": tiers}
     disabled = set(str(v) for v in config.get("disabled_builtin_long_context") or [])
@@ -767,7 +1131,9 @@ def remove_user_long_context_pricing(model: str, threshold: int | None = None) -
     else:
         existing = dict(rules[model] or {})
         tiers = _normalize_long_context_tiers(existing.get("tiers") or [])
-        next_tiers = [tier for tier in tiers if int(tier["threshold"]) != int(threshold)]
+        next_tiers = [
+            tier for tier in tiers if int(tier["threshold"]) != int(threshold)
+        ]
         if len(next_tiers) == len(tiers):
             return False
         if next_tiers:
@@ -872,11 +1238,16 @@ def _compute_pricing(model: str) -> tuple[float, float, float, float] | None:
     if base_model in user:
         return user[base_model]
 
-    if _matches_any_model_prefix(base_model, _UNKNOWN_MODEL_PREFIXES):
+    if (
+        _matches_any_model_prefix(base_model, _UNKNOWN_MODEL_PREFIXES)
+        and _catalog_standard_pricing(base_model) is None
+    ):
         return None
 
     if embedded_mode:
-        premium = _compute_non_standard_mode_prices(base_model, embedded_mode, embedded_mode)
+        premium = _compute_non_standard_mode_prices(
+            base_model, embedded_mode, embedded_mode
+        )
         if premium is not None:
             return premium
 
@@ -899,22 +1270,28 @@ def is_model_priced(model: str) -> bool:
 def _user_long_context_rules() -> list[dict[str, object]]:
     rules = []
     for model, rule in (_load_user_config().get("long_context") or {}).items():
-        rules.append({
-            "prefixes": (str(model),),
-            "tiers": _normalize_long_context_tiers(rule.get("tiers") or []),
-            "source": "user",
-        })
+        rules.append(
+            {
+                "prefixes": (str(model),),
+                "tiers": _normalize_long_context_tiers(rule.get("tiers") or []),
+                "source": "user",
+            }
+        )
     rules.sort(key=lambda r: len(str(r["prefixes"][0])), reverse=True)
     return rules
 
 
 def _builtin_long_context_enabled(rule: dict[str, object]) -> bool:
-    disabled = set(str(v) for v in _load_user_config().get("disabled_builtin_long_context") or [])
+    disabled = set(
+        str(v) for v in _load_user_config().get("disabled_builtin_long_context") or []
+    )
     prefixes = tuple(str(p) for p in rule["prefixes"])
     return not any(prefix in disabled for prefix in prefixes)
 
 
-def get_long_context_rules(*, include_disabled: bool = False) -> list[dict[str, object]]:
+def get_long_context_rules(
+    *, include_disabled: bool = False
+) -> list[dict[str, object]]:
     """Return effective long-context pricing tiers for display and fingerprints."""
     rules: list[dict[str, object]] = []
     for rule in _user_long_context_rules():
@@ -924,6 +1301,28 @@ def get_long_context_rules(*, include_disabled: bool = False) -> list[dict[str, 
             row["threshold"] = int(tier["threshold"])
             row["prices"] = tuple(float(v) for v in tier["prices"])
             rules.append(row)
+    for model, record in _catalog_models().items():
+        aliases = record.get("aliases") if isinstance(record, dict) else None
+        tiers = record.get("long_context") if isinstance(record, dict) else None
+        if not isinstance(aliases, list) or not aliases or aliases[0] != model:
+            continue
+        if not isinstance(tiers, list):
+            continue
+        for tier in tiers:
+            if not isinstance(tier, dict):
+                continue
+            prices = _price_tuple(tier.get("prices"))
+            threshold = tier.get("threshold")
+            if prices is None or not isinstance(threshold, (int, float)):
+                continue
+            rules.append(
+                {
+                    "prefixes": (model,),
+                    "threshold": int(threshold),
+                    "prices": prices,
+                    "source": "catalog",
+                }
+            )
     for rule in _LONG_CONTEXT_RULES:
         enabled = _builtin_long_context_enabled(rule)
         if not enabled and not include_disabled:
@@ -999,9 +1398,10 @@ def _long_context_prices(
         user_tiers, unknown, builtin = entry  # type: ignore[misc]
 
     for tiers in user_tiers:
-        matched = _matched_tier_prices(total_input_tokens, tiers)
-        if matched is not None:
-            return matched
+        if isinstance(tiers, list):
+            matched = _matched_tier_prices(total_input_tokens, tiers)
+            if matched is not None:
+                return matched
 
     if unknown:
         return None
@@ -1009,17 +1409,37 @@ def _long_context_prices(
     current_group: int | None = None
     matched_builtin: tuple[float, float, float, float] | None = None
     for group, rule in builtin:
-        if current_group is not None and group != current_group and matched_builtin is not None:
-            return matched_builtin
+        if (
+            current_group is not None
+            and group != current_group
+            and matched_builtin is not None
+        ):
+            break
         current_group = group
         if total_input_tokens > int(rule["threshold"]):
             matched_builtin = tuple(float(v) for v in rule["prices"])  # type: ignore[assignment]
-    return matched_builtin
+    if matched_builtin is not None:
+        return matched_builtin
+    if model not in _BUILTIN_PRICING:
+        return _catalog_long_context_pricing(model, total_input_tokens)
+    return None
+
+
+def get_catalog_pricing() -> dict[str, PriceTuple]:
+    """Return standard prices supplied by the local aggregate catalog."""
+    return {
+        model: pricing
+        for model in _catalog_models()
+        if (pricing := _catalog_standard_pricing(model)) is not None
+    }
 
 
 def get_all_pricing() -> dict[str, tuple[float, float, float, float]]:
-    """Return merged pricing: builtin defaults overridden by user values."""
+    """Return catalog and builtin pricing overridden by user values."""
     merged = dict(_BUILTIN_PRICING)
+    for model, pricing in get_catalog_pricing().items():
+        if model not in merged:
+            merged[model] = pricing
     merged.update(_load_user_pricing())
     return merged
 
@@ -1032,7 +1452,9 @@ def _user_cache_rule(model: str) -> dict[str, float] | None:
     except KeyError:
         rules = _load_user_config().get("cache") or {}
         matched: dict[str, float] | None = None
-        for prefix, rule in sorted(rules.items(), key=lambda x: len(x[0]), reverse=True):
+        for prefix, rule in sorted(
+            rules.items(), key=lambda x: len(x[0]), reverse=True
+        ):
             if _matches_model_prefix(model, str(prefix)):
                 matched = dict(rule)
                 break
@@ -1058,7 +1480,10 @@ def get_pricing_fingerprint() -> str:
     payload = {
         "version": _PRICING_FINGERPRINT_VERSION,
         "aliases": sorted(_MODEL_ALIASES.items()),
-        "builtin": sorted((model, list(prices)) for model, prices in _BUILTIN_PRICING.items()),
+        "builtin": sorted(
+            (model, list(prices)) for model, prices in _BUILTIN_PRICING.items()
+        ),
+        "catalog_models": _catalog_models(),
         "long_context_rules": get_long_context_rules(include_disabled=True),
         "mode_aliases": sorted(_MODE_ALIASES.items()),
         "non_billable": sorted(_NON_BILLABLE_MODELS),
@@ -1108,13 +1533,17 @@ def estimate_cost(
     ):
         return 0.0
 
-    cache_creation_1h_tokens = max(0, min(cache_creation_1h_tokens, cache_creation_tokens))
+    cache_creation_1h_tokens = max(
+        0, min(cache_creation_1h_tokens, cache_creation_tokens)
+    )
     cache_creation_5m_tokens = cache_creation_tokens - cache_creation_1h_tokens
 
     base_model, embedded_mode = _decompose_model_name(model)
     effective_service_tier = service_tier or embedded_mode
     effective_speed = speed or embedded_mode
-    pricing = _non_standard_mode_prices(base_model, effective_service_tier, effective_speed)
+    pricing = _non_standard_mode_prices(
+        base_model, effective_service_tier, effective_speed
+    )
     if pricing is None and apply_long_context:
         pricing = _long_context_prices(
             base_model,
@@ -1122,6 +1551,13 @@ def estimate_cost(
             cache_read_tokens=cache_read_tokens,
             cache_creation_tokens=cache_creation_tokens,
         )
+    elif pricing is not None and apply_long_context and embedded_mode:
+        mode_name = "ultrafast" if embedded_mode == "ultrafast" else "priority"
+        mode_tiers = _NON_STANDARD_MODE_LONG_CONTEXT_PRICING.get(mode_name, {})
+        total_input_tokens = input_tokens + cache_read_tokens + cache_creation_tokens
+        mode_long_prices = mode_tiers.get(base_model)
+        if mode_long_prices is not None and total_input_tokens > 272_000:
+            pricing = mode_long_prices
     pricing = pricing or get_pricing(model)
     if pricing is None:
         return None

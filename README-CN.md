@@ -27,7 +27,7 @@ agent 数据文件(`~/.claude/`、`~/.codex/`);如果配置了 SSH
 ## 各 Agent 指标覆盖情况
 
 | 字段 | Claude Code | Codex |
-|------|:-----------:|:-----:|
+| ------ | :-----------: | :-----: |
 | 会话 ID | ✓ | ✓ |
 | 项目路径 | ✓ | ✓ |
 | Git 分支 | ✓ | ✓ |
@@ -83,7 +83,7 @@ agentic-metric pricing               # 管理模型定价
 ### Report 选项
 
 | 选项 | 说明 |
-|------|------|
+| ------ | ------ |
 | `--today` | 今日用量 |
 | `--week` | 本周用量(周一至今) |
 | `--month` | 本月用量 |
@@ -100,12 +100,12 @@ agentic-metric pricing               # 管理模型定价
 
 ### 定价管理
 
-模型定价用于成本估算。常见模型已内置定价,你可以通过 CLI 添加新模型、覆盖现有价格、
-配置长上下文费率和缓存时长费率。用户自定义定价存储在 `$DATA/agentic_metric/pricing.json`。
+模型定价用于成本估算。正常 sync/report/TUI 启动时会每天从 models.dev 刷新本地聚合目录,内置定价作为离线兜底。你可以通过 CLI 添加新模型、覆盖聚合或内置价格、配置长上下文费率和缓存时长费率。本地聚合快照存储在 `$DATA/agentic_metric/pricing-catalog.json`,手动覆盖存储在 `$DATA/agentic_metric/pricing.json`。
 
 #### 基础模型定价
 
 ```bash
+agentic-metric pricing update                                              # 立即刷新 models.dev 聚合目录
 agentic-metric pricing list                                                # 查看所有模型定价
 agentic-metric pricing set deepseek-r2 -i 0.5 -o 2.0                       # 添加新模型
 agentic-metric pricing set claude-opus-4-7 -i 4.0 -o 20.0 -cr 0.4 -cw 5.0  # 覆盖内置定价
@@ -149,7 +149,7 @@ agentic-metric pricing cache reset claude-sonnet-4                # 删除覆盖
 底栏显示为:`PgUp/PgDn Range · ←→ View · . Now · r Auto-refresh · p Pricing · ? Help · q Quit`。
 
 | 键 | 底栏 | 功能 |
-|----|------|------|
+| ---- | ------ | ------ |
 | `←` / `→` | View | 切换视图(Today / Week / Month) |
 | `PageUp` / `PageDown` | Range | 时间范围往前 / 往后 |
 | `.` | Now | 回到"现在"(清空 offset) |
@@ -203,7 +203,7 @@ agentic-metric pricing cache reset claude-sonnet-4                # 删除覆盖
 | gpt-6-astra | $10.00 | $50.00 | $1.00 | $12.50 |
 | gpt-6-sol | $2.00 | $10.00 | $0.20 | $2.50 |
 | gpt-6-luna | $0.10 | $0.50 | $0.01 | $0.125 |
-| gpt-5.6-sol | $5.00 | $30.00 | $0.50 | $6.25 |
+| gpt-5.6-sol | $4.00 | $20.00 | $0.40 | $5.00 |
 | gpt-5.6-terra | $2.00 | $12.00 | $0.20 | $2.50 |
 | gpt-5.6-luna | $0.20 | $1.20 | $0.02 | $0.25 |
 | gpt-5.5 | $5.00 | $30.00 | $0.50 | — |
@@ -293,7 +293,7 @@ src/agentic_metric/
 | `$DATA` | `~/.local/share` | `~/Library/Application Support` | `%LOCALAPPDATA%` |
 
 | Agent | 数据路径 | 采集内容 |
-|-------|---------|---------|
+| ------- | --------- | --------- |
 | Claude Code | `~/.claude/projects/` | JSONL 会话、token 用量、模型、分支 |
 | Claude Code | `~/.claude/stats-cache.json` | 每日活动统计 |
 | Codex | `~/.codex/sessions/` | JSONL 会话、token 用量、模型 |

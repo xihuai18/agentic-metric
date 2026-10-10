@@ -104,14 +104,17 @@ breakdown, top projects, and optional extra drill-down tables.
 
 ### Pricing Management
 
-Model pricing is used for cost estimation. Builtin pricing is included for
-common models. You can add new models, override builtins, configure
-long-context rates, and configure observable cache-duration rates via CLI.
-Overrides are stored in `$DATA/agentic_metric/pricing.json`.
+Model pricing is used for cost estimation. A local catalog from models.dev is
+refreshed daily during normal sync/report/TUI startup, while builtin pricing is
+kept as an offline fallback. You can add new models, override catalog or builtin
+prices, configure long-context rates, and configure observable cache-duration
+rates via CLI. The catalog snapshot is stored in `$DATA/agentic_metric/pricing-catalog.json`;
+manual overrides are stored in `$DATA/agentic_metric/pricing.json`.
 
 #### Basic model pricing
 
 ```bash
+agentic-metric pricing update                                              # Refresh the models.dev catalog now
 agentic-metric pricing list                                                # List all model pricing
 agentic-metric pricing set deepseek-r2 -i 0.5 -o 2.0                       # Add a new model
 agentic-metric pricing set claude-opus-4-7 -i 4.0 -o 20.0 -cr 0.4 -cw 5.0  # Override builtin
@@ -228,7 +231,7 @@ The table uses regular published rates, excluding time-limited promotions.
 | gpt-6-astra | $10.00 | $50.00 | $1.00 | $12.50 |
 | gpt-6-sol | $2.00 | $10.00 | $0.20 | $2.50 |
 | gpt-6-luna | $0.10 | $0.50 | $0.01 | $0.125 |
-| gpt-5.6-sol | $5.00 | $30.00 | $0.50 | $6.25 |
+| gpt-5.6-sol | $4.00 | $20.00 | $0.40 | $5.00 |
 | gpt-5.6-terra | $2.00 | $12.00 | $0.20 | $2.50 |
 | gpt-5.6-luna | $0.20 | $1.20 | $0.02 | $0.25 |
 | gpt-5.5 | $5.00 | $30.00 | $0.50 | — |

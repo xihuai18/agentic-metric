@@ -16,9 +16,10 @@ from agentic_metric.pricing import (
     get_long_context_rules,
     get_pricing,
     get_pricing_fingerprint,
-    remove_user_pricing,
     remove_user_long_context_pricing,
+    remove_user_pricing,
     reset_all_user_pricing,
+    refresh_pricing_catalog,
     set_user_cache_pricing,
     set_user_long_context_pricing,
     set_user_pricing,
@@ -28,6 +29,7 @@ from agentic_metric.pricing import (
 def _reset_cache():
     """Reset the user-pricing memo cache between tests."""
     import agentic_metric.pricing as p
+
     p._user_cache = None
     p._user_cache_mtime = -1.0
 
@@ -36,12 +38,25 @@ def _reset_cache():
 def _reset_pricing_state():
     """Reset all global pricing state before and after each test."""
     import agentic_metric.pricing as p
+
     p._user_cache = None
     p._user_cache_mtime = -1.0
+    p._catalog_cache = None
+    p._catalog_cache_mtime = -1.0
+    p._catalog_generation = 0
+    p._catalog_model_tokens_generation = -1
+    p._sorted_catalog_model_tokens = ()
+    p._reset_derived_caches()
     p._warned_models.clear()
     yield
     p._user_cache = None
     p._user_cache_mtime = -1.0
+    p._catalog_cache = None
+    p._catalog_cache_mtime = -1.0
+    p._catalog_generation = 0
+    p._catalog_model_tokens_generation = -1
+    p._sorted_catalog_model_tokens = ()
+    p._reset_derived_caches()
     p._warned_models.clear()
 
 
@@ -98,7 +113,10 @@ def test_mock_model_is_never_billed(tmp_path):
     """``mock`` transcripts are a local harness artifact, not a paid model."""
     with _patch_empty_user_pricing(tmp_path):
         assert get_pricing("mock") == (0.0, 0.0, 0.0, 0.0)
-        assert estimate_cost("mock", input_tokens=1_000_000, output_tokens=1_000_000) == 0.0
+        assert (
+            estimate_cost("mock", input_tokens=1_000_000, output_tokens=1_000_000)
+            == 0.0
+        )
         # Only the exact placeholder is exempt.
         assert get_pricing("mock-1-preview") is None
 
@@ -106,7 +124,9 @@ def test_mock_model_is_never_billed(tmp_path):
 def test_unparseable_config_drops_memoized_overrides(tmp_path):
     """A broken pricing file must stop applying the last valid overrides."""
     pricing_file = tmp_path / "pricing.json"
-    pricing_file.write_text(json.dumps({"models": {"custom-model": [1.0, 2.0, 3.0, 4.0]}}))
+    pricing_file.write_text(
+        json.dumps({"models": {"custom-model": [1.0, 2.0, 3.0, 4.0]}})
+    )
 
     _reset_cache()
     with patch("agentic_metric.pricing.PRICING_FILE", pricing_file):
@@ -123,12 +143,14 @@ def test_failed_save_does_not_apply_the_override(tmp_path):
     _reset_cache()
     with patch("agentic_metric.pricing.PRICING_FILE", pricing_file):
         assert get_pricing("custom-model") is None
-        with patch(
-            "agentic_metric.pricing._save_user_config",
-            side_effect=OSError("read-only volume"),
+        with (
+            patch(
+                "agentic_metric.pricing._save_user_config",
+                side_effect=OSError("read-only volume"),
+            ),
+            pytest.raises(OSError),
         ):
-            with pytest.raises(OSError):
-                set_user_pricing("custom-model", 1.0, 2.0)
+            set_user_pricing("custom-model", 1.0, 2.0)
         assert get_pricing("custom-model") is None
     _reset_cache()
 
@@ -169,8 +191,8 @@ def test_no_family_fallback_gpt5():
 
 def test_gpt_56_family_pricing(tmp_path):
     with _patch_empty_user_pricing(tmp_path):
-        assert get_pricing("gpt-5.6") == (5.0, 30.0, 0.50, 6.25)
-        assert get_pricing("gpt-5.6-sol") == (5.0, 30.0, 0.50, 6.25)
+        assert get_pricing("gpt-5.6") == (4.0, 20.0, 0.40, 5.0)
+        assert get_pricing("gpt-5.6-sol") == (4.0, 20.0, 0.40, 5.0)
         assert get_pricing("gpt-5.6-terra") == (2.0, 12.0, 0.20, 2.50)
         assert get_pricing("gpt-5.6-luna") == (0.20, 1.20, 0.02, 0.25)
 
@@ -249,6 +271,30 @@ def test_openai_long_context_is_model_specific(tmp_path):
     _reset_cache()
 
 
+def test_gpt_6_astra_long_context_includes_cache_write(tmp_path):
+    """Astra uses the standard long-context and cache-write rates."""
+    with _patch_empty_user_pricing(tmp_path):
+        below = estimate_cost(
+            "gpt-6-astra",
+            input_tokens=272_000,
+            output_tokens=1_000,
+            cache_read_tokens=10_000,
+            cache_creation_tokens=2_000,
+        )
+        above = estimate_cost(
+            "gpt-6-astra",
+            input_tokens=272_001,
+            output_tokens=1_000,
+            cache_read_tokens=10_000,
+            cache_creation_tokens=2_000,
+        )
+        expected_below = (272_000 * 20.0 + 1_000 * 75.0 + 10_000 * 2.0 + 2_000 * 25.0) / 1_000_000
+        expected_above = (272_001 * 20.0 + 1_000 * 75.0 + 10_000 * 2.0 + 2_000 * 25.0) / 1_000_000
+        assert abs(below - expected_below) < 0.001
+        assert abs(above - expected_above) < 0.001
+    _reset_cache()
+
+
 def test_gpt_55_long_context_uses_long_context_rate(tmp_path):
     with _patch_empty_user_pricing(tmp_path):
         cost = estimate_cost(
@@ -265,8 +311,8 @@ def test_gpt_55_long_context_uses_long_context_rate(tmp_path):
 @pytest.mark.parametrize(
     ("model", "prices"),
     [
-        ("gpt-5.6", (10.0, 45.0, 1.0, 12.5)),
-        ("gpt-5.6-sol", (10.0, 45.0, 1.0, 12.5)),
+        ("gpt-5.6", (8.0, 30.0, 0.8, 10.0)),
+        ("gpt-5.6-sol", (8.0, 30.0, 0.8, 10.0)),
         ("gpt-5.6-terra", (4.0, 18.0, 0.40, 5.0)),
         ("gpt-5.6-luna", (0.40, 1.80, 0.04, 0.50)),
     ],
@@ -291,13 +337,18 @@ def test_gpt_56_long_context_uses_model_rate(tmp_path, model, prices):
 
 def test_builtin_long_context_uses_highest_matching_tier(tmp_path):
     with _patch_empty_user_pricing(tmp_path):
-        with patch("agentic_metric.pricing._LONG_CONTEXT_RULES", [{
-            "prefixes": ("gpt-5.5",),
-            "tiers": (
-                {"threshold": 272_000, "prices": (10.0, 45.0, 1.0, 0.0)},
-                {"threshold": 512_000, "prices": (12.0, 52.0, 1.2, 0.0)},
-            ),
-        }]):
+        with patch(
+            "agentic_metric.pricing._LONG_CONTEXT_RULES",
+            [
+                {
+                    "prefixes": ("gpt-5.5",),
+                    "tiers": (
+                        {"threshold": 272_000, "prices": (10.0, 45.0, 1.0, 0.0)},
+                        {"threshold": 512_000, "prices": (12.0, 52.0, 1.2, 0.0)},
+                    ),
+                }
+            ],
+        ):
             cost = estimate_cost(
                 "gpt-5.5",
                 input_tokens=600_000,
@@ -332,7 +383,7 @@ def test_openai_priority_tier_uses_official_priority_prices(tmp_path):
             cache_creation_tokens=1_000_000,
             service_tier="priority",
         )
-        assert abs(cost - (10.0 + 60.0 + 1.0 + 12.5)) < 1e-9
+        assert abs(cost - (8.0 + 40.0 + 0.8 + 10.0)) < 1e-9
 
         standard = estimate_cost(
             "gpt-5.6-sol",
@@ -341,7 +392,7 @@ def test_openai_priority_tier_uses_official_priority_prices(tmp_path):
             service_tier="default",
             apply_long_context=False,
         )
-        assert abs(standard - (5.0 + 30.0)) < 1e-9
+        assert abs(standard - (4.0 + 20.0)) < 1e-9
     _reset_cache()
 
 
@@ -354,7 +405,7 @@ def test_priority_tier_wins_over_long_context(tmp_path):
             output_tokens=1_000,
             service_tier="priority",
         )
-        expected = (300_000 * 10.0 + 1_000 * 60.0) / 1_000_000
+        expected = (300_000 * 8.0 + 1_000 * 40.0) / 1_000_000
         assert abs(cost - expected) < 1e-9
     _reset_cache()
 
@@ -398,11 +449,14 @@ def test_priority_tier_without_official_price_falls_back_to_standard(tmp_path):
         assert abs(nano - 0.20) < 1e-9
 
         # Unknown models stay unknown even with a tier marker.
-        assert estimate_cost(
-            "gpt-5.4-pro",
-            input_tokens=1_000,
-            service_tier="priority",
-        ) is None
+        assert (
+            estimate_cost(
+                "gpt-5.4-pro",
+                input_tokens=1_000,
+                service_tier="priority",
+            )
+            is None
+        )
     _reset_cache()
 
 
@@ -416,17 +470,21 @@ def test_anthropic_speed_fast_does_not_bill_gpt_priority(tmp_path):
             speed="fast",
             apply_long_context=False,
         )
-        assert abs(cost - (5.0 + 30.0)) < 1e-9
+        assert abs(cost - (4.0 + 20.0)) < 1e-9
     _reset_cache()
 
 
 def test_priority_tier_does_not_leak_family_price_to_user_priced_pro(tmp_path):
     pricing_file = tmp_path / "pricing.json"
-    pricing_file.write_text(json.dumps({
-        "models": {
-            "gpt-5.4-pro": [60.0, 270.0, 6.0, 0.0],
-        },
-    }))
+    pricing_file.write_text(
+        json.dumps(
+            {
+                "models": {
+                    "gpt-5.4-pro": [60.0, 270.0, 6.0, 0.0],
+                },
+            }
+        )
+    )
 
     _reset_cache()
     with patch("agentic_metric.pricing.PRICING_FILE", pricing_file):
@@ -607,18 +665,13 @@ def test_estimate_cost_zero_usage_unknown_model_is_silent(caplog):
 
 def test_gpt_6_astra_pricing(tmp_path):
     with _patch_empty_user_pricing(tmp_path):
-        assert get_pricing("gpt-6-astra") == (10.0, 50.0, 1.00, 12.50)
-        assert get_pricing("gpt-6") == (10.0, 50.0, 1.00, 12.50)
-
-        # Priority mode doubles base token prices
+        assert get_pricing("gpt-6-astra") == (10.0, 50.0, 1.00, 12.5)
+        assert get_pricing("gpt-6") == (10.0, 50.0, 1.00, 12.5)
         assert get_pricing("codex/gpt-6-astra[fast]") == (20.0, 100.0, 2.0, 25.0)
-
-        # Long context tier (>272k)
-        cost_normal = estimate_cost("gpt-6-astra", input_tokens=100_000, output_tokens=10_000)
-        assert abs(cost_normal - (100_000 * 10.0 + 10_000 * 50.0) / 1_000_000) < 1e-9
-
-        cost_long = estimate_cost("gpt-6-astra", input_tokens=300_000, output_tokens=10_000)
-        assert abs(cost_long - (300_000 * 20.0 + 10_000 * 75.0) / 1_000_000) < 1e-9
+        assert get_pricing("gpt-6-astra-ultrafast") == (60.0, 300.0, 6.0, 75.0)
+        assert estimate_cost("gpt-6-astra", input_tokens=272_001) == 272_001 * 20 / 1_000_000
+        assert estimate_cost("gpt-6-astra-fast", input_tokens=272_001) == 272_001 * 40 / 1_000_000
+        assert estimate_cost("gpt-6-astra-ultrafast", input_tokens=272_001) == 272_001 * 120 / 1_000_000
 
 
 def test_new_model_pricing(tmp_path):
@@ -660,22 +713,37 @@ def test_wrapped_model_decomposition(tmp_path):
         assert get_pricing("cursor/claude-sonnet-5-high") == (2.0, 10.0, 0.20, 2.50)
         assert get_pricing("cursor/claude-opus-5-medium") == (5.0, 25.0, 0.50, 6.25)
         assert get_pricing("cursor/gemini-3-flash-high") == (0.50, 3.00, 0.05, 0.0)
-        assert get_pricing("openrouter/openai/gpt-5.6-sol") == (5.0, 30.0, 0.50, 6.25)
+        assert get_pricing("openrouter/openai/gpt-5.6-sol") == (4.0, 20.0, 0.40, 5.0)
         assert get_pricing("my-proxy/gemini-3.8-flash") == (1.50, 7.50, 0.15, 0.0)
 
         # Bedrock prefix and version suffix
-        assert get_pricing("anthropic.claude-haiku-4-5-20251001-v1:0") == (1.0, 5.0, 0.10, 1.25)
-        assert get_pricing("us.anthropic.claude-sonnet-4-6-v1:0") == (3.0, 15.0, 0.30, 3.75)
+        assert get_pricing("anthropic.claude-haiku-4-5-20251001-v1:0") == (
+            1.0,
+            5.0,
+            0.10,
+            1.25,
+        )
+        assert get_pricing("us.anthropic.claude-sonnet-4-6-v1:0") == (
+            3.0,
+            15.0,
+            0.30,
+            3.75,
+        )
         assert get_pricing("anthropic/claude-opus-5") == (5.0, 25.0, 0.50, 6.25)
 
         # Fast mode markers on wrapped models
-        assert get_pricing("codex/gpt-5.6-sol[fast]") == (10.0, 60.0, 1.0, 12.5)
-        assert get_pricing("cursor/gpt-5.6-sol-high-fast") == (10.0, 60.0, 1.0, 12.5)
+        assert get_pricing("codex/gpt-5.6-sol[fast]") == (8.0, 40.0, 0.8, 10.0)
+        assert get_pricing("cursor/gpt-5.6-sol-high-fast") == (8.0, 40.0, 0.8, 10.0)
         assert get_pricing("cursor/gpt-5.6-terra-high-fast") == (4.0, 24.0, 0.40, 5.0)
 
         # Non-supported / unknown models remain None
         assert get_pricing("cursor/default") is None
-        assert get_pricing("600a22_256k_new_sft_0803_glm_agent_w_sp_mtp3_lr_2e-5_agentic_test_id_parser") is None
+        assert (
+            get_pricing(
+                "600a22_256k_new_sft_0803_glm_agent_w_sp_mtp3_lr_2e-5_agentic_test_id_parser"
+            )
+            is None
+        )
 
         # Cursor-wrapped Grok resolves via alias
         assert get_pricing("cursor/cursor-grok-4.6-xhigh-fast") == (2.0, 6.0, 0.5, 0.0)
@@ -692,10 +760,10 @@ def test_model_name_normalization_ignores_case_and_separators(tmp_path):
         assert get_pricing("cursor/cursor_grok_4_6_xhigh_fast") == grok
         assert get_pricing("cursor.cursor-grok-4.6-high") == grok
         assert get_pricing("grok-4.6:latest") == grok
-        assert get_pricing("openrouter.openai/GPT_5_6_SOL") == (5.0, 30.0, 0.5, 6.25)
-        assert get_pricing("gpt.5.6.sol") == (5.0, 30.0, 0.5, 6.25)
+        assert get_pricing("openrouter.openai/GPT_5_6_SOL") == (4.0, 20.0, 0.4, 5.0)
+        assert get_pricing("gpt.5.6.sol") == (4.0, 20.0, 0.4, 5.0)
         assert get_pricing("cursor/GPT_6_MAX") == (10.0, 50.0, 1.0, 12.5)
-        assert get_pricing("codex/gpt_5_6_sol_fast_20260912") == (10.0, 60.0, 1.0, 12.5)
+        assert get_pricing("codex/gpt_5_6_sol_fast_20260912") == (8.0, 40.0, 0.8, 10.0)
 
 
 def test_model_name_normalization_respects_token_boundaries(tmp_path):
@@ -711,7 +779,10 @@ def test_synthetic_model_is_non_billable(caplog):
     p._warned_models.clear()
     caplog.set_level("WARNING", logger="agentic_metric.pricing")
 
-    assert estimate_cost("<synthetic>", input_tokens=1_000_000, output_tokens=1_000_000) == 0.0
+    assert (
+        estimate_cost("<synthetic>", input_tokens=1_000_000, output_tokens=1_000_000)
+        == 0.0
+    )
     assert "Unknown model" not in caplog.text
 
 
@@ -724,11 +795,15 @@ def test_all_models_have_four_values():
 def test_user_pricing_override(tmp_path):
     """User pricing should take precedence over builtin."""
     pricing_file = tmp_path / "pricing.json"
-    pricing_file.write_text(json.dumps({
-        "models": {
-            "claude-opus-4-6": [99.0, 99.0, 99.0, 99.0],
-        },
-    }))
+    pricing_file.write_text(
+        json.dumps(
+            {
+                "models": {
+                    "claude-opus-4-6": [99.0, 99.0, 99.0, 99.0],
+                },
+            }
+        )
+    )
 
     _reset_cache()
     with patch("agentic_metric.pricing.PRICING_FILE", pricing_file):
@@ -776,24 +851,37 @@ def test_pricing_fingerprint_includes_lookup_rules(tmp_path):
     _reset_cache()
     with patch("agentic_metric.pricing.PRICING_FILE", pricing_file):
         base = get_pricing_fingerprint()
-        with patch("agentic_metric.pricing._MODEL_ALIASES", {"alias-model": "claude-sonnet-4-6"}):
+        with patch(
+            "agentic_metric.pricing._MODEL_ALIASES",
+            {"alias-model": "claude-sonnet-4-6"},
+        ):
             assert get_pricing_fingerprint() != base
         with patch("agentic_metric.pricing._LONG_CONTEXT_RULES", []):
             assert get_pricing_fingerprint() != base
-        with patch("agentic_metric.pricing._UNKNOWN_MODEL_PREFIXES", ("gpt-5-pro", "custom-pro")):
+        with patch(
+            "agentic_metric.pricing._UNKNOWN_MODEL_PREFIXES",
+            ("gpt-5-pro", "custom-pro"),
+        ):
             assert get_pricing_fingerprint() != base
-        with patch("agentic_metric.pricing._NON_BILLABLE_MODELS", {"<synthetic>", "<nonbillable>"}):
+        with patch(
+            "agentic_metric.pricing._NON_BILLABLE_MODELS",
+            {"<synthetic>", "<nonbillable>"},
+        ):
             assert get_pricing_fingerprint() != base
     _reset_cache()
 
 
 def test_user_pricing_override_is_exact_match(tmp_path):
     pricing_file = tmp_path / "pricing.json"
-    pricing_file.write_text(json.dumps({
-        "models": {
-            "gpt-5": [99.0, 99.0, 99.0, 99.0],
-        },
-    }))
+    pricing_file.write_text(
+        json.dumps(
+            {
+                "models": {
+                    "gpt-5": [99.0, 99.0, 99.0, 99.0],
+                },
+            }
+        )
+    )
 
     _reset_cache()
     with patch("agentic_metric.pricing.PRICING_FILE", pricing_file):
@@ -804,11 +892,15 @@ def test_user_pricing_override_is_exact_match(tmp_path):
 
 def test_user_base_price_does_not_disable_long_context(tmp_path):
     pricing_file = tmp_path / "pricing.json"
-    pricing_file.write_text(json.dumps({
-        "models": {
-            "gpt-5.4": [1.0, 2.0, 0.1, 0.0],
-        },
-    }))
+    pricing_file.write_text(
+        json.dumps(
+            {
+                "models": {
+                    "gpt-5.4": [1.0, 2.0, 0.1, 0.0],
+                },
+            }
+        )
+    )
 
     _reset_cache()
     with patch("agentic_metric.pricing.PRICING_FILE", pricing_file):
@@ -852,7 +944,11 @@ def test_user_long_context_supports_multiple_tiers(tmp_path):
         set_user_long_context_pricing("gpt-5.5", 272_000, 10.0, 45.0, 1.0, 0.0)
         set_user_long_context_pricing("gpt-5.5", 512_000, 12.0, 52.0, 1.2, 0.0)
 
-        rules = [r for r in get_long_context_rules() if tuple(r["prefixes"]) == ("gpt-5.5",) and r["source"] == "user"]
+        rules = [
+            r
+            for r in get_long_context_rules()
+            if tuple(r["prefixes"]) == ("gpt-5.5",) and r["source"] == "user"
+        ]
         assert [r["threshold"] for r in rules] == [272_000, 512_000]
 
         low_cost = estimate_cost(
@@ -874,7 +970,11 @@ def test_user_long_context_supports_multiple_tiers(tmp_path):
         assert abs(high_cost - expected_high) < 0.001
 
         assert remove_user_long_context_pricing("gpt-5.5", threshold=512_000) is True
-        rules = [r for r in get_long_context_rules() if tuple(r["prefixes"]) == ("gpt-5.5",) and r["source"] == "user"]
+        rules = [
+            r
+            for r in get_long_context_rules()
+            if tuple(r["prefixes"]) == ("gpt-5.5",) and r["source"] == "user"
+        ]
         assert [r["threshold"] for r in rules] == [272_000]
     _reset_cache()
 
@@ -908,11 +1008,15 @@ def test_builtin_long_context_can_be_disabled_and_enabled(tmp_path):
 def test_user_custom_model(tmp_path):
     """User can add entirely new models."""
     pricing_file = tmp_path / "pricing.json"
-    pricing_file.write_text(json.dumps({
-        "models": {
-            "my-custom-model": [1.0, 2.0, 0.1, 0.2],
-        },
-    }))
+    pricing_file.write_text(
+        json.dumps(
+            {
+                "models": {
+                    "my-custom-model": [1.0, 2.0, 0.1, 0.2],
+                },
+            }
+        )
+    )
 
     _reset_cache()
     with patch("agentic_metric.pricing.PRICING_FILE", pricing_file):
@@ -923,11 +1027,15 @@ def test_user_custom_model(tmp_path):
 
 def test_user_custom_model_can_price_unknown_prefix(tmp_path):
     pricing_file = tmp_path / "pricing.json"
-    pricing_file.write_text(json.dumps({
-        "models": {
-            "gpt-5.4-pro": [60.0, 270.0, 6.0, 0.0],
-        },
-    }))
+    pricing_file.write_text(
+        json.dumps(
+            {
+                "models": {
+                    "gpt-5.4-pro": [60.0, 270.0, 6.0, 0.0],
+                },
+            }
+        )
+    )
 
     _reset_cache()
     with patch("agentic_metric.pricing.PRICING_FILE", pricing_file):
@@ -970,11 +1078,15 @@ def test_reset_all_user_pricing(tmp_path):
 
 def test_get_all_pricing_merges(tmp_path):
     pricing_file = tmp_path / "pricing.json"
-    pricing_file.write_text(json.dumps({
-        "models": {
-            "new-model": [1.0, 2.0, 0.1, 0.2],
-        },
-    }))
+    pricing_file.write_text(
+        json.dumps(
+            {
+                "models": {
+                    "new-model": [1.0, 2.0, 0.1, 0.2],
+                },
+            }
+        )
+    )
 
     _reset_cache()
     with patch("agentic_metric.pricing.PRICING_FILE", pricing_file):
@@ -982,4 +1094,74 @@ def test_get_all_pricing_merges(tmp_path):
         assert "claude-opus-4-7" in merged
         assert "new-model" in merged
         assert merged["new-model"] == (1.0, 2.0, 0.1, 0.2)
+    _reset_cache()
+
+
+def test_catalog_imports_modes_and_long_context(tmp_path):
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "openai": {
+                        "models": {
+                            "gpt-9": {
+                                "id": "gpt-9",
+                                "canonical_model_id": "openai/gpt-9",
+                                "cost": {
+                                    "input": 1.0,
+                                    "output": 4.0,
+                                    "cache_read": 0.1,
+                                    "cache_write": 1.25,
+                                    "tiers": [
+                                        {
+                                            "tier": {"type": "context", "size": 100},
+                                            "input": 2.0,
+                                            "output": 8.0,
+                                            "cache_read": 0.2,
+                                            "cache_write": 2.5,
+                                        }
+                                    ],
+                                },
+                                "experimental": {
+                                    "modes": {
+                                        "fast": {
+                                            "cost": {
+                                                "input": 2.0,
+                                                "output": 8.0,
+                                                "cache_read": 0.2,
+                                                "cache_write": 2.5,
+                                            },
+                                            "provider": {
+                                                "body": {"service_tier": "priority"}
+                                            },
+                                        }
+                                    }
+                                },
+                            }
+                        }
+                    }
+                }
+            ).encode()
+
+    pricing_file = tmp_path / "pricing.json"
+    catalog_file = tmp_path / "pricing-catalog.json"
+    with (
+        patch("agentic_metric.pricing.PRICING_FILE", pricing_file),
+        patch("agentic_metric.pricing.PRICING_CATALOG_FILE", catalog_file),
+        patch("agentic_metric.pricing.urlopen", return_value=Response()),
+    ):
+        assert refresh_pricing_catalog() == 1
+        assert get_pricing("codex/gpt-9[fast]") == (2.0, 8.0, 0.2, 2.5)
+        assert get_pricing("cursor/gpt-9-high") == (1.0, 4.0, 0.1, 1.25)
+        assert estimate_cost("cursor/gpt-9", input_tokens=101) == 101 * 2 / 1_000_000
+
+        set_user_pricing("gpt-9", 9.0, 9.0, 9.0, 9.0)
+        assert get_pricing("gpt-9") == (9.0, 9.0, 9.0, 9.0)
+        assert estimate_cost("gpt-9-fast", input_tokens=1) == 9 / 1_000_000
     _reset_cache()
