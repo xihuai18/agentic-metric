@@ -411,8 +411,9 @@ def test_claude_history_sync_scopes_state_by_provider_and_root(tmp_path):
     state_keys = db.conn.execute(
         "SELECT key FROM sync_state WHERE key LIKE 'cc_jsonl:v14:%'"
     ).fetchall()
-    assert len(state_keys) == 4
+    assert len(state_keys) == 6
     assert sum(":assistant_ids:" in row["key"] for row in state_keys) == 2
+    assert sum(":checkpoint:" in row["key"] for row in state_keys) == 2
     db.close()
 
 
@@ -1323,6 +1324,122 @@ def _run_rsync_sync(data_dir, responses):
             error = str(exc)
         cache = _cache_root_for(target)
     return error, cache, run_mock
+
+
+def test_parallel_rsync_batches_share_a_bounded_transfer_budget(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier, BoundedSemaphore, Lock
+    import agentic_metric.collectors.remote as remote
+
+    monkeypatch.setattr(remote.shutil, "which", lambda _: "/usr/bin/rsync")
+    monkeypatch.setattr(remote, "_RSYNC_TRANSFER_SLOTS", BoundedSemaphore(2))
+    monkeypatch.setattr(remote, "_DOWNLOAD_BATCH_FILES", 1)
+    barrier = Barrier(2, timeout=5)
+    lock = Lock()
+    active = peak = 0
+    manifest = {f"p/{index}.jsonl": {"size": "10", "mtime": "123"} for index in range(4)}
+
+    def transfer(argv, timeout, label, *, input_bytes, allowed_returncodes):
+        nonlocal active, peak
+        name = input_bytes.decode().rstrip("\0")
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        try:
+            barrier.wait()
+            path = Path(argv[-1]) / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("received\n")
+            return Mock(stdout=f">f+++++++++ {name}\n".encode())
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(remote, "_run_command", transfer)
+
+    def mirror(index):
+        root = tmp_path / str(index)
+        root.mkdir()
+        missing = remote._download_changed_files(
+            _rsync_target(), root, manifest, {}, list(manifest), rsync_base=_RSYNC_BASE
+        )
+        assert not missing
+        assert json.loads((root / ".remote-manifest.json").read_text()) == manifest
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(mirror, range(2)))
+    assert peak == 2
+
+
+def test_parallel_rsync_fatal_failure_drains_completed_batches(tmp_path, monkeypatch):
+    from threading import Barrier, BoundedSemaphore, Event
+    import agentic_metric.collectors.remote as remote
+
+    monkeypatch.setattr(remote.shutil, "which", lambda _: "/usr/bin/rsync")
+    monkeypatch.setattr(remote, "_RSYNC_BATCH_WORKERS", 2)
+    monkeypatch.setattr(remote, "_RSYNC_TRANSFER_SLOTS", BoundedSemaphore(2))
+    monkeypatch.setattr(remote, "_DOWNLOAD_BATCH_FILES", 2)
+    stop = Event()
+    monkeypatch.setattr(remote, "Event", lambda: stop)
+    barrier = Barrier(2, timeout=5)
+    manifest = {f"p/{index}.jsonl": {"size": "10", "mtime": "123"} for index in range(8)}
+    attempts = []
+
+    def transfer(argv, timeout, label, *, input_bytes, allowed_returncodes):
+        names = input_bytes.decode().rstrip("\0").split("\0")
+        attempts.append(names)
+        barrier.wait()
+        if names[0] == "p/0.jsonl":
+            raise RuntimeError("link down")
+        assert stop.wait(5)
+        for name in names:
+            path = Path(argv[-1]) / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("received\n")
+        return Mock(stdout="".join(f">f+++++++++ {name}\n" for name in names).encode())
+
+    monkeypatch.setattr(remote, "_run_command", transfer)
+    with pytest.raises(RuntimeError, match="link down"):
+        remote._download_changed_files(
+            _rsync_target(), tmp_path, manifest, {}, list(manifest), rsync_base=_RSYNC_BASE
+        )
+    saved = json.loads((tmp_path / ".remote-manifest.json").read_text())
+    assert set(saved) == {"p/2.jsonl", "p/3.jsonl"}
+    assert len(attempts) == 2
+    assert (tmp_path / ".remote-manifest.incomplete").exists()
+
+
+def test_parallel_rsync_manifest_updates_stay_on_the_caller_thread(tmp_path, monkeypatch):
+    from threading import Barrier, get_ident
+    import agentic_metric.collectors.remote as remote
+
+    monkeypatch.setattr(remote.shutil, "which", lambda _: "/usr/bin/rsync")
+    monkeypatch.setattr(remote, "_DOWNLOAD_BATCH_FILES", 1)
+    barrier = Barrier(4, timeout=5)
+    manifest = {f"p/{index}.jsonl": {"size": "10", "mtime": "123"} for index in range(4)}
+    caller = get_ident()
+    writers = []
+    save = remote._save_manifest
+
+    def record(root, value):
+        writers.append(get_ident())
+        save(root, value)
+
+    def transfer(argv, timeout, label, *, input_bytes, allowed_returncodes):
+        barrier.wait()
+        name = input_bytes.decode().rstrip("\0")
+        path = Path(argv[-1]) / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("received\n")
+        return Mock(stdout=f">f+++++++++ {name}\n".encode())
+
+    monkeypatch.setattr(remote, "_run_command", transfer)
+    monkeypatch.setattr(remote, "_save_manifest", record)
+    remote._download_changed_files(
+        _rsync_target(), tmp_path, manifest, {}, list(manifest), rsync_base=_RSYNC_BASE
+    )
+    assert len(writers) == 4
+    assert set(writers) == {caller}
 
 
 def test_remote_rsync_command_is_read_only_and_safe(monkeypatch):
@@ -3816,10 +3933,11 @@ def test_claude_incremental_sync_uses_skipped_files_for_replay_dedupe(tmp_path):
     write_file(second, extra_input=5)
     with patch("agentic_metric.collectors.claude_code.PROJECTS_DIR", projects), \
          patch(
-             "agentic_metric.collectors.claude_code._read_assistant_ids",
-             side_effect=AssertionError("assistant ids should come from cache"),
-         ):
+             "agentic_metric.collectors.claude_code._read_cwd",
+             wraps=__import__("agentic_metric.collectors.claude_code", fromlist=["_read_cwd"])._read_cwd,
+         ) as read_cwd:
         ClaudeCodeCollector().sync_history(db)
+        assert first not in [call.args[0] for call in read_cwd.call_args_list]
 
     row = db.conn.execute(
         """SELECT input_tokens, output_tokens

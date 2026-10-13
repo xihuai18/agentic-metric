@@ -423,9 +423,14 @@ download changed session/index files instead of transferring full agent
 directories again. When both hosts have `rsync`, ordinary remote paths use
 verified block deltas instead of retransferring growing logs in full; otherwise
 sync uses SSH/tar. The remote files are read-only in either case. Downloads run
-in size-bounded batches and the manifest
-advances after each batch, so `timeout` applies per batch and an interrupted
-sync of a large remote resumes instead of starting over. Cached files that
+in size-bounded batches, with at most four rsync transfers across all roots.
+The largest batches start first, and the manifest advances after each completed
+batch, so `timeout` applies per batch and interrupted syncs resume.
+Claude parsing checkpoints persist in the local database. Growing logs verify
+the complete previously parsed prefix before processing new records; rewrites,
+truncation, replay ownership, pricing, or timezone changes trigger a full parse.
+The first sync after upgrade builds checkpoints for affected files; subsequent
+syncs reuse them. Cached files that
 disappear from the remote manifest are
 moved under `.stale/` and no longer parsed; usage already recorded from them
 stays in the database, so historical reports keep it.

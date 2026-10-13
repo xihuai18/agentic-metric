@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
+import os
 import re
+import time
+import zlib
 from datetime import datetime
 from pathlib import Path
 
@@ -101,6 +106,9 @@ class _SessionAccum:
         "all_assistant_ids",
         "assistant_usage_by_id",
         "usage_buckets",
+        "_hasher",
+        "tail_unterminated",
+        "_checkpoint_restored",
     )
 
     def __init__(
@@ -147,6 +155,9 @@ class _SessionAccum:
             tuple[int, int, int, int, int, float | None, str, int, str, str],
         ] = {}
         self.usage_buckets: dict[tuple[str, int, str, str], dict] = {}
+        self._hasher = hashlib.sha256()
+        self.tail_unterminated = False
+        self._checkpoint_restored = False
 
     def read_new_lines(self) -> None:
         """Read only bytes appended since last call."""
@@ -155,29 +166,44 @@ class _SessionAccum:
             self._reset_today_counters(today_str)
 
         try:
-            stat = self.file_path.stat()
-            size = stat.st_size
-            file_id = (stat.st_dev, stat.st_ino)
-            mtime_ns = stat.st_mtime_ns
-            same_size_rewrite = (
-                size == self.offset
-                and self.file_mtime_ns >= 0
-                and mtime_ns != self.file_mtime_ns
-            )
-            if (
-                (self.file_id is not None and file_id != self.file_id)
-                or size < self.offset
-                or same_size_rewrite
-            ):
-                self._reset_parsed_state(today_str)
-            self.file_id = file_id
-            if size == self.offset:
-                self.file_mtime_ns = mtime_ns
-                return
             with open(self.file_path, "rb") as f:
+                stat = os.fstat(f.fileno())
+                size = stat.st_size
+                file_id = (stat.st_dev, stat.st_ino)
+                mtime_ns = stat.st_mtime_ns
+                restored = self._checkpoint_restored
+                same_size_rewrite = (
+                    size == self.offset
+                    and self.file_mtime_ns >= 0
+                    and mtime_ns != self.file_mtime_ns
+                )
+                if (
+                    (self.file_id is not None and file_id != self.file_id)
+                    or size < self.offset
+                    or same_size_rewrite
+                    or (restored and mtime_ns != self.file_mtime_ns)
+                ):
+                    self._reset_parsed_state(today_str)
+                self.file_id = file_id
+                if size == self.offset:
+                    self.file_mtime_ns = mtime_ns
+                    return
                 f.seek(self.offset)
                 new_data = f.read()
-            self.offset = size
+                final_stat = os.fstat(f.fileno())
+                if restored and (final_stat.st_size, final_stat.st_mtime_ns) != (size, mtime_ns):
+                    self._reset_parsed_state(today_str)
+                    f.seek(0)
+                    new_data = f.read()
+                    stable_stat = os.fstat(f.fileno())
+                    if (stable_stat.st_size, stable_stat.st_mtime_ns) != (final_stat.st_size, final_stat.st_mtime_ns):
+                        raise RuntimeError("session changed while verifying checkpoint")
+                    self.file_id = file_id
+                    final_stat = stable_stat
+                mtime_ns = final_stat.st_mtime_ns
+            self._checkpoint_restored = False
+            self._hasher.update(new_data)
+            self.offset += len(new_data)
             self.file_mtime_ns = mtime_ns
         except OSError:
             return
@@ -192,8 +218,13 @@ class _SessionAccum:
         for raw_line in lines:
             self._process_raw_line(raw_line, today_str)
 
-        if tail.strip() and not self._process_raw_line(tail, today_str):
-            self.partial_line = tail
+        self.tail_unterminated = False
+        self._checkpoint_restored = False
+        if tail.strip():
+            if self._process_raw_line(tail, today_str):
+                self.tail_unterminated = True
+            else:
+                self.partial_line = tail
 
     def _reset_parsed_state(self, today_str: str) -> None:
         """Reset parsed counters after file truncation/replacement."""
@@ -213,6 +244,9 @@ class _SessionAccum:
         self.git_branch = ""
         self.model = ""
         self.partial_line = b""
+        self._hasher = hashlib.sha256()
+        self.tail_unterminated = False
+        self._checkpoint_restored = False
         self.assistant_message_dates.clear()
         self.all_assistant_ids.clear()
         self.assistant_usage_by_id.clear()
@@ -737,6 +771,7 @@ class ClaudeCodeCollector(BaseCollector):
         # reparse enriched logs without clearing stored history.
         sync_prefix = f"{self.sync_state_prefix}:"
         assistant_ids_prefix = f"{self.sync_state_prefix}:assistant_ids:"
+        checkpoint_prefix = f"{self.sync_state_prefix}:checkpoint:"
 
         try:
             project_dirs = list(projects_dir.iterdir())
@@ -772,6 +807,7 @@ class ClaudeCodeCollector(BaseCollector):
                 )
                 active_sync_keys.add(sync_key)
                 active_sync_keys.add(f"{assistant_ids_prefix}{jsonl_file}")
+                active_sync_keys.add(f"{checkpoint_prefix}{jsonl_file}")
 
             if file_states and all(unchanged for _, _, _, unchanged in file_states):
                 continue
@@ -780,24 +816,39 @@ class ClaudeCodeCollector(BaseCollector):
             for jsonl_file, sync_key, state, unchanged in file_states:
                 reprocess_for_replay = False
                 if unchanged:
-                    assistant_ids = _cached_assistant_ids(
+                    cached = _cached_assistant_ids(
                         db,
-                        jsonl_file,
                         f"{assistant_ids_prefix}{jsonl_file}",
                         state,
                     )
-                    reprocess_for_replay = bool(seen_assistant_ids & assistant_ids)
-                    if not reprocess_for_replay:
-                        seen_assistant_ids.update(assistant_ids)
-                        continue
+                    if cached is not None:
+                        assistant_ids, owned_ids = cached
+                        excluded_ids = assistant_ids - owned_ids
+                        reprocess_for_replay = (
+                            {item for item in assistant_ids if item in seen_assistant_ids}
+                            != excluded_ids
+                        )
+                        if not reprocess_for_replay:
+                            seen_assistant_ids.update(owned_ids)
+                            continue
 
                 real_cwd = _read_cwd(jsonl_file)
                 project_path = real_cwd if real_cwd else str(project_dir)
-                accum = _SessionAccum(
+                checkpoint_key = f"{checkpoint_prefix}{jsonl_file}"
+                accum = _restore_checkpoint(
+                    db,
+                    checkpoint_key,
                     jsonl_file,
-                    project_path=project_path,
-                    replayed_assistant_ids=seen_assistant_ids,
+                    project_path,
+                    seen_assistant_ids,
                 )
+                restored_offset = accum.offset if accum is not None else -1
+                if accum is None:
+                    accum = _SessionAccum(
+                        jsonl_file,
+                        project_path=project_path,
+                        replayed_assistant_ids=seen_assistant_ids,
+                    )
                 accum.read_new_lines()
                 seen_assistant_ids.update(accum.assistant_message_dates)
                 _store_assistant_ids(
@@ -805,7 +856,14 @@ class ClaudeCodeCollector(BaseCollector):
                     f"{assistant_ids_prefix}{jsonl_file}",
                     state,
                     accum.all_assistant_ids,
+                    set(accum.assistant_message_dates),
                 )
+                if accum.offset != restored_offset and not accum.tail_unterminated:
+                    db.set_sync_state(
+                        checkpoint_key,
+                        _encode_checkpoint(accum),
+                        commit=False,
+                    )
 
                 session_id = _session_id_for_jsonl(
                     project_dir,
@@ -913,54 +971,206 @@ def _sync_state_value(file_size: int, mtime_ns: int) -> str:
 
 def _cached_assistant_ids(
     db,
-    jsonl_file: Path,
     cache_key: str,
     state: str,
-) -> set[str]:
+) -> tuple[set[str], set[str]] | None:
+    """Return (all ids, owned ids), or None when ownership is unknown."""
     cached = db.get_sync_state(cache_key)
-    if cached:
-        try:
-            payload = json.loads(cached)
-        except (json.JSONDecodeError, TypeError):
-            payload = None
-        if isinstance(payload, dict) and payload.get("state") == state:
-            ids = payload.get("ids")
-            if isinstance(ids, list) and all(isinstance(item, str) for item in ids):
-                return set(ids)
+    if not cached:
+        return None
+    try:
+        payload = json.loads(cached)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("state") != state:
+        return None
+    ids = payload.get("ids")
+    owned = payload.get("owned_ids")
+    if not (
+        isinstance(ids, list)
+        and isinstance(owned, list)
+        and all(isinstance(item, str) for item in ids)
+        and all(isinstance(item, str) for item in owned)
+    ):
+        return None
+    ids_set, owned_set = set(ids), set(owned)
+    return (ids_set, owned_set) if owned_set <= ids_set else None
 
-    ids = _read_assistant_ids(jsonl_file)
-    _store_assistant_ids(db, cache_key, state, ids)
-    return ids
 
-
-def _store_assistant_ids(db, cache_key: str, state: str, ids: set[str]) -> None:
+def _store_assistant_ids(
+    db,
+    cache_key: str,
+    state: str,
+    ids: set[str],
+    owned_ids: set[str],
+) -> None:
     value = json.dumps(
-        {"state": state, "ids": sorted(ids)},
+        {"state": state, "ids": sorted(ids), "owned_ids": sorted(owned_ids)},
         ensure_ascii=False,
         separators=(",", ":"),
     )
     db.set_sync_state(cache_key, value, commit=False)
 
 
-def _read_assistant_ids(jsonl_file: Path) -> set[str]:
-    """Read assistant message ids from a JSONL file without rebuilding usage."""
-    ids: set[str] = set()
+# ── Persistent parse checkpoints ─────────────────────────────────────────
+
+_CHECKPOINT_VERSION = 1
+_CHECKPOINT_INTS = (
+    "user_turns", "message_count", "input_tokens", "output_tokens",
+    "cache_read", "cache_create", "cache_create_1h",
+)
+_CHECKPOINT_STRS = (
+    "first_ts", "last_ts", "first_prompt", "last_prompt", "git_branch", "model",
+)
+_COST = (int, float, type(None))
+_DATES_TYPES = (str, int, str, str)
+_USAGE_TYPES = (int, int, int, int, int, _COST, str, int, str, str)
+_BUCKET_TYPES = (str, int, str, str, int, int, int, int, int, int, int, _COST)
+_BUCKET_FIELDS = (
+    "message_count", "user_turns", "input_tokens", "output_tokens",
+    "cache_read_tokens", "cache_creation_tokens", "cache_creation_1h_tokens",
+    "estimated_cost_usd",
+)
+
+
+def _timezone_signature() -> list:
+    return [os.environ.get("TZ", ""), list(time.tzname), time.timezone, time.altzone, time.daylight]
+
+
+def _typed_row(row: object, types: tuple) -> bool:
+    return (
+        isinstance(row, list)
+        and len(row) == len(types)
+        and all(isinstance(value, kind) and not isinstance(value, bool) for value, kind in zip(row, types))
+    )
+
+
+def _encode_checkpoint(accum: _SessionAccum) -> str:
+    ids: dict[str, list | None] = {}
+    for msg_id in accum.all_assistant_ids:
+        dates = accum.assistant_message_dates.get(msg_id)
+        usage = accum.assistant_usage_by_id.get(msg_id)
+        ids[msg_id] = None if dates is None else [
+            list(dates),
+            None if usage is None else list(usage),
+        ]
+    payload = {
+        "v": _CHECKPOINT_VERSION,
+        "tz": _timezone_signature(),
+        "project": accum.project_path,
+        "offset": accum.offset,
+        "sha256": accum._hasher.hexdigest(),
+        "partial": len(accum.partial_line),
+        "scalars": {name: getattr(accum, name) for name in _CHECKPOINT_INTS + _CHECKPOINT_STRS},
+        "ids": ids,
+        "buckets": [
+            [*key, *(bucket[field] for field in _BUCKET_FIELDS)]
+            for key, bucket in accum.usage_buckets.items()
+        ],
+    }
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return base64.b64encode(zlib.compress(raw, 1)).decode("ascii")
+
+
+def _decode_checkpoint(value: str | None) -> dict | None:
+    if not value:
+        return None
     try:
-        with jsonl_file.open(encoding="utf-8") as handle:
-            for line in handle:
-                try:
-                    entry = json.loads(line)
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    continue
-                if entry.get("type") != "assistant":
-                    continue
-                msg = entry.get("message", {})
-                msg_id = msg.get("id", "") if isinstance(msg, dict) else ""
-                if isinstance(msg_id, str) and msg_id:
-                    ids.add(msg_id)
+        payload = json.loads(zlib.decompress(base64.b64decode(value, validate=True)))
+        scalars = payload["scalars"]
+        offset, partial = payload["offset"], payload["partial"]
+        valid = (
+            payload["v"] == _CHECKPOINT_VERSION
+            and payload["tz"] == _timezone_signature()
+            and isinstance(payload["project"], str)
+            and type(offset) is int and type(partial) is int
+            and 0 <= partial <= offset
+            and isinstance(payload["sha256"], str)
+            and all(type(scalars[name]) is int for name in _CHECKPOINT_INTS)
+            and all(isinstance(scalars[name], str) for name in _CHECKPOINT_STRS)
+            and isinstance(payload["ids"], dict)
+            and all(
+                entry is None or (
+                    isinstance(entry, list) and len(entry) == 2
+                    and _typed_row(entry[0], _DATES_TYPES)
+                    and (entry[1] is None or _typed_row(entry[1], _USAGE_TYPES))
+                )
+                for entry in payload["ids"].values()
+            )
+            and isinstance(payload["buckets"], list)
+            and all(_typed_row(row, _BUCKET_TYPES) for row in payload["buckets"])
+        )
+    except (ValueError, TypeError, KeyError, zlib.error):
+        return None
+    return payload if valid else None
+
+
+def _restore_checkpoint(
+    db,
+    checkpoint_key: str,
+    jsonl_file: Path,
+    project_path: str,
+    seen_assistant_ids: set[str],
+) -> _SessionAccum | None:
+    """Rebuild a parsed accumulator only after hashing its whole consumed prefix."""
+    payload = _decode_checkpoint(db.get_sync_state(checkpoint_key))
+    if payload is None or payload["project"] != project_path:
+        return None
+    ids = payload["ids"]
+    replayed = {msg_id for msg_id, entry in ids.items() if entry is None}
+    if {msg_id for msg_id in ids if msg_id in seen_assistant_ids} != replayed:
+        return None
+
+    offset, partial = payload["offset"], payload["partial"]
+    hasher = hashlib.sha256()
+    tail = b""
+    try:
+        with open(jsonl_file, "rb") as f:
+            initial_stat = os.fstat(f.fileno())
+            remaining = offset
+            while remaining:
+                chunk = f.read(min(remaining, 1 << 20))
+                if not chunk:
+                    return None
+                remaining -= len(chunk)
+                hasher.update(chunk)
+                if partial:
+                    tail = (tail + chunk)[-partial:]
+            stat = os.fstat(f.fileno())
     except OSError:
-        return ids
-    return ids
+        return None
+    if (stat.st_size, stat.st_mtime_ns) != (initial_stat.st_size, initial_stat.st_mtime_ns):
+        return None
+    if hasher.hexdigest() != payload["sha256"]:
+        return None
+
+    accum = _SessionAccum(jsonl_file, project_path, seen_assistant_ids)
+    for name, value in payload["scalars"].items():
+        if name in _CHECKPOINT_INTS or name in _CHECKPOINT_STRS:
+            setattr(accum, name, value)
+    for msg_id, entry in ids.items():
+        accum.all_assistant_ids.add(msg_id)
+        if entry is not None:
+            accum.assistant_message_dates[msg_id] = tuple(entry[0])
+            if entry[1] is not None:
+                accum.assistant_usage_by_id[msg_id] = tuple(entry[1])
+    for row in payload["buckets"]:
+        key = (row[0], row[1], row[2], row[3])
+        accum.usage_buckets[key] = {
+            "usage_date": row[0],
+            "usage_hour": row[1],
+            "project_path": project_path,
+            "model": row[2],
+            "account_key": row[3],
+            **dict(zip(_BUCKET_FIELDS, row[4:])),
+        }
+    accum.offset = offset
+    accum._hasher = hasher
+    accum.partial_line = tail
+    accum.file_id = (stat.st_dev, stat.st_ino)
+    accum.file_mtime_ns = stat.st_mtime_ns
+    accum._checkpoint_restored = True
+    return accum
 
 
 def _sync_state_matches(state: str | None, file_size: int, mtime_ns: int) -> bool:

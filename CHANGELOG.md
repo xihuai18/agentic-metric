@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.8.20 (2026-10-13)
+
+- Remote rsync batches run with a shared four-transfer limit and largest-first scheduling. Completed batches retain progress when another transfer fails, while SQLite and manifest updates remain serial.
+- Claude history persists compressed parsing checkpoints across CLI/TUI restarts. Growing logs verify their complete old prefix before decoding only new records; rewrites, truncation, replay ownership changes, timezone changes, and pricing invalidation fall back to a full parse.
+
 ## v0.8.19 (2026-10-13)
 
 - Bounded, catalog-aware model normalization caching speeds up per-event pricing during history sync without delaying external catalog updates.

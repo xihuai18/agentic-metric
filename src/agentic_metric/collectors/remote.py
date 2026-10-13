@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import CancelledError, FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from hashlib import sha1
 from io import BytesIO
@@ -14,6 +15,7 @@ import shutil
 import stat
 import subprocess
 import tarfile
+from threading import BoundedSemaphore, Event
 import time
 
 from ..config import DATA_DIR, RemoteSpec
@@ -36,6 +38,8 @@ _DOWNLOAD_BATCH_FILES = 500
 # download is treated as failing. Keeps one oversized file from blocking the
 # mirror, without spending one timeout per batch when the remote is down.
 _MAX_SKIPPED_BATCHES = 3
+_RSYNC_BATCH_WORKERS = 4
+_RSYNC_TRANSFER_SLOTS = BoundedSemaphore(_RSYNC_BATCH_WORKERS)
 
 # Exit 24 may omit files; only confirmed deliveries advance the manifest.
 _RSYNC_VANISHED_EXIT = 24
@@ -499,8 +503,91 @@ def _download_changed_files(
         if via_rsync:
             (cache_root / target.source_child).mkdir(parents=True, exist_ok=True)
 
+    def record(batch: list[str], written: set[str]) -> None:
+        for rel in batch:
+            if rel in written:
+                progress[rel] = manifest[rel]
+            else:
+                progress.pop(rel, None)
+                missing.add(rel)
+        persist()
+
+    def failed(batch: list[str], exc: RuntimeError) -> bool:
+        nonlocal skipped, first_error
+        for rel in batch:
+            progress.pop(rel, None)
+        if len(batch) == 1 and skipped < _MAX_SKIPPED_BATCHES:
+            skipped += 1
+            missing.update(batch)
+            if first_error is None:
+                first_error = exc
+            return False
+        return True
+
+    stop = Event()
+
+    def download_rsync(batch: list[str], transport: _RsyncPlan) -> set[str]:
+        with _RSYNC_TRANSFER_SLOTS:
+            if stop.is_set():
+                raise CancelledError()
+            proc = _run_command(
+                _rsync_command(transport, cache_root, target.source_child),
+                target.remote.timeout,
+                "rsync",
+                input_bytes="\0".join(batch).encode("utf-8") + b"\0",
+                allowed_returncodes=(0, _RSYNC_VANISHED_EXIT),
+            )
+            return _rsync_delivered(proc.stdout, batch, cache_root / target.source_child)
+
     try:
+        rsync_batches = iter(sorted(
+            (batch for batch, transport in plan if transport is not None),
+            key=lambda batch: sum(int(manifest[rel]["size"]) for rel in batch),
+            reverse=True,
+        ))
+        if rsync_plan is not None:
+            fatal_error: BaseException | None = None
+            with ThreadPoolExecutor(max_workers=_RSYNC_BATCH_WORKERS) as pool:
+                pending = {}
+                try:
+                    while True:
+                        while not stop.is_set() and len(pending) < _RSYNC_BATCH_WORKERS:
+                            batch = next(rsync_batches, None)
+                            if batch is None:
+                                break
+                            pending[pool.submit(download_rsync, batch, rsync_plan)] = batch
+                        if not pending:
+                            break
+                        done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                        for future in done:
+                            batch = pending.pop(future)
+                            try:
+                                written = future.result()
+                            except CancelledError:
+                                continue
+                            except RuntimeError as exc:
+                                if failed(batch, exc):
+                                    fatal_error = fatal_error or exc
+                                    stop.set()
+                            except BaseException as exc:
+                                for rel in batch:
+                                    progress.pop(rel, None)
+                                fatal_error = fatal_error or exc
+                                stop.set()
+                            else:
+                                record(batch, written)
+                        if stop.is_set():
+                            for future in pending:
+                                future.cancel()
+                    if fatal_error is not None:
+                        raise fatal_error
+                finally:
+                    stop.set()
+                    for future in pending:
+                        future.cancel()
         for batch, batch_rsync_plan in plan:
+            if batch_rsync_plan is not None:
+                continue
             payload = "\0".join(batch).encode("utf-8") + b"\0"
             # tar exits 1 (not fatal) when a file changes/shrinks while it is
             # being read — common when a remote session is live. The archive it
@@ -509,64 +596,29 @@ def _download_changed_files(
             # session would make every sync discard the whole download and never
             # catch up.
             try:
-                if batch_rsync_plan is not None:
-                    proc = _run_command(
-                        _rsync_command(batch_rsync_plan, cache_root, target.source_child),
-                        target.remote.timeout,
-                        "rsync",
-                        input_bytes=payload,
-                        allowed_returncodes=(0, _RSYNC_VANISHED_EXIT),
-                    )
-                else:
-                    proc = _run_ssh(
-                        target.remote,
-                        _download_command(target),
-                        input_bytes=payload,
-                        allowed_returncodes=(0, 1),
-                    )
+                proc = _run_ssh(
+                    target.remote,
+                    _download_command(target),
+                    input_bytes=payload,
+                    allowed_returncodes=(0, 1),
+                )
             except RuntimeError as exc:
-                # Never record the failed batch: a half-extracted file must still
-                # look changed to the next sync even when its manifest metadata
-                # matches, or the truncated copy would be accepted as current.
-                for rel in batch:
-                    progress.pop(rel, None)
-                if len(batch) == 1 and skipped < _MAX_SKIPPED_BATCHES:
-                    skipped += 1
-                    missing.update(batch)
-                    if first_error is None:
-                        first_error = exc
+                if not failed(batch, exc):
                     continue
                 raise
             try:
-                if batch_rsync_plan is not None:
-                    written = _rsync_delivered(
-                        proc.stdout, batch, cache_root / target.source_child
-                    )
-                else:
-                    written = (
-                        _extract_tarball(proc.stdout, cache_root / target.source_child)
-                        if proc.stdout
-                        else set()
-                    )
+                written = (
+                    _extract_tarball(proc.stdout, cache_root / target.source_child)
+                    if proc.stdout
+                    else set()
+                )
             except Exception:
                 # A local extraction failure (full disk, unreadable archive) is
                 # not something another batch can work around, so never skip it.
                 for rel in batch:
                     progress.pop(rel, None)
                 raise
-            for rel in batch:
-                meta = manifest.get(rel)
-                if meta is None:
-                    continue
-                if rel in written:
-                    progress[rel] = meta
-                else:
-                    # The transfer did not deliver this file (deleted mid-transfer,
-                    # skipped as a non-regular file, or dropped by tar). Recording
-                    # it would let an outdated local
-                    # copy pass as current, so leave it for the next sync.
-                    progress.pop(rel, None)
-                    missing.add(rel)
+            record(batch, written)
         if first_error is not None:
             # Report the skipped files as a failed sync; they stay "changed", so
             # the next run retries them while the rest of the mirror is current.
