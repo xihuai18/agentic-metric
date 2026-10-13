@@ -5,10 +5,14 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from collections.abc import Iterable
 from functools import lru_cache
+import hashlib
 import json
 import logging
+import os
 import re
+import tempfile
 import threading
+from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
@@ -20,6 +24,7 @@ PriceTuple = tuple[float, float, float, float]
 
 PRICING_CATALOG_URL = "https://models.dev/api.json"
 _PRICING_CATALOG_TTL_SECONDS = 24 * 60 * 60
+_PRICING_CATALOG_RETRY_SECONDS = 60
 _CATALOG_EXCLUDED_PROVIDERS = {
     "amazon-bedrock",
     "azure",
@@ -394,11 +399,8 @@ def _decompose_model_name(name: str) -> tuple[str, str]:
     return _cached_model_decomposition(name, _catalog_generation)
 
 
-@lru_cache(maxsize=4096)
-def _cached_model_decomposition(name: str, catalog_generation: int) -> tuple[str, str]:
-    if not name:
-        return "", ""
-
+def _clean_model_name(name: str) -> tuple[str, str]:
+    """Strip mode, effort, date, and version suffixes; return (clean, mode)."""
     mode = ""
     clean = name.strip().lower()
     while True:
@@ -415,7 +417,15 @@ def _cached_model_decomposition(name: str, catalog_generation: int) -> tuple[str
         if not match:
             break
         clean = clean[: match.start()]
+    return clean, mode
 
+
+@lru_cache(maxsize=4096)
+def _cached_model_decomposition(name: str, catalog_generation: int) -> tuple[str, str]:
+    if not name:
+        return "", ""
+
+    clean, mode = _clean_model_name(name)
     tokens = _model_tokens(clean)
     for candidate, model in _SORTED_ALIAS_TOKENS:
         if tokens[-len(candidate) :] == candidate:
@@ -760,39 +770,93 @@ def _load_catalog_config() -> dict[str, object]:
             return _catalog_cache
 
 
-def refresh_pricing_catalog(*, timeout: float = 15.0) -> int:
-    """Fetch models.dev pricing and replace the local generated catalog."""
-    request = Request(PRICING_CATALOG_URL, headers={"User-Agent": "agentic-metric"})
-    with urlopen(request, timeout=timeout) as response:
-        payload = json.loads(response.read().decode("utf-8"))
-    catalog = _normalize_catalog_payload(payload)
-    PRICING_CATALOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    temporary = PRICING_CATALOG_FILE.with_name(PRICING_CATALOG_FILE.name + ".tmp")
-    temporary.write_text(json.dumps(catalog, ensure_ascii=False, indent=2) + "\n")
-    temporary.replace(PRICING_CATALOG_FILE)
+def _write_json_atomic(path: Path, data: dict[str, object]) -> None:
+    """Write JSON via a unique same-directory temp file, removing only that file on failure."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(
+        dir=path.parent, prefix=path.name + ".", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def _write_catalog_file(catalog: dict[str, object]) -> None:
+    _write_json_atomic(PRICING_CATALOG_FILE, catalog)
+
+
+def _catalog_attempt_file() -> Path:
+    return PRICING_CATALOG_FILE.with_name(PRICING_CATALOG_FILE.name + ".attempt")
+
+
+def _reload_catalog() -> None:
     global _catalog_cache, _catalog_cache_mtime
     _catalog_cache = None
     _catalog_cache_mtime = -1.0
     _load_catalog_config()
     _reset_derived_caches()
+
+
+def refresh_pricing_catalog(*, timeout: float = 15.0) -> int:
+    """Fetch models.dev pricing and replace the local catalog; ignores the retry cooldown."""
+    request = Request(PRICING_CATALOG_URL, headers={"User-Agent": "agentic-metric"})
+    with urlopen(request, timeout=timeout) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    catalog = _normalize_catalog_payload(payload)
+    _write_catalog_file(catalog)
+    _reload_catalog()
     return len(catalog["models"])  # type: ignore[arg-type]
 
 
-def refresh_pricing_catalog_if_stale() -> bool:
-    """Refresh the catalog once per day, retaining the last good snapshot on failure."""
-    catalog = _load_catalog_config()
-    retrieved_at = catalog.get("retrieved_at")
+def _recent_failed_attempt(now: datetime) -> bool:
     try:
-        age = datetime.now(timezone.utc) - datetime.fromisoformat(str(retrieved_at))
+        data = json.loads(_catalog_attempt_file().read_text())
+        elapsed = now - datetime.fromisoformat(str(data.get("last_attempt")))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+    return 0 <= elapsed.total_seconds() < _PRICING_CATALOG_RETRY_SECONDS
+
+
+def _record_failed_attempt() -> None:
+    """Persist the failure time in its own file so the catalog is never rewritten on failure."""
+    try:
+        _write_json_atomic(
+            _catalog_attempt_file(),
+            {"last_attempt": datetime.now(timezone.utc).isoformat()},
+        )
+    except OSError as exc:
+        log.warning("Failed to record pricing catalog attempt: %s", exc)
+
+
+def pricing_catalog_refresh_due() -> bool:
+    catalog = _load_catalog_config()
+    now = datetime.now(timezone.utc)
+    try:
+        age = now - datetime.fromisoformat(str(catalog.get("retrieved_at")))
     except (TypeError, ValueError):
         age = None
     if age is not None and age.total_seconds() < _PRICING_CATALOG_TTL_SECONDS:
+        return False
+    return not _recent_failed_attempt(now)
+
+
+def refresh_pricing_catalog_if_stale() -> bool:
+    """Refresh once per 24h, retrying after a failure only once the 60s cooldown has passed."""
+    if not pricing_catalog_refresh_due():
         return False
     try:
         refresh_pricing_catalog()
         return True
     except (OSError, URLError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
         log.warning("Failed to refresh pricing catalog: %s", exc)
+        _record_failed_attempt()
         return False
 
 
@@ -1588,16 +1652,13 @@ def get_user_cache_pricing() -> dict[str, dict[str, float]]:
     return dict(_load_user_config().get("cache") or {})
 
 
-def get_pricing_fingerprint() -> str:
-    """Return a stable fingerprint for repricing stored sessions."""
-    payload = {
+def _static_pricing_payload() -> dict[str, object]:
+    return {
         "version": _PRICING_FINGERPRINT_VERSION,
         "aliases": sorted(_MODEL_ALIASES.items()),
         "builtin": sorted(
             (model, list(prices)) for model, prices in _BUILTIN_PRICING.items()
         ),
-        "catalog_models": _catalog_models(),
-        "long_context_rules": get_long_context_rules(include_disabled=True),
         "mode_aliases": sorted(_MODE_ALIASES.items()),
         "non_billable": sorted(_NON_BILLABLE_MODELS),
         "non_standard_modes": sorted(
@@ -1609,7 +1670,104 @@ def get_pricing_fingerprint() -> str:
         "unknown_model_prefixes": sorted(_UNKNOWN_MODEL_PREFIXES),
         "user_config": _load_user_config(),
     }
+
+
+def get_pricing_fingerprint(models: Iterable[str] | None = None) -> str:
+    """Return a stable fingerprint for repricing; with ``models``, ignore catalog entries for other models."""
+    if models is not None:
+        global_digest, per_model = _scoped_pricing_fingerprints(models)
+        return "scoped:" + _digest({"global": global_digest, "models": per_model})
+    payload = _static_pricing_payload()
+    payload["catalog_models"] = _catalog_models()
+    payload["long_context_rules"] = get_long_context_rules(include_disabled=True)
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def get_pricing_epoch() -> tuple[int, int]:
+    """Return (user-config, catalog) load generations; they advance on every effective reload, even A->B->A."""
+    _load_user_config()
+    _load_catalog_config()
+    return (_config_generation, _catalog_generation)
+
+
+def get_model_pricing_fingerprints(models: Iterable[str]) -> dict[str, str]:
+    """Return a fingerprint per raw model covering global rules plus every catalog record that can resolve or price it."""
+    return _scoped_pricing_fingerprints(models)[1]
+
+
+def _digest(payload: object) -> str:
+    text = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+_catalog_key_index_source: object = None
+_catalog_key_index: dict[str, tuple[tuple[tuple[str, ...], str], ...]] = {}
+_catalog_empty_token_keys: tuple[str, ...] = ()
+
+
+def _catalog_keys_within(tokens: tuple[str, ...]) -> set[str]:
+    """Return catalog keys whose tokens occur contiguously in ``tokens`` (a superset of the resolver's match)."""
+    global _catalog_key_index_source, _catalog_key_index, _catalog_empty_token_keys
+    sorted_tokens = _catalog_model_tokens()
+    if _catalog_key_index_source is not sorted_tokens:
+        index: dict[str, list[tuple[tuple[str, ...], str]]] = {}
+        empty: list[str] = []
+        for candidate, key in sorted_tokens:
+            if candidate:
+                index.setdefault(candidate[0], []).append((candidate, key))
+            else:
+                empty.append(key)
+        _catalog_key_index = {k: tuple(v) for k, v in index.items()}
+        _catalog_empty_token_keys = tuple(empty)
+        _catalog_key_index_source = sorted_tokens
+    found = set(_catalog_empty_token_keys)
+    for position, token in enumerate(tokens):
+        for candidate, key in _catalog_key_index.get(token, ()):
+            if tokens[position : position + len(candidate)] == candidate:
+                found.add(key)
+    return found
+
+
+def _model_catalog_keys(model: str) -> tuple[str, str, set[str]]:
+    """Return (base, mode, catalog keys) that can influence pricing ``model``, following re-decomposition to a fixed point."""
+    base, mode = _decompose_model_name(model)
+    keys: set[str] = set()
+    seen: set[str] = set()
+    name = model
+    while name not in seen and len(seen) < 8:
+        seen.add(name)
+        keys.add(name)
+        clean, _ = _clean_model_name(name)
+        keys.update(_catalog_keys_within(_model_tokens(clean)))
+        name = _decompose_model_name(name)[0]
+    keys.add(name)
+    return base, mode, keys
+
+
+def _scoped_pricing_fingerprints(
+    models: Iterable[str],
+) -> tuple[str, dict[str, str]]:
+    static = _static_pricing_payload()
+    static["long_context_rules"] = [
+        rule
+        for rule in get_long_context_rules(include_disabled=True)
+        if rule.get("source") != "catalog"
+    ]
+    global_digest = _digest(static)
+    catalog = _catalog_models()
+    per_model: dict[str, str] = {}
+    for model in sorted({str(m or "") for m in models}):
+        base, mode, keys = _model_catalog_keys(model)
+        per_model[model] = _digest(
+            {
+                "global": global_digest,
+                "model": model,
+                "base": base,
+                "mode": mode,
+                "catalog": {k: catalog[k] for k in sorted(keys) if k in catalog},
+            }
+        )
+    return global_digest, per_model
 
 
 def estimate_cost(

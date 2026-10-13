@@ -2270,13 +2270,14 @@ def test_pricing_screen_update_refreshes_catalog_and_resyncs(tmp_path, monkeypat
     refreshed = []
     release = threading.Event()
 
-    def _refresh():
+    def _refresh(self, *, force):
+        assert force
         release.wait(5)
         refreshed.append(True)
         return 1
 
     db_path = str(tmp_path / "tui.db")
-    monkeypatch.setattr(app_module, "refresh_pricing_catalog", _refresh)
+    monkeypatch.setattr(app_module.AgenticMetricApp, "_refresh_catalog_in_worker", _refresh)
     monkeypatch.setattr(app_module, "Database", lambda: Database(db_path=db_path))
     collectors = _Collectors()
 
@@ -2965,3 +2966,696 @@ def test_cost_format_keeps_unknown_state_out_of_numeric_values():
     assert tui_fmt_cost(0.0, unknown=True) == "—"
     assert cli_fmt_cost(None, unknown=True) == "—"
     assert tui_fmt_cost(None, unknown=True) == "—"
+
+
+# ── Scoped pricing invalidation, WAL, and migration writes ─────────
+
+
+@pytest.fixture
+def pricing_env(tmp_path, monkeypatch):
+    """Isolated user pricing and catalog files with helpers to edit the catalog."""
+    import os
+    import agentic_metric.pricing as pricing
+
+    monkeypatch.setattr(pricing, "PRICING_FILE", tmp_path / "pricing.json")
+    monkeypatch.setattr(pricing, "PRICING_CATALOG_FILE", tmp_path / "catalog.json")
+    pricing._user_cache = None
+    pricing._user_cache_mtime = -1.0
+    pricing._catalog_cache = None
+    pricing._catalog_cache_mtime = -1.0
+    pricing._reset_derived_caches()
+
+    def write(models):
+        path = tmp_path / "catalog.json"
+        previous = path.stat().st_mtime if path.exists() else 0
+        path.write_text(json.dumps({"models": models}))
+        os.utime(path, (previous + 1, previous + 1))
+
+    def record(name, price=1.0):
+        return {"aliases": [name], "prices": [price, 2.0, 0.1, 1.25]}
+
+    write({"used-model-1": record("used-model-1")})
+    yield write, record
+    pricing._user_cache = None
+    pricing._user_cache_mtime = -1.0
+    pricing._catalog_cache = None
+    pricing._catalog_cache_mtime = -1.0
+    pricing._reset_derived_caches()
+
+
+def _seed_usage(db, model="used-model-1", session="s1"):
+    db.replace_session_usage(
+        session,
+        "claude_code",
+        [{
+            "usage_date": "2026-07-13",
+            "usage_hour": 8,
+            "model": model,
+            "input_tokens": 1_000_000,
+        }],
+        data_root="/tmp/.claude",
+    )
+    db.upsert_session(
+        session, "claude_code", data_root="/tmp/.claude", model=model,
+        input_tokens=1_000_000, estimated_cost_usd=1.0,
+    )
+    db.set_sync_state(f"cc_jsonl:v5:/tmp/{session}.jsonl", "checkpoint")
+    db.commit()
+
+
+def _usage_cost(db, session="s1"):
+    return db.conn.execute(
+        "SELECT estimated_cost_usd FROM session_usage WHERE session_id = ?", (session,)
+    ).fetchone()[0]
+
+
+def test_unused_catalog_change_keeps_checkpoints_and_costs(tmp_path, pricing_env):
+    write, record = pricing_env
+    path = str(tmp_path / "d.db")
+    db = Database(db_path=path)
+    _seed_usage(db)
+    stored = db.get_sync_state("pricing:fingerprint")
+    db.close()
+
+    write({"used-model-1": record("used-model-1"), "audit-model-9": record("audit-model-9", 50.0)})
+    db = Database(db_path=path)
+    assert db.pricing_changed is False
+    assert db.get_sync_state("cc_jsonl:v5:/tmp/s1.jsonl") == "checkpoint"
+    assert _usage_cost(db) == 1.0
+    new_stored = db.get_sync_state("pricing:fingerprint")
+    assert new_stored != stored
+    from agentic_metric.pricing import get_pricing_fingerprint
+    assert new_stored == get_pricing_fingerprint()
+    db.close()
+
+    db = Database(db_path=path)  # steady state: nothing to do
+    assert db.pricing_changed is False
+    db.close()
+
+
+def test_used_catalog_change_reprices_and_drops_checkpoints(tmp_path, pricing_env):
+    write, record = pricing_env
+    path = str(tmp_path / "d.db")
+    db = Database(db_path=path)
+    _seed_usage(db)
+    db.close()
+
+    write({"used-model-1": record("used-model-1", 4.0)})
+    db = Database(db_path=path)
+    assert db.pricing_changed is True
+    assert db.get_sync_state("cc_jsonl:v5:/tmp/s1.jsonl") is None
+    assert _usage_cost(db) == 4.0
+    db.close()
+
+
+def test_newly_arrived_model_does_not_invalidate_old_checkpoints(tmp_path, pricing_env):
+    write, record = pricing_env
+    path = str(tmp_path / "d.db")
+    db = Database(db_path=path)
+    _seed_usage(db)
+    # A second model first appears during this session and is committed.
+    _seed_usage(db, model="arrival-2", session="s2")
+    tracked = json.loads(db.get_sync_state("pricing:model_fingerprints"))["models"]
+    assert set(tracked) == {"used-model-1", "arrival-2"}
+    db.close()
+
+    write({
+        "used-model-1": record("used-model-1"),
+        "arrival-2": record("arrival-2", 3.0),
+        "audit-model-9": record("audit-model-9"),
+    })
+    db = Database(db_path=path)
+    # arrival-2 changed from unknown to known: it is a used model, so reprice.
+    assert db.pricing_changed is True
+    db.close()
+
+    write({
+        "used-model-1": record("used-model-1"),
+        "arrival-2": record("arrival-2", 3.0),
+        "audit-model-9": record("audit-model-9", 77.0),
+    })
+    db = Database(db_path=path)
+    assert db.pricing_changed is False
+    db.close()
+
+
+def test_new_model_baseline_survives_unused_catalog_change(tmp_path, pricing_env):
+    write, record = pricing_env
+    path = str(tmp_path / "d.db")
+    db = Database(db_path=path)
+    _seed_usage(db)
+    db.close()
+    # Reopen, add a brand-new model (no full-fingerprint change), then drop the map
+    # entry's process memory by closing: baseline must exist from the commit hook.
+    db = Database(db_path=path)
+    _seed_usage(db, model="arrival-2", session="s2")
+    db.close()
+
+    write({"used-model-1": record("used-model-1"), "audit-model-9": record("audit-model-9")})
+    db = Database(db_path=path)
+    assert db.pricing_changed is False
+    assert db.get_sync_state("cc_jsonl:v5:/tmp/s1.jsonl") == "checkpoint"
+    assert db.get_sync_state("cc_jsonl:v5:/tmp/s2.jsonl") == "checkpoint"
+    db.close()
+
+
+def test_model_without_baseline_is_reconciled_when_fingerprint_unchanged(tmp_path, pricing_env):
+    write, record = pricing_env
+    path = str(tmp_path / "d.db")
+    db = Database(db_path=path)
+    _seed_usage(db)
+    # First-run migration: databases from older versions have no baseline map.
+    db.conn.execute("DELETE FROM sync_state WHERE key = 'pricing:model_fingerprints'")
+    db.commit()
+    db.close()
+
+    db = Database(db_path=path)
+    assert db.pricing_changed is False
+    assert db.get_sync_state("cc_jsonl:v5:/tmp/s1.jsonl") == "checkpoint"
+    assert "used-model-1" in json.loads(db.get_sync_state("pricing:model_fingerprints"))["models"]
+    db.close()
+
+    write({"used-model-1": record("used-model-1"), "audit-model-9": record("audit-model-9")})
+    db = Database(db_path=path)
+    assert db.pricing_changed is False
+    db.close()
+
+
+@pytest.mark.parametrize("damage", ["missing", "malformed", "wrong-full", "missing-model"])
+def test_changed_fingerprint_with_untrustworthy_baseline_reprices(tmp_path, pricing_env, damage):
+    write, record = pricing_env
+    path = str(tmp_path / "d.db")
+    db = Database(db_path=path)
+    _seed_usage(db)
+    if damage == "missing":
+        db.conn.execute("DELETE FROM sync_state WHERE key = 'pricing:model_fingerprints'")
+    elif damage == "malformed":
+        db.set_sync_state("pricing:model_fingerprints", "{not json")
+    elif damage == "wrong-full":
+        data = json.loads(db.get_sync_state("pricing:model_fingerprints"))
+        data["full"] = "0" * 64
+        db.set_sync_state("pricing:model_fingerprints", json.dumps(data))
+    else:
+        data = json.loads(db.get_sync_state("pricing:model_fingerprints"))
+        data["models"] = {}
+        db.set_sync_state("pricing:model_fingerprints", json.dumps(data))
+    db.commit()
+    db.close()
+
+    write({"used-model-1": record("used-model-1"), "audit-model-9": record("audit-model-9")})
+    db = Database(db_path=path)
+    assert db.pricing_changed is True
+    assert db.get_sync_state("cc_jsonl:v5:/tmp/s1.jsonl") is None
+    assert "used-model-1" in json.loads(db.get_sync_state("pricing:model_fingerprints"))["models"]
+    db.close()
+
+
+def test_explicit_invalid_full_fingerprint_forces_reprice_despite_matching_baseline(
+    tmp_path, pricing_env
+):
+    path = str(tmp_path / "d.db")
+    db = Database(db_path=path)
+    _seed_usage(db)
+    db.set_sync_state("pricing:fingerprint", "old")
+    db.close()
+
+    db = Database(db_path=path)
+    assert db.pricing_changed is True
+    assert db.get_sync_state("cc_jsonl:v5:/tmp/s1.jsonl") is None
+    db.close()
+
+
+def test_scoped_advance_keeps_explicit_costs_and_session_fallback_models(tmp_path, pricing_env):
+    write, record = pricing_env
+    path = str(tmp_path / "d.db")
+    db = Database(db_path=path)
+    # A session with no usage buckets is priced from its own model on reprice.
+    db.upsert_session(
+        "fb", "codex", data_root="/tmp/.codex", model="used-model-1",
+        input_tokens=1_000_000, estimated_cost_usd=1.0,
+    )
+    db.replace_session_usage(
+        "ex", "codex",
+        [{"usage_date": "2026-07-13", "usage_hour": 1, "model": "used-model-1",
+          "input_tokens": 5, "estimated_cost_usd": 9.5}],
+        data_root="/tmp/.codex",
+    )
+    db.commit()
+    db.close()
+
+    write({"used-model-1": record("used-model-1"), "audit-model-9": record("audit-model-9")})
+    db = Database(db_path=path)
+    assert db.pricing_changed is False
+    assert _usage_cost(db, "ex") == 9.5
+    db.close()
+
+
+def test_empty_database_gets_empty_baseline(tmp_path, pricing_env):
+    db = Database(db_path=str(tmp_path / "d.db"))
+    data = json.loads(db.get_sync_state("pricing:model_fingerprints"))
+    assert data["models"] == {}
+    db.close()
+
+
+def test_stored_models_walk_includes_null_and_empty_model(tmp_path, pricing_env):
+    db = Database(db_path=str(tmp_path / "d.db"))
+    _seed_usage(db, model="b-model", session="s1")
+    _seed_usage(db, model="a-model", session="s2")
+    db.conn.execute("UPDATE session_usage SET model = NULL WHERE session_id = 's2'")
+    assert db._stored_pricing_models() == {"b-model", ""}
+    db.close()
+
+
+def test_file_database_uses_wal_with_durable_defaults(tmp_path, pricing_env):
+    db = Database(db_path=str(tmp_path / "d.db"))
+    assert db.conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    assert db.conn.execute("PRAGMA synchronous").fetchone()[0] == 2  # FULL
+    db.close()
+    memory = Database(db_path=":memory:")
+    assert memory.conn.execute("PRAGMA journal_mode").fetchone()[0] == "memory"
+    memory.close()
+
+
+def test_reader_is_not_blocked_by_open_write_transaction(tmp_path, pricing_env):
+    path = str(tmp_path / "d.db")
+    writer = Database(db_path=path)
+    _seed_usage(writer)
+    reader = sqlite3.connect(path, timeout=0.2)
+    writer.conn.execute("INSERT INTO sync_state (key, value) VALUES ('k', 'v')")
+    writer.upsert_session("s9", "codex", data_root="/r", model="x")
+    assert reader.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 1
+    assert reader.execute("SELECT COUNT(*) FROM sync_state WHERE key = 'k'").fetchone()[0] == 0
+    writer.commit()
+    assert reader.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 2
+    reader.close()
+    writer.close()
+
+
+def _trace_statements(monkeypatch):
+    statements: list[str] = []
+    real_connect = sqlite3.connect
+
+    def connect(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    monkeypatch.setattr("agentic_metric.store.database.sqlite3.connect", connect)
+    return statements
+
+
+def test_clean_open_runs_no_delete_statements(tmp_path, pricing_env, monkeypatch):
+    path = str(tmp_path / "d.db")
+    Database(db_path=path).close()
+    statements = _trace_statements(monkeypatch)
+    Database(db_path=path).close()
+    assert [s for s in statements if s.lstrip().upper().startswith(("DELETE", "INSERT", "UPDATE"))] == []
+
+
+def test_legacy_assistant_id_state_is_still_removed(tmp_path, pricing_env):
+    path = str(tmp_path / "d.db")
+    db = Database(db_path=path)
+    db.set_sync_state("cc_assistant_ids:/tmp/a.jsonl", "ids")
+    db.set_sync_state("cc_assistant_idsX", "keep")
+    db.close()
+    db = Database(db_path=path)
+    assert db.get_sync_state("cc_assistant_ids:/tmp/a.jsonl") is None
+    assert db.get_sync_state("cc_assistant_idsX") == "keep"
+    db.close()
+
+
+def test_pricing_change_between_write_and_commit_forces_reprice(tmp_path, pricing_env):
+    write, record = pricing_env
+    path = str(tmp_path / "d.db")
+    db = Database(db_path=path)
+    _seed_usage(db)
+    # arrival-2 is priced under the old catalog, then pricing changes before commit.
+    db.replace_session_usage(
+        "s2", "claude_code",
+        [{"usage_date": "2026-07-13", "usage_hour": 9, "model": "arrival-2", "input_tokens": 1_000_000}],
+        data_root="/tmp/.claude",
+    )
+    db.set_sync_state("cc_jsonl:v5:/tmp/s2.jsonl", "checkpoint", commit=False)
+    assert _usage_cost(db, "s2") is None
+    write({"used-model-1": record("used-model-1"), "arrival-2": record("arrival-2", 3.0)})
+    db.commit()
+    tracked = json.loads(db.get_sync_state("pricing:model_fingerprints"))["models"]
+    assert "arrival-2" not in tracked
+    db.close()
+
+    db = Database(db_path=path)
+    assert db.pricing_changed is True
+    assert db.get_sync_state("cc_jsonl:v5:/tmp/s2.jsonl") is None
+    assert _usage_cost(db, "s2") == 3.0
+    db.close()
+
+
+def test_pricing_change_during_signature_capture_is_not_baselined(tmp_path, pricing_env, monkeypatch):
+    write, record = pricing_env
+    import agentic_metric.store.database as database_module
+
+    path = str(tmp_path / "d.db")
+    db = Database(db_path=path)
+    _seed_usage(db)
+    real = database_module.get_model_pricing_fingerprints
+
+    def racing(models):
+        result = real(models)
+        write({"used-model-1": record("used-model-1"), "arrival-2": record("arrival-2", 3.0)})
+        return result
+
+    monkeypatch.setattr(database_module, "get_model_pricing_fingerprints", racing)
+    db.replace_session_usage(
+        "s2", "claude_code",
+        [{"usage_date": "2026-07-13", "usage_hour": 9, "model": "arrival-2", "input_tokens": 1}],
+        data_root="/tmp/.claude",
+    )
+    db.commit()
+    monkeypatch.setattr(database_module, "get_model_pricing_fingerprints", real)
+    db.close()
+
+    db = Database(db_path=path)
+    assert db.pricing_changed is True
+    db.close()
+
+
+# ── Pricing epoch guard (A -> B -> A) ──────────────────────────────
+
+
+def _write_usage(db, session, model):
+    db.replace_session_usage(
+        session, "claude_code",
+        [{"usage_date": "2026-07-13", "usage_hour": 9, "model": model, "input_tokens": 1_000_000}],
+        data_root="/tmp/.claude",
+    )
+    db.set_sync_state(f"cc_jsonl:v5:/tmp/{session}.jsonl", "checkpoint", commit=False)
+
+
+def _aba_catalogs(record):
+    """Catalog A (arrival-2 unknown) and B (arrival-2 priced, used-model-1 repriced)."""
+    a = {"used-model-1": record("used-model-1")}
+    b = {"used-model-1": record("used-model-1", 4.0), "arrival-2": record("arrival-2", 3.0)}
+    return a, b
+
+
+def _flip_catalog_through_b(write, a, b):
+    """Reload B through the real loader, then return to A: the full fingerprint is A again."""
+    from agentic_metric.pricing import get_pricing_epoch
+
+    write(b)
+    get_pricing_epoch()
+    write(a)
+    get_pricing_epoch()
+
+
+@pytest.mark.parametrize("commit_path", ["commit", "set_sync_state", "delete_prefix"])
+def test_aba_for_tracked_model_invalidates_on_every_commit_path(tmp_path, pricing_env, commit_path):
+    write, record = pricing_env
+    a, b = _aba_catalogs(record)
+    write(a)
+    path = str(tmp_path / "d.db")
+    db = Database(db_path=path)
+    _seed_usage(db)
+    write(b)
+    from agentic_metric.pricing import get_pricing_epoch
+
+    get_pricing_epoch()
+    _write_usage(db, "s2", "used-model-1")  # priced under B
+    _flip_catalog_through_b(write, a, a)
+    if commit_path == "commit":
+        db.commit()
+    elif commit_path == "set_sync_state":
+        db.set_sync_state("cc_jsonl:v5:/tmp/other.jsonl", "x")
+    else:
+        db.delete_sync_state_prefix("unrelated:")
+    assert db.get_sync_state("pricing:fingerprint") == ""
+    db.close()
+
+    db = Database(db_path=path)
+    assert db.pricing_changed is True
+    assert db.get_sync_state("cc_jsonl:v5:/tmp/s2.jsonl") is None
+    assert _usage_cost(db, "s2") == 1.0
+    db.close()
+
+
+def test_aba_for_new_model_is_not_baselined(tmp_path, pricing_env):
+    write, record = pricing_env
+    a, b = _aba_catalogs(record)
+    write(a)
+    path = str(tmp_path / "d.db")
+    db = Database(db_path=path)
+    _seed_usage(db)
+    from agentic_metric.pricing import get_pricing_epoch
+
+    write(b)
+    get_pricing_epoch()
+    _write_usage(db, "s2", "arrival-2")  # known under B only
+    assert _usage_cost(db, "s2") == 3.0
+    write(a)
+    get_pricing_epoch()
+    db.commit()
+    assert db.get_sync_state("pricing:fingerprint") == ""
+    models = db.get_sync_state("pricing:model_fingerprints")
+    assert "arrival-2" not in (json.loads(models)["models"] if models else {})
+    db.close()
+
+    db = Database(db_path=path)
+    assert db.pricing_changed is True
+    assert db.get_sync_state("cc_jsonl:v5:/tmp/s2.jsonl") is None
+    assert _usage_cost(db, "s2") is None
+    db.close()
+
+
+def test_epoch_change_without_price_dependent_writes_does_not_invalidate(tmp_path, pricing_env):
+    write, record = pricing_env
+    a, b = _aba_catalogs(record)
+    write(a)
+    path = str(tmp_path / "d.db")
+    db = Database(db_path=path)
+    _seed_usage(db)
+    stored = db.get_sync_state("pricing:fingerprint")
+    _flip_catalog_through_b(write, a, b)
+    db.set_sync_state("note", "metadata only")
+    db.delete_session("ghost", "claude_code", provider="")
+    db.replace_session_usage("s1", "claude_code", [], data_root="/tmp/.claude")
+    db.commit()
+    assert db.get_sync_state("pricing:fingerprint") == stored
+    db.close()
+
+
+def test_stable_epoch_keeps_new_model_baseline(tmp_path, pricing_env):
+    write, record = pricing_env
+    a, _ = _aba_catalogs(record)
+    write(a)
+    path = str(tmp_path / "d.db")
+    db = Database(db_path=path)
+    _seed_usage(db)
+    _write_usage(db, "s2", "arrival-2")
+    db.commit()
+    assert "arrival-2" in json.loads(db.get_sync_state("pricing:model_fingerprints"))["models"]
+    db.close()
+    write({**a, "audit-model-9": record("audit-model-9")})
+    db = Database(db_path=path)
+    assert db.pricing_changed is False
+    assert db.get_sync_state("cc_jsonl:v5:/tmp/s2.jsonl") == "checkpoint"
+    db.close()
+
+
+def test_epoch_change_during_reconciliation_leaves_fingerprint_invalid(tmp_path, pricing_env, monkeypatch):
+    write, record = pricing_env
+    a, _ = _aba_catalogs(record)
+    write(a)
+    import agentic_metric.store.database as database_module
+
+    path = str(tmp_path / "d.db")
+    db = Database(db_path=path)
+    _seed_usage(db)
+    db.close()
+    write({**a, "audit-model-9": record("audit-model-9")})
+    real = database_module.get_model_pricing_fingerprints
+
+    def racing(models):
+        result = real(models)
+        write({**a, "audit-model-9": record("audit-model-9", 9.0)})
+        return result
+
+    monkeypatch.setattr(database_module, "get_model_pricing_fingerprints", racing)
+    db = Database(db_path=path)
+    assert db.get_sync_state("pricing:fingerprint") == ""
+    db.close()
+    monkeypatch.setattr(database_module, "get_model_pricing_fingerprints", real)
+
+    db = Database(db_path=path)
+    assert db.pricing_changed is True
+    db.close()
+
+
+# ── Cancellation while opening the database ────────────────────────
+
+
+def _seed_reprice_db(path, rows=720):
+    """File DB with `rows` bucket rows carrying a wrong cost and a stale pricing fingerprint."""
+    db = Database(db_path=path)
+    for session in range(rows // 24):
+        db.replace_session_usage(
+            f"s{session}", "claude_code",
+            [
+                {"usage_date": "2026-07-13", "usage_hour": hour, "model": "used-model-1",
+                 "input_tokens": 1_000_000}
+                for hour in range(24)
+            ],
+            data_root="/tmp/.claude",
+        )
+    db.conn.execute("UPDATE session_usage SET estimated_cost_usd = -1")
+    db.set_sync_state("cc_jsonl:v5:/tmp/s0.jsonl", "checkpoint")
+    db.set_sync_state("pricing:fingerprint", "stale")
+    db.close()
+
+
+def _raw_state(path):
+    conn = sqlite3.connect(path)
+    try:
+        return (
+            conn.execute("SELECT COUNT(*) FROM session_usage WHERE estimated_cost_usd = -1").fetchone()[0],
+            conn.execute("SELECT value FROM sync_state WHERE key = 'cc_jsonl:v5:/tmp/s0.jsonl'").fetchone(),
+            conn.execute("SELECT value FROM sync_state WHERE key = 'pricing:fingerprint'").fetchone()[0],
+        )
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("cancel_after", [200, 720])
+def test_cancel_during_first_reprice_stops_rows_and_commits_nothing(tmp_path, pricing_env, monkeypatch, cancel_after):
+    from concurrent.futures import CancelledError
+    from threading import Event
+
+    import agentic_metric.store.database as database_module
+    from agentic_metric.collectors import sync_cancellation
+
+    path = str(tmp_path / "d.db")
+    _seed_reprice_db(path)
+    event = Event()
+    calls = []
+    real = database_module.estimate_cost
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == cancel_after:
+            event.set()
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(database_module, "estimate_cost", counting)
+    with sync_cancellation(event):
+        with pytest.raises(CancelledError):
+            Database(db_path=path)
+    assert len(calls) <= cancel_after + database_module._CANCEL_CHECK_ROWS
+    assert len(calls) < 2 * 720
+    wrong, checkpoint, fingerprint = _raw_state(path)
+    assert wrong == 720
+    assert checkpoint == ("checkpoint",)
+    assert fingerprint == "stale"
+
+    monkeypatch.setattr(database_module, "estimate_cost", real)
+    db = Database(db_path=path)
+    assert db.pricing_changed is True
+    assert db.get_sync_state("cc_jsonl:v5:/tmp/s0.jsonl") is None
+    assert db.conn.execute("SELECT COUNT(*) FROM session_usage WHERE estimated_cost_usd = 1.0").fetchone()[0] == 720
+    db.close()
+
+
+def test_interrupted_sql_during_open_becomes_cancellation_and_closes(tmp_path, pricing_env, monkeypatch):
+    from concurrent.futures import CancelledError
+    from threading import Event
+
+    import agentic_metric.store.database as database_module
+    from agentic_metric.collectors import _sync_cancel_event
+
+    path = str(tmp_path / "d.db")
+    _seed_reprice_db(path)
+    conn = sqlite3.connect(path)
+    conn.executemany(
+        "INSERT INTO session_usage (session_id, agent_type, provider, data_root, usage_date, usage_hour, model) "
+        "VALUES (?, 'codex', 'openai', '/r', '2026-01-01', 1, 'bulk')",
+        ((f"bulk{i}",) for i in range(60_000)),
+    )
+    conn.commit()
+    conn.close()
+
+    event = Event()
+    event.set()
+    monkeypatch.setattr(database_module, "_check_cancelled", lambda: None)
+    token = _sync_cancel_event.set(event)
+    try:
+        with pytest.raises(CancelledError) as caught:
+            Database(db_path=path)
+    finally:
+        _sync_cancel_event.reset(token)
+    assert isinstance(caught.value.__cause__, sqlite3.OperationalError)
+    assert _raw_state(path)[2] == "stale"
+
+    monkeypatch.undo()
+    db = Database(db_path=path)  # the file reopens and repairs
+    assert db.pricing_changed is True
+    db.close()
+
+
+def test_interrupted_sql_without_cancellation_is_not_converted(tmp_path, pricing_env, monkeypatch):
+    path = str(tmp_path / "d.db")
+
+    def boom(self):
+        raise sqlite3.OperationalError("interrupted")
+
+    monkeypatch.setattr(Database, "_migrate", boom)
+    with pytest.raises(sqlite3.OperationalError):
+        Database(db_path=path)
+
+
+def test_progress_handler_is_removed_after_open(tmp_path, pricing_env):
+    from threading import Event
+
+    from agentic_metric.collectors import sync_cancellation
+
+    event = Event()
+    path = str(tmp_path / "d.db")
+    with sync_cancellation(event):
+        db = Database(db_path=path)
+    event.set()
+    count = db.conn.execute(
+        "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 200000) "
+        "SELECT COUNT(*) FROM c"
+    ).fetchone()[0]
+    assert count == 200_000
+    db.close()
+
+
+def test_cancel_before_migration_commit_rolls_back_table_rebuild(tmp_path, pricing_env):
+    from concurrent.futures import CancelledError
+    from threading import Event
+
+    from agentic_metric.collectors import _sync_cancel_event
+
+    path = str(tmp_path / "legacy.db")
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """CREATE TABLE sessions (session_id TEXT PRIMARY KEY, agent_type TEXT, project_path TEXT);
+           INSERT INTO sessions VALUES ('s1', 'codex', '/p');"""
+    )
+    conn.commit()
+    conn.close()
+    event = Event()
+    event.set()
+    token = _sync_cancel_event.set(event)
+    try:
+        with pytest.raises(CancelledError):
+            Database(db_path=path)
+    finally:
+        _sync_cancel_event.reset(token)
+    conn = sqlite3.connect(path)
+    names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    assert "sessions" in names and "sessions_old" not in names
+    assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 1
+    conn.close()
+
+    db = Database(db_path=path)  # legacy unscoped rows are purged by design, but the rebuild completes
+    assert "data_root" in {r[1] for r in db.conn.execute("PRAGMA table_info(sessions)")}
+    db.close()

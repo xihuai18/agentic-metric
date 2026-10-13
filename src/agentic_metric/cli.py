@@ -88,7 +88,7 @@ def account_set(
     account_key: str, label: str = typer.Option(..., "--label"),
     plan: str = typer.Option("", "--plan", help="Manual current plan label, not an entitlement check."),
 ):
-    """Label an observed fingerprint or a manual-only account."""
+    """Label an observed or explicitly declared account."""
     from .accounts import set_account_profile
 
     with _account_database() as conn:
@@ -385,11 +385,8 @@ def tui(
 
 def _run_tui(*, sync_on_mount: bool = True) -> None:
     """Launch the interactive TUI dashboard."""
-    from .pricing import refresh_pricing_catalog_if_stale
-
-    refresh_pricing_catalog_if_stale()
     from .tui.app import AgenticMetricApp
-    AgenticMetricApp(sync_on_mount=sync_on_mount).run()
+    AgenticMetricApp(sync_on_mount=sync_on_mount, refresh_pricing_on_mount=sync_on_mount).run()
 
 
 @app.command()
@@ -532,40 +529,38 @@ def report(
             sync_errors = registry.get_sync_errors()
 
         detailed = full or json_
-        totals = aggregator.get_range_totals(db, frm, to)
-        by_provider = aggregator.get_range_by_provider(db, frm, to)
-        by_agent_model = aggregator.get_range_by_agent_model(db, frm, to)
-        by_project = aggregator.get_range_by_project(db, frm, to, limit=limit)
-        by_host = aggregator.get_range_by_host(db, frm, to) if detailed else []
-        by_agent_type = aggregator.get_range_by_agent_type(db, frm, to) if detailed else []
-        by_model = aggregator.get_range_by_model(db, frm, to) if detailed else []
-        by_agent = aggregator.get_range_by_agent(db, frm, to) if detailed else []
-        by_provider_model = (
-            aggregator.get_range_by_provider_model(db, frm, to) if detailed else []
-        )
-        by_agent_type_model = (
-            aggregator.get_range_by_agent_type_model(db, frm, to) if detailed else []
-        )
-        by_project_agent = (
-            aggregator.get_range_by_project_agent(db, frm, to, limit=limit)
-            if detailed else []
-        )
-        by_project_model = (
-            aggregator.get_range_by_project_model(db, frm, to, limit=limit)
-            if detailed else []
-        )
-        # Periodic breakdown (hourly/daily/weekly) — only when the range
-        # corresponds to a named focus.
-        focus_kind = None
-        if not range_:
-            focus_kind = "week" if week else ("month" if month else "today")
-        periodic = aggregator.get_heatmap(db, focus_kind) if focus_kind else []
+        with aggregator.query_snapshot(db):
+            totals = aggregator.get_range_totals(db, frm, to)
+            by_provider = aggregator.get_range_by_provider(db, frm, to)
+            by_agent_model = aggregator.get_range_by_agent_model(db, frm, to)
+            by_project = aggregator.get_range_by_project(db, frm, to, limit=limit)
+            by_host = aggregator.get_range_by_host(db, frm, to) if detailed else []
+            by_agent_type = aggregator.get_range_by_agent_type(db, frm, to) if detailed else []
+            by_model = aggregator.get_range_by_model(db, frm, to) if detailed else []
+            by_agent = aggregator.get_range_by_agent(db, frm, to) if detailed else []
+            by_provider_model = (
+                aggregator.get_range_by_provider_model(db, frm, to) if detailed else []
+            )
+            by_agent_type_model = (
+                aggregator.get_range_by_agent_type_model(db, frm, to) if detailed else []
+            )
+            by_project_agent = (
+                aggregator.get_range_by_project_agent(db, frm, to, limit=limit)
+                if detailed else []
+            )
+            by_project_model = (
+                aggregator.get_range_by_project_model(db, frm, to, limit=limit)
+                if detailed else []
+            )
+            focus_kind = None
+            if not range_:
+                focus_kind = "week" if week else ("month" if month else "today")
+            periodic = aggregator.get_heatmap(db, focus_kind) if focus_kind else []
 
-        # Previous period totals for delta comparison (cost cell arrow).
-        prev_totals = None
-        if focus_kind:
-            _, p_frm, p_to = aggregator.resolve_range(focus_kind, offset=1)
-            prev_totals = aggregator.get_range_totals(db, p_frm, p_to)
+            prev_totals = None
+            if focus_kind:
+                _, p_frm, p_to = aggregator.resolve_range(focus_kind, offset=1)
+                prev_totals = aggregator.get_range_totals(db, p_frm, p_to)
 
         db.close()
 

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from concurrent.futures import CancelledError
 import os
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -13,8 +15,11 @@ from textual.timer import Timer
 from textual.widgets import Footer, Header, LoadingIndicator, Static
 from textual.widgets._footer import FooterKey
 
-from ..collectors import CollectorRegistry, create_default_registry
+from ..collectors import CollectorRegistry, create_default_registry, sync_cancellation
+from ..collectors.remote import _run_command
+from textual.worker import get_current_worker
 from ..config import AUTO_REFRESH_INTERVAL, DATA_SYNC_INTERVAL
+from ..pricing import pricing_catalog_refresh_due
 from ..formatting import cache_hit_rate as _cache_hit_rate
 from ..formatting import source_label as _source_label
 from ..store.aggregator import (
@@ -23,14 +28,13 @@ from ..store.aggregator import (
     get_range_by_provider,
     get_range_by_project,
     get_range_totals,
-    get_today_sessions,
+    query_snapshot,
     get_trend,
     get_unpriced_models,
     get_trend_provider_totals,
     get_used_models,
     resolve_range,
 )
-from ..pricing import refresh_pricing_catalog
 from ..store.database import Database
 from .widgets import Breakdown, PeriodicHeatmap, SummaryCell, TrendBlocks
 from .pricing_screen import PricingScreen
@@ -167,13 +171,16 @@ class AgenticMetricApp(App):
         collectors: CollectorRegistry | None = None,
         sync_on_mount: bool = True,
         show_clock: bool = True,
+        refresh_pricing_on_mount: bool = False,
     ) -> None:
         super().__init__()
-        self._db = db or Database()
+        self._db = db or Database(reprice_on_open=False)
         self._collectors: CollectorRegistry = collectors or create_default_registry()
         self._sync_on_mount = sync_on_mount
         self._show_clock = show_clock
-        self._today_sessions: list[dict] = []
+        self._refresh_pricing_on_mount = refresh_pricing_on_mount
+        self._exit_requested = False
+        self._range_totals_cache: dict[tuple[str, str], dict] | None = None
         self._focus: str = "today"
         self._offset: int = 0  # 0 = current period; N = N units in the past
         self._auto_refresh_timer: Timer | None = None
@@ -221,24 +228,39 @@ class AgenticMetricApp(App):
             if cached is not None:
                 self._initial_sync_pending = False
                 self._set_initial_loading(False)
-                self._today_sessions = get_today_sessions(self._db)
                 self._populate_all()
                 self._refresh_pricing_warning()
             self._sync_timer = self.set_interval(DATA_SYNC_INTERVAL, self._tick_sync)
             self._start_sync(self._initial_sync_worker)
         else:
-            self._today_sessions = get_today_sessions(self._db)
             self.sub_title = "cached data"
             self._populate_all()
             self._refresh_pricing_warning()
 
     async def _initial_sync_worker(self) -> None:
+        if self._refresh_pricing_on_mount:
+            try:
+                self._refresh_catalog_in_worker(force=False)
+            except CancelledError:
+                return
+            except RuntimeError:
+                pass
         self._run_sync()
 
+    async def action_quit(self) -> None:
+        self._exit_requested = True
+        self.workers.cancel_all()
+        self.exit()
+
     def on_unmount(self) -> None:
+        self._exit_requested = True
+        self.workers.cancel_all()
         if self._auto_refresh_timer is not None:
             self._auto_refresh_timer.stop()
             self._auto_refresh_timer = None
+        if self._sync_timer is not None:
+            self._sync_timer.stop()
+            self._sync_timer = None
         self._db.close()
 
     # ── Rendering ─────────────────────────────────────────────────────
@@ -248,16 +270,34 @@ class AgenticMetricApp(App):
         self.query_one("#dashboard", Vertical).display = not loading
 
     def _populate_all(self) -> None:
-        self._populate_summary()
-        self._populate_heatmap()
-        self._populate_chart()
-        self._populate_breakdown()
+        with query_snapshot(self._db):
+            self._range_totals_cache = {}
+            try:
+                self._populate_summary()
+                self._populate_heatmap()
+                self._populate_chart()
+                self._populate_breakdown()
+            finally:
+                self._range_totals_cache = None
 
     def _populate_chart_and_breakdown(self) -> None:
         """Refresh everything that depends on focus/offset (not summary)."""
-        self._populate_heatmap()
-        self._populate_chart()
-        self._populate_breakdown()
+        with query_snapshot(self._db):
+            self._range_totals_cache = {}
+            try:
+                self._populate_heatmap()
+                self._populate_chart()
+                self._populate_breakdown()
+            finally:
+                self._range_totals_cache = None
+
+    def _range_totals(self, start: str, end: str) -> dict:
+        if self._range_totals_cache is None:
+            return get_range_totals(self._db, start, end)
+        key = (start, end)
+        if key not in self._range_totals_cache:
+            self._range_totals_cache[key] = get_range_totals(self._db, start, end)
+        return self._range_totals_cache[key]
 
 
     def _populate_heatmap(self) -> None:
@@ -265,7 +305,7 @@ class AgenticMetricApp(App):
         buckets = get_heatmap(self._db, self._focus, offset=self._offset)
 
         label, frm, to = resolve_range(self._focus, offset=self._offset)
-        totals = get_range_totals(self._db, frm, to)
+        totals = self._range_totals(frm, to)
         project_rows = get_range_by_project(self._db, frm, to, limit=3)
         provider_rows = get_range_by_provider(self._db, frm, to)
 
@@ -311,7 +351,7 @@ class AgenticMetricApp(App):
         ):
             cell_offset = self._offset if kind == self._focus else 0
             label, frm, to = resolve_range(kind, offset=cell_offset)
-            totals = get_range_totals(self._db, frm, to)
+            totals = self._range_totals(frm, to)
             cost = totals.get("estimated_cost_usd") or 0.0
             cost_unknown = _has_unknown_cost(totals)
             sess = totals.get("session_count") or 0
@@ -323,7 +363,7 @@ class AgenticMetricApp(App):
 
             # Previous period for delta comparison
             _, p_frm, p_to = resolve_range(kind, offset=cell_offset + 1)
-            prev = get_range_totals(self._db, p_frm, p_to)
+            prev = self._range_totals(p_frm, p_to)
             prev_cost = prev.get("estimated_cost_usd") or 0.0
             prev_cost_unknown = _has_unknown_cost(prev)
 
@@ -471,7 +511,7 @@ class AgenticMetricApp(App):
 
     def _start_sync(self, worker) -> None:
         """Keep cached data visible while one background sync is running."""
-        if self._sync_in_progress:
+        if self._exit_requested or self._sync_in_progress:
             return
         self._sync_in_progress = True
         if self._initial_sync_pending:
@@ -487,12 +527,16 @@ class AgenticMetricApp(App):
         self._run_sync()
 
     def _run_sync(self) -> None:
+        worker = get_current_worker()
         db = None
         error = ""
         try:
-            db = Database()
-            self._collectors.sync_all(db)
-            db.commit()
+            with sync_cancellation(worker.cancelled_event):
+                db = Database()
+                self._collectors.sync_all(db)
+                db.commit()
+        except CancelledError:
+            return
         except Exception as exc:
             error = str(exc)
         finally:
@@ -501,17 +545,34 @@ class AgenticMetricApp(App):
                     db.close()
                 except Exception as exc:
                     error = error or str(exc)
-        if error:
-            self.call_from_thread(self._on_sync_failed, error)
-        else:
-            self.call_from_thread(self._on_sync_done)
+        if self._exit_requested or worker.is_cancelled:
+            return
+        try:
+            if error:
+                self.call_from_thread(self._on_sync_failed, error)
+            else:
+                self.call_from_thread(self._on_sync_done)
+        except RuntimeError:
+            if not self._exit_requested and not worker.is_cancelled:
+                raise
+
+    def _refresh_catalog_in_worker(self, *, force: bool) -> int:
+        if not force and not pricing_catalog_refresh_due():
+            return 0
+        function = "refresh_pricing_catalog" if force else "refresh_pricing_catalog_if_stale"
+        code = f"from agentic_metric.pricing import {function}; print(int({function}()))"
+        with sync_cancellation(get_current_worker().cancelled_event):
+            result = _run_command([sys.executable, "-c", code], 20, "pricing refresh")
+            return int(result.stdout.strip())
 
     async def _pricing_update_worker(self) -> None:
-        # Fetch the catalog on the sync thread so pricing caches never change
-        # under a concurrent sync; the sync that follows reprices history.
         try:
-            count = refresh_pricing_catalog()
+            count = self._refresh_catalog_in_worker(force=True)
+        except CancelledError:
+            return
         except Exception as exc:
+            if self._exit_requested:
+                return
             self.call_from_thread(
                 self.notify,
                 str(exc),
@@ -521,6 +582,8 @@ class AgenticMetricApp(App):
                 markup=False,
             )
         else:
+            if self._exit_requested:
+                return
             self.call_from_thread(
                 self.notify,
                 f"Pricing catalog updated ({count:,} model aliases).",
@@ -578,7 +641,6 @@ class AgenticMetricApp(App):
 
     def _on_sync_done(self) -> None:
         self._sync_in_progress = False
-        self._today_sessions = get_today_sessions(self._db)
         self._populate_all()
         self._refresh_pricing_warning()
 
@@ -603,7 +665,6 @@ class AgenticMetricApp(App):
 
     def _on_sync_failed(self, error: str) -> None:
         self._sync_in_progress = False
-        self._today_sessions = get_today_sessions(self._db)
         self._populate_all()
         self._refresh_pricing_warning()
         self.sub_title = "sync failed · showing cached data"

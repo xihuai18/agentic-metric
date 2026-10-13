@@ -8,6 +8,7 @@ from datetime import date
 from pathlib import Path
 
 from ..config import CODEX_SESSIONS_DIR
+from ..accounts import assign_source_account
 from ..pricing import estimate_cost
 from ..usage import (
     estimate_token_usage_cost,
@@ -18,6 +19,7 @@ from ..usage import (
 )
 from . import (
     BaseCollector,
+    check_sync_cancelled,
     local_time_bucket,
     reconcile_scope_sessions,
     reconcile_sync_state_keys,
@@ -165,6 +167,7 @@ class _SessionAccum:
         If the file shrank (truncated or replaced), reset state and re-parse
         from offset 0 — otherwise we'd silently miss data.
         """
+        check_sync_cancelled()
         today_str = date.today().strftime("%Y-%m-%d")
         if today_str != self.today_key:
             self._reset_today_counters(today_str)
@@ -371,6 +374,7 @@ class _SessionAccum:
 
     def _process_raw_line(self, raw_line: bytes) -> bool:
         """Process one JSONL line. Return False for an unparsable line."""
+        check_sync_cancelled()
         raw_line = raw_line.strip()
         if not raw_line:
             return True
@@ -757,6 +761,7 @@ def _session_file_identity(jsonl_file: Path) -> tuple[str, str, str]:
     try:
         with jsonl_file.open(encoding="utf-8") as handle:
             for line in handle:
+                check_sync_cancelled()
                 try:
                     entry = json.loads(line)
                 except (json.JSONDecodeError, UnicodeDecodeError):
@@ -781,11 +786,66 @@ def _session_file_identity(jsonl_file: Path) -> tuple[str, str, str]:
     return ("", "", "")
 
 
+_IDENTITY_CACHE_VERSION = 1
+_StatSignature = tuple[int, int, int, int, int]
+_Identity = tuple[str, str, str]
+
+
+def _stat_signature(jsonl_file: Path) -> _StatSignature | None:
+    """Return metadata that changes when a rollout is rewritten or replaced."""
+    try:
+        stat = jsonl_file.stat()
+    except OSError:
+        return None
+    return (
+        stat.st_size,
+        stat.st_mtime_ns,
+        stat.st_ctime_ns,
+        stat.st_dev,
+        stat.st_ino,
+    )
+
+
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _identity_cache_value(signature: _StatSignature, identity: _Identity) -> str:
+    return json.dumps(
+        {"v": _IDENTITY_CACHE_VERSION, "stat": list(signature), "id": list(identity)},
+        separators=(",", ":"),
+    )
+
+
+def _parse_identity_cache(raw: str | None) -> tuple[_StatSignature, _Identity] | None:
+    """Decode a cached identity record; None when missing or malformed."""
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(data, dict) or data.get("v") != _IDENTITY_CACHE_VERSION:
+        return None
+    stat, ident = data.get("stat"), data.get("id")
+    if not isinstance(stat, list) or len(stat) != 5 or not all(_is_int(v) for v in stat):
+        return None
+    if (
+        not isinstance(ident, list)
+        or len(ident) != 3
+        or not all(isinstance(v, str) for v in ident)
+        or not ident[0]
+    ):
+        return None
+    return (tuple(stat), (ident[0], ident[1], ident[2]))  # type: ignore[return-value]
+
+
 def _read_token_signatures(jsonl_file: Path) -> tuple[bytes, ...]:
     signatures: list[bytes] = []
     try:
         with jsonl_file.open(encoding="utf-8") as handle:
             for line in handle:
+                check_sync_cancelled()
                 try:
                     entry = json.loads(line)
                 except (json.JSONDecodeError, UnicodeDecodeError):
@@ -819,30 +879,71 @@ class CodexCollector(BaseCollector):
         sessions_dir: Path | None = None,
         provider: str = "",
         data_root: str = "",
+        *,
+        account_key: str = "",
     ) -> None:
+        from ..accounts import validate_account_key
+
         self.sessions_dir = sessions_dir
         self.provider = provider.strip()
         self.data_root = data_root
+        self.account_key = validate_account_key(account_key) if account_key else ""
         self.agent_type = "codex"
+        self.last_sync_complete = False
 
     def _sessions_dir(self) -> Path:
         return self.sessions_dir or CODEX_SESSIONS_DIR
 
     @property
     def sync_state_prefix(self) -> str:
-        identity = sync_key_identity(self.provider, self.data_root)
+        identity = sync_key_identity(self.provider, self.data_root, account_key=self.account_key)
         return f"codex_jsonl:{CODEX_SYNC_VERSION}:{identity}"
 
-    def sync_history(self, db, *, reconcile: bool = True) -> None:
+    def sync_history(
+        self,
+        db,
+        *,
+        reconcile: bool = True,
+        files: list[Path] | None = None,
+        preserve_missing_parents: bool = True,
+    ) -> None:
         """Sync Codex session history into the database."""
-        self._sync_jsonl_sessions(db, reconcile=reconcile)
+        self.last_sync_complete = False
+        self.last_sync_complete = self._sync_jsonl_sessions(
+            db,
+            reconcile=reconcile,
+            files=files,
+            preserve_missing_parents=preserve_missing_parents,
+        )
         db.commit()
 
-    def _sync_jsonl_sessions(self, db, *, reconcile: bool = True) -> None:
-        """Walk all ~/.codex/sessions/**/*.jsonl and upsert session data."""
+    def _load_identity(
+        self, db, jsonl_file: Path, identity_key: str
+    ) -> tuple[_Identity, _StatSignature | None, str]:
+        """Return identity provenance; an unstable read has no reusable signature."""
+        before = _stat_signature(jsonl_file)
+        raw = db.get_sync_state(identity_key)
+        cached = _parse_identity_cache(raw)
+        if cached is not None and before is not None and cached[0] == before:
+            return cached[1], before, "hit"
+        status = "missing" if raw is None else "stale"
+        identity = _session_file_identity(jsonl_file)
+        after = _stat_signature(jsonl_file)
+        stable = before is not None and before == after and bool(identity[0])
+        return identity, (before if stable else None), status
+
+    def _sync_jsonl_sessions(
+        self,
+        db,
+        *,
+        reconcile: bool = True,
+        files: list[Path] | None = None,
+        preserve_missing_parents: bool = True,
+    ) -> bool:
+        """Sync rollouts and report whether inventory provenance stayed complete."""
         sessions_dir = self._sessions_dir()
         if not sessions_dir.exists():
-            return
+            return False
 
         # v9: compatible gateways may report input_tokens as non-cached input
         # with cached_input_tokens added separately; reparse to normalize that
@@ -863,12 +964,29 @@ class CodexCollector(BaseCollector):
         # v17: partial replay aborts retain an observed child turn context.
         sync_prefix = f"{self.sync_state_prefix}:"
 
-        try:
-            jsonl_files = sorted(sessions_dir.rglob("rollout-*.jsonl"))
-        except OSError:
-            return
-        identities = {path: _session_file_identity(path) for path in jsonl_files}
-        inventory_complete = all(identity[0] for identity in identities.values())
+        if files is not None:
+            jsonl_files = sorted({Path(path) for path in files})
+        else:
+            try:
+                jsonl_files = sorted(sessions_dir.rglob("rollout-*.jsonl"))
+            except OSError:
+                return False
+        identity_prefix = f"{sync_prefix}identity:"
+        identities: dict[Path, _Identity] = {}
+        # path -> (stable signature or None, cache status)
+        identity_meta: dict[Path, tuple[_StatSignature | None, str]] = {}
+        for path in jsonl_files:
+            check_sync_cancelled()
+            identity, signature, status = self._load_identity(
+                db, path, f"{identity_prefix}{path}"
+            )
+            identities[path] = identity
+            identity_meta[path] = (signature, status)
+        # An unstable or empty identity read makes the inventory incomplete.
+        inventory_complete = all(
+            identities[path][0] and identity_meta[path][0] is not None
+            for path in jsonl_files
+        )
         files_by_session_id = {
             session_id: path
             for path, (session_id, _parent_id, _provider) in identities.items()
@@ -882,34 +1000,53 @@ class CodexCollector(BaseCollector):
             effective_provider = self.provider or observed_provider
             active_ids = active_by_provider.setdefault(effective_provider, set())
             active_ids.add(session_id)
-            if parent_id and parent_id not in files_by_session_id:
+            if preserve_missing_parents and parent_id and parent_id not in files_by_session_id:
                 active_ids.add(parent_id)
         active_sync_keys = {
             f"{self.sync_state_prefix}:{jsonl_file}" for jsonl_file in jsonl_files
         }
+        active_sync_keys.update(f"{identity_prefix}{path}" for path in jsonl_files)
+
+        def persist_identity(jsonl_file: Path, current: _StatSignature) -> None:
+            signature, _status = identity_meta[jsonl_file]
+            # Only persist when the file is unchanged since its identity read.
+            if signature is None or signature != current:
+                return
+            db.set_sync_state(
+                f"{identity_prefix}{jsonl_file}",
+                _identity_cache_value(signature, identities[jsonl_file]),
+                commit=False,
+            )
 
         for jsonl_file in jsonl_files:
+            check_sync_cancelled()
             sync_key = f"{sync_prefix}{jsonl_file}"
             prev_state = db.get_sync_state(sync_key)
 
-            try:
-                stat = jsonl_file.stat()
-            except OSError:
+            current = _stat_signature(jsonl_file)
+            if current is None:
+                inventory_complete = False
                 continue
-            file_size = stat.st_size
-            mtime_ns = stat.st_mtime_ns
+            file_size, mtime_ns = current[0], current[1]
+            identity_signature, identity_status = identity_meta[jsonl_file]
+            # A rewrite since the inventory read invalidates identity and reconcile.
+            identity_current = identity_signature == current
+            if not identity_current:
+                inventory_complete = False
 
             parent_id = identities[jsonl_file][1]
             parent_file = files_by_session_id.get(parent_id)
             parent_state = f"missing:{parent_id}" if parent_id else ""
             if parent_file is not None and parent_file != jsonl_file:
-                try:
-                    parent_stat = parent_file.stat()
-                    parent_state = (
-                        f"{parent_file}:{parent_stat.st_size}:{parent_stat.st_mtime_ns}"
-                    )
-                except OSError:
+                parent_signature = _stat_signature(parent_file)
+                if parent_signature is None:
                     parent_file = None
+                    inventory_complete = False
+                else:
+                    # Full parent metadata so a same-size restored-mtime rewrite is seen.
+                    parent_state = f"{parent_file}:{':'.join(map(str, parent_signature))}"
+                    if identity_meta[parent_file][0] != parent_signature:
+                        inventory_complete = False
 
             if _sync_state_matches(
                 prev_state,
@@ -917,7 +1054,9 @@ class CodexCollector(BaseCollector):
                 mtime_ns,
                 parent_state=parent_state,
             ):
-                continue
+                # Skip only when cached identity provenance matches full metadata.
+                if identity_status == "hit" and identity_current:
+                    continue
 
             replayed_token_signatures = None
             if parent_file is not None and parent_file != jsonl_file:
@@ -956,6 +1095,7 @@ class CodexCollector(BaseCollector):
                     state,
                     commit=False,
                 )
+                persist_identity(jsonl_file, current)
                 continue
 
             session_id = accum.session_id or jsonl_file.stem
@@ -977,9 +1117,10 @@ class CodexCollector(BaseCollector):
                     state,
                     commit=False,
                 )
+                persist_identity(jsonl_file, current)
                 continue
 
-            usage_rows = accum.usage_bucket_rows()
+            usage_rows = assign_source_account(accum.usage_bucket_rows(), self.account_key)
             cost = _usage_rows_cost(usage_rows)
 
             db.upsert_session(
@@ -1016,6 +1157,7 @@ class CodexCollector(BaseCollector):
                 state,
                 commit=False,
             )
+            persist_identity(jsonl_file, current)
 
         if inventory_complete and reconcile:
             owned_providers = {self.provider} if self.provider else None
@@ -1031,6 +1173,7 @@ class CodexCollector(BaseCollector):
                 self.sync_state_prefix,
                 active_sync_keys,
             )
+        return inventory_complete
 
 
 def _sync_state_value(

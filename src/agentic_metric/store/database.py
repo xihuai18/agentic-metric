@@ -2,12 +2,23 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 
 from ..config import DATA_DIR, DB_PATH
-from ..pricing import estimate_cost, get_pricing_fingerprint
+from ..pricing import (
+    estimate_cost,
+    get_model_pricing_fingerprints,
+    get_pricing_epoch,
+    get_pricing_fingerprint,
+)
 
 _UNSET = object()
+_CANCEL_CHECK_ROWS = 256
+_PRICING_STATE_KEY = "pricing:fingerprint"
+_PRICING_MODELS_KEY = "pricing:model_fingerprints"
+_PRICING_MODELS_VERSION = 1
 _HISTORY_IDENTITY_VERSION = "provider-data-root-v4"
 
 _SESSIONS_TABLE_SQL = """\
@@ -68,16 +79,78 @@ CREATE TABLE IF NOT EXISTS sync_state (
 """ + _SESSION_USAGE_TABLE_SQL
 
 
+def _check_cancelled() -> None:
+    from ..collectors import check_sync_cancelled  # lazy: collectors import this module's package
+
+    check_sync_cancelled()
+
+
+def _cancellable(rows):
+    for index, row in enumerate(rows):
+        if index % _CANCEL_CHECK_ROWS == 0:
+            _check_cancelled()
+        yield row
+
+
 class Database:
-    def __init__(self, db_path: str | None = None) -> None:
+    def __init__(self, db_path: str | None = None, *, reprice_on_open: bool = True) -> None:
+        from ..collectors import current_sync_cancel_event
+
         self._path = db_path or str(DB_PATH)
         self.pricing_changed = False
+        self._tracked_models: set[str] = set()
+        self._unrecorded_models: set[str] = set()
+        self._pricing_epoch: tuple[int, int] | None = None
+        self._price_dirty = False
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(self._path)
         self._conn.row_factory = sqlite3.Row
-        self._conn.executescript(_SCHEMA)
-        self._migrate()
-        self.ensure_pricing_current()
+        event = current_sync_cancel_event()
+        if event is not None:
+            self._conn.set_progress_handler(lambda: int(event.is_set()), 1000)
+        try:
+            _check_cancelled()
+            self._enable_wal()
+            _check_cancelled()
+            self._conn.executescript(_SCHEMA)
+            self._migrate()
+            if reprice_on_open:
+                self.ensure_pricing_current()
+        except BaseException as exc:
+            self._abandon_connection()
+            if (
+                event is not None
+                and event.is_set()
+                and isinstance(exc, sqlite3.OperationalError)
+                and "interrupted" in str(exc)
+            ):
+                from concurrent.futures import CancelledError
+
+                raise CancelledError() from exc
+            raise
+        if event is not None:
+            self._conn.set_progress_handler(None, 0)
+
+    def _abandon_connection(self) -> None:
+        self._conn.set_progress_handler(None, 0)
+        try:
+            self._conn.rollback()
+        except sqlite3.Error:
+            pass
+        try:
+            self._conn.close()
+        except sqlite3.Error:
+            pass
+
+    def _enable_wal(self) -> None:
+        """Let readers proceed during writes; synchronous stays at its durable default."""
+        if self._path == ":memory:" or self._path.startswith("file::memory:"):
+            return
+        try:
+            self._conn.execute("PRAGMA journal_mode=WAL").fetchone()
+        except sqlite3.OperationalError:
+            # Another connection holds the file; keep the current mode.
+            pass
 
     def _migrate(self) -> None:
         """Add columns that may be missing in older databases."""
@@ -102,7 +175,7 @@ class Database:
             or "data_root" not in cols
             or pk_cols != ["session_id", "agent_type", "provider", "data_root"]
         ):
-            self._rebuild_sessions_table(cols)
+            self._atomically(self._rebuild_sessions_table, cols)
 
         usage_info = self._conn.execute("PRAGMA table_info(session_usage)").fetchall()
         usage_cols = {r[1] for r in usage_info}
@@ -126,7 +199,7 @@ class Database:
                 "account_key",
             ]
         ):
-            self._rebuild_session_usage_table(usage_cols)
+            self._atomically(self._rebuild_session_usage_table, usage_cols)
 
         self._conn.executescript(_SESSION_USAGE_TABLE_SQL + """\
         CREATE INDEX IF NOT EXISTS idx_session_usage_date ON session_usage (usage_date);
@@ -138,10 +211,15 @@ class Database:
         """)
         self._ensure_history_identity_current()
         self._purge_unscoped_legacy_history()
-        self._conn.execute(
-            "DELETE FROM sync_state WHERE key LIKE 'cc_assistant_ids:%'"
-        )
-        self._conn.commit()
+        # ';' is ':' + 1, so this index range proves nothing matches without taking a write lock.
+        if self._conn.execute(
+            "SELECT 1 FROM sync_state "
+            "WHERE key >= 'cc_assistant_ids:' AND key < 'cc_assistant_ids;' LIMIT 1"
+        ).fetchone():
+            self._conn.execute(
+                "DELETE FROM sync_state WHERE key LIKE 'cc_assistant_ids:%'"
+            )
+        self._commit()
 
     @staticmethod
     def _column_expr(cols: set[str], column: str, default_sql: str) -> str:
@@ -193,7 +271,17 @@ class Database:
         self._conn.execute("DELETE FROM session_usage WHERE data_root = ''")
         self._conn.execute("DELETE FROM sync_state WHERE key LIKE 'codex_jsonl:v5:%'")
         self._conn.execute("DELETE FROM sync_state WHERE key LIKE 'cc_jsonl:v5:%'")
-        self._conn.commit()
+        self._commit()
+
+    def _atomically(self, rebuild, cols: set[str]) -> None:
+        """Run a table rebuild in one transaction so an interrupt never leaves a renamed-away table."""
+        if not self._conn.in_transaction:
+            self._conn.execute("BEGIN")
+        try:
+            rebuild(cols)
+        except BaseException:
+            self._conn.rollback()
+            raise
 
     def _rebuild_sessions_table(self, cols: set[str]) -> None:
         """Rebuild the sessions table with the current primary key."""
@@ -231,7 +319,7 @@ class Database:
                FROM sessions_old"""
         )
         self._conn.execute("DROP TABLE sessions_old")
-        self._conn.commit()
+        self._commit()
 
     def _rebuild_session_usage_table(self, cols: set[str]) -> None:
         """Extend usage identity, preserving legacy rows as unknown accounts."""
@@ -267,6 +355,10 @@ class Database:
                FROM session_usage_old"""
         )
         self._conn.execute("DROP TABLE session_usage_old")
+        self._commit()
+
+    def _commit(self) -> None:
+        _check_cancelled()
         self._conn.commit()
 
     def close(self) -> None:
@@ -287,26 +379,180 @@ class Database:
     def set_sync_state(
         self, key: str, value: str, *, commit: bool = True
     ) -> None:
+        if commit:
+            self._guard_pricing_epoch()
         self._conn.execute(
             "INSERT INTO sync_state (key, value) VALUES (?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, value),
         )
         if commit:
-            self._conn.commit()
+            self._commit()
 
     def delete_sync_state_prefix(self, prefix: str) -> None:
+        self._guard_pricing_epoch()
         self._conn.execute(
             "DELETE FROM sync_state WHERE key LIKE ?",
             (f"{prefix}%",),
         )
-        self._conn.commit()
+        self._commit()
+
+    # ── Per-model pricing baselines ───────────────────────────────
+
+    def _stored_pricing_models(self, *, include_session_fallback: bool = False) -> set[str]:
+        """Return the raw model ids whose stored costs depend on pricing, via one index lookup per distinct model."""
+        models = {
+            row[0]
+            for row in self._conn.execute(
+                """WITH RECURSIVE m(x) AS (
+                       SELECT MIN(model) FROM session_usage
+                       UNION ALL
+                       SELECT (SELECT MIN(model) FROM session_usage WHERE model > m.x)
+                       FROM m WHERE m.x IS NOT NULL
+                   )
+                   SELECT x FROM m WHERE x IS NOT NULL"""
+            )
+        }
+        if self._conn.execute(
+            "SELECT 1 FROM session_usage WHERE model IS NULL LIMIT 1"
+        ).fetchone():
+            models.add("")
+        if include_session_fallback:
+            models.update(
+                row[0]
+                for row in self._conn.execute(
+                    """SELECT DISTINCT COALESCE(model, '')
+                       FROM sessions AS s
+                       WHERE NOT EXISTS (
+                           SELECT 1
+                           FROM session_usage AS u
+                           WHERE u.session_id = s.session_id
+                             AND u.agent_type = s.agent_type
+                             AND u.provider = s.provider
+                             AND u.data_root = s.data_root
+                       )"""
+                )
+            )
+        return models
+
+    @staticmethod
+    def _full_digest(fingerprint: str) -> str:
+        return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
+
+    def _load_model_fingerprints(self, fingerprint: str | None) -> dict[str, str] | None:
+        """Return the per-model baseline only if it belongs to this stored fingerprint."""
+        raw = self.get_sync_state(_PRICING_MODELS_KEY)
+        if fingerprint is None or not raw:
+            return None
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return None
+        if (
+            not isinstance(data, dict)
+            or data.get("v") != _PRICING_MODELS_VERSION
+            or data.get("full") != self._full_digest(fingerprint)
+        ):
+            return None
+        models = data.get("models")
+        if not isinstance(models, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in models.items()
+        ):
+            return None
+        return models
+
+    def _write_model_fingerprints(
+        self, fingerprint: str, models: dict[str, str]
+    ) -> None:
+        self.set_sync_state(
+            _PRICING_MODELS_KEY,
+            json.dumps(
+                {
+                    "v": _PRICING_MODELS_VERSION,
+                    "full": self._full_digest(fingerprint),
+                    "models": models,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            commit=False,
+        )
+        self._tracked_models = set(models)
+
+    def _record_new_models(self) -> None:
+        """Baseline models written this session, only while pricing provably still matches the stored fingerprint."""
+        pending = self._unrecorded_models - self._tracked_models
+        self._unrecorded_models = set()
+        if not pending:
+            return
+        stored = self.get_sync_state(_PRICING_STATE_KEY)
+        prior = self._load_model_fingerprints(stored)
+        if prior is None or stored is None:
+            return
+        stable = get_pricing_fingerprint() == stored
+        signatures = get_model_pricing_fingerprints(pending) if stable else {}
+        if not stable or get_pricing_fingerprint() != stored:
+            # New rows may be priced under other rules: force a reprice on the next open.
+            self.set_sync_state(_PRICING_STATE_KEY, "", commit=False)
+            return
+        if self._pricing_epoch is None or get_pricing_epoch() != self._pricing_epoch:
+            self._invalidate_pricing()
+            return
+        prior.update(signatures)
+        self._write_model_fingerprints(stored, prior)
+
+    def _invalidate_pricing(self) -> None:
+        """Force the next open to reprice by blanking the stored fingerprint, without writing signatures."""
+        if self.get_sync_state(_PRICING_STATE_KEY) != "":
+            self.set_sync_state(_PRICING_STATE_KEY, "", commit=False)
+
+    def _guard_pricing_epoch(self) -> None:
+        """Before committing price-dependent rows, invalidate if pricing was reloaded since the verified baseline."""
+        if not self._price_dirty:
+            return
+        self._price_dirty = False
+        if self._pricing_epoch is None or get_pricing_epoch() != self._pricing_epoch:
+            self._unrecorded_models = set()
+            self._invalidate_pricing()
 
     def ensure_pricing_current(self) -> None:
-        """Reprice stored sessions when pricing rules change."""
-        state_key = "pricing:fingerprint"
+        """Reconcile stored pricing, then remember the pricing epoch only if it stayed stable throughout."""
+        start = get_pricing_epoch()
+        self._ensure_pricing_current()
+        if get_pricing_epoch() == start:
+            self._pricing_epoch = start
+            return
+        self._pricing_epoch = None
+        self._invalidate_pricing()
+        self._commit()
+
+    def _ensure_pricing_current(self) -> None:
+        """Reprice stored sessions when a stored model's pricing inputs (or an untrusted baseline) changed; otherwise just advance the fingerprint."""
+        state_key = _PRICING_STATE_KEY
         fingerprint = get_pricing_fingerprint()
-        if self.get_sync_state(state_key) == fingerprint:
+        stored = self.get_sync_state(state_key)
+        prior = self._load_model_fingerprints(stored)
+        if stored == fingerprint:
+            models = self._stored_pricing_models()
+            if prior is not None and set(prior) == models:
+                self._tracked_models = set(models)
+                return
+            # Stored costs match the current configuration, so current signatures are the baseline.
+            baseline = {m: fp for m, fp in (prior or {}).items() if m in models}
+            baseline.update(
+                get_model_pricing_fingerprints(models.difference(baseline))
+            )
+            self._write_model_fingerprints(fingerprint, baseline)
+            self._commit()
+            return
+
+        current = get_model_pricing_fingerprints(
+            self._stored_pricing_models(include_session_fallback=True)
+        )
+        if prior is not None and all(prior.get(m) == fp for m, fp in current.items()):
+            self.set_sync_state(state_key, fingerprint, commit=False)
+            self._write_model_fingerprints(fingerprint, current)
+            self._commit()
             return
 
         self.pricing_changed = True
@@ -341,8 +587,9 @@ class Database:
                 row["model"] or "",
                 row["account_key"],
             )
-            for row in usage_rows
+            for row in _cancellable(usage_rows)
         ]
+        _check_cancelled()
         if usage_updates:
             self._conn.executemany(
                 """UPDATE session_usage
@@ -390,8 +637,9 @@ class Database:
                 row["provider"],
                 row["data_root"],
             )
-            for row in rows
+            for row in _cancellable(rows)
         ]
+        _check_cancelled()
         if updates:
             self._conn.executemany(
                 """UPDATE sessions
@@ -431,12 +679,9 @@ class Database:
                )"""
         )
 
-        self._conn.execute(
-            "INSERT INTO sync_state (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (state_key, fingerprint),
-        )
-        self._conn.commit()
+        self.set_sync_state(state_key, fingerprint, commit=False)
+        self._write_model_fingerprints(fingerprint, current)
+        self._commit()
 
     # ── Session CRUD ──────────────────────────────────────────────
 
@@ -466,6 +711,16 @@ class Database:
     ) -> None:
         data_root_value = data_root or ""
         provider_value = provider or ""
+        if model is not None:
+            self._unrecorded_models.add(model)
+        if any(
+            value is not None
+            for value in (
+                model, input_tokens, output_tokens, cache_read_tokens,
+                cache_creation_tokens, cache_creation_1h_tokens,
+            )
+        ) or estimated_cost_usd is not _UNSET:
+            self._price_dirty = True
         existing = self._conn.execute(
             """SELECT 1
                FROM sessions
@@ -591,6 +846,9 @@ class Database:
         """Replace one session's per-local-hour usage buckets."""
         data_root_value = data_root or ""
         provider_value = provider or ""
+        self._unrecorded_models.update(b.get("model") or "" for b in buckets)
+        if buckets:
+            self._price_dirty = True
         self._conn.execute(
             """DELETE FROM session_usage
                WHERE session_id = ? AND agent_type = ? AND provider = ? AND data_root = ?""",
@@ -656,4 +914,6 @@ class Database:
         )
 
     def commit(self) -> None:
-        self._conn.commit()
+        self._guard_pricing_epoch()
+        self._record_new_models()
+        self._commit()

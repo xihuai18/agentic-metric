@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 
 from ..formatting import source_label
@@ -54,8 +57,71 @@ _USAGE_SOURCE = """(
 )"""
 
 
+class _Snapshot:
+    __slots__ = ("changes", "source", "source_changes")
+
+    def __init__(self, changes: int | None) -> None:
+        self.changes = changes
+        self.source: str | None = None
+        self.source_changes: int | None = None
+
+
+# Live only while a query_snapshot context is open, so nothing survives a sync.
+_snapshots: dict[int, _Snapshot] = {}
+
+
+def _total_changes(db: Database) -> int | None:
+    try:
+        return int(db.conn.total_changes)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+@contextmanager
+def query_snapshot(db: Database) -> Iterator[None]:
+    """Cache the pending-resync probe for one refresh, only under a verified read transaction."""
+    key = id(db)
+    if key in _snapshots:
+        yield
+        return
+    conn = getattr(db, "conn", None)
+    owns = False
+    if getattr(conn, "in_transaction", None) is False:
+        try:
+            conn.execute("BEGIN")
+            owns = getattr(conn, "in_transaction", None) is True
+        except sqlite3.Error:
+            owns = False
+    if not owns and getattr(conn, "in_transaction", None) is not True:
+        yield
+        return
+    _snapshots[key] = state = _Snapshot(_total_changes(db))
+    try:
+        yield
+    finally:
+        _snapshots.pop(key, None)
+        # A caller-owned transaction is never touched; ours is rolled back unless it wrote.
+        if owns and _total_changes(db) == state.changes:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+
+
 def _usage_source(db: Database) -> str:
     """Return per-bucket usage plus a sessions fallback for pending re-syncs."""
+    state = _snapshots.get(id(db))
+    if state is not None and state.source is not None:
+        if state.source_changes == _total_changes(db):
+            return state.source
+    source = _probe_usage_source(db)
+    if state is not None:
+        state.source = source
+        state.source_changes = _total_changes(db)
+    return source
+
+
+def _probe_usage_source(db: Database) -> str:
     pending = db.conn.execute(
         """SELECT 1
            FROM sessions AS s

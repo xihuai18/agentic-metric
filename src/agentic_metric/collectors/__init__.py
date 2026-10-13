@@ -3,9 +3,36 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from concurrent.futures import CancelledError
+from contextlib import contextmanager
+from contextvars import ContextVar, copy_context
 from datetime import datetime
+from threading import Event
 import hashlib
 import json
+
+_sync_cancel_event: ContextVar[Event | None] = ContextVar("sync_cancel_event", default=None)
+
+
+def current_sync_cancel_event() -> Event | None:
+    return _sync_cancel_event.get()
+
+
+@contextmanager
+def sync_cancellation(event: Event):
+    token = _sync_cancel_event.set(event)
+    try:
+        check_sync_cancelled()
+        yield
+    finally:
+        _sync_cancel_event.reset(token)
+
+
+def check_sync_cancelled() -> None:
+    event = current_sync_cancel_event()
+    if event is not None and event.is_set():
+        raise CancelledError()
+
 
 # Both collectors bucket every parsed entry by local date and hour. Converting
 # each ISO timestamp on its own dominated a full reparse (millions of
@@ -49,9 +76,12 @@ def local_time_bucket(ts: str) -> tuple[str, int]:
     return bucket
 
 
-def sync_key_identity(provider: str, data_root: str) -> str:
+def sync_key_identity(provider: str, data_root: str, *, account_key: str = "") -> str:
+    scope = {"provider": provider or "", "data_root": data_root or ""}
+    if account_key:
+        scope["account_key"] = account_key
     raw = json.dumps(
-        {"provider": provider or "", "data_root": data_root or ""},
+        scope,
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -143,7 +173,25 @@ class CollectorRegistry:
         data_root = getattr(collector, "data_root", "")
         return f"{agent_type} {data_root}".strip()
 
-    def sync_all(self, db) -> None:
+    def sync_all(self, db, *, cancel_event: Event | None = None) -> None:
+        cancel_event = cancel_event or current_sync_cancel_event() or Event()
+        token = _sync_cancel_event.set(cancel_event)
+        if cancel_event is not None:
+            db.conn.set_progress_handler(lambda: int(cancel_event.is_set()), 1000)
+        try:
+            check_sync_cancelled()
+            self._sync_all(db)
+        except BaseException:
+            if cancel_event is not None:
+                db.conn.set_progress_handler(None, 0)
+            db.conn.rollback()
+            raise
+        finally:
+            if cancel_event is not None:
+                db.conn.set_progress_handler(None, 0)
+            _sync_cancel_event.reset(token)
+
+    def _sync_all(self, db) -> None:
         """Sync all collectors' history into the database.
 
         Remote mirroring is network-only, so it runs in background threads while
@@ -163,24 +211,36 @@ class CollectorRegistry:
             self._reconcile_derived_state(db)
             return
 
-        from concurrent.futures import ThreadPoolExecutor
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
         with ThreadPoolExecutor(
             max_workers=min(8, len(remote)),
             thread_name_prefix="remote-cache",
         ) as pool:
-            futures = [
-                pool.submit(getattr(collector, "prepare_cache")) for collector in remote
-            ]
-            self._sync_collectors(db, local)
-            for collector, future in zip(remote, futures):
-                try:
-                    future.result()
-                except Exception as exc:
-                    # Builtin collectors report mirroring failures through
-                    # ``last_error``; a raising one must not abort the sync.
-                    self._sync_errors.append(f"{self._label(collector)}: {exc}")
-        self._sync_collectors(db, remote)
+            futures = {
+                pool.submit(copy_context().run, getattr(collector, "prepare_cache")): collector
+                for collector in remote
+            }
+            try:
+                self._sync_collectors(db, local)
+                for future in as_completed(futures):
+                    check_sync_cancelled()
+                    collector = futures[future]
+                    try:
+                        future.result()
+                    except CancelledError:
+                        raise
+                    except Exception as exc:
+                        self._sync_errors.append(f"{self._label(collector)}: {exc}")
+                    self._sync_collectors(db, [collector])
+            except BaseException:
+                event = current_sync_cancel_event()
+                if event is not None:
+                    event.set()
+                for future in futures:
+                    future.cancel()
+                raise
+        check_sync_cancelled()
         self._reconcile_derived_state(db)
 
     def _reconcile_derived_state(self, db) -> None:
@@ -242,9 +302,14 @@ class CollectorRegistry:
 
     def _sync_collectors(self, db, collectors: list[BaseCollector]) -> None:
         for collector in collectors:
+            check_sync_cancelled()
             try:
                 collector.sync_history(db)
+                check_sync_cancelled()
+            except CancelledError:
+                raise
             except Exception as exc:
+                check_sync_cancelled()
                 db.conn.rollback()
                 self._sync_errors.append(f"{self._label(collector)}: {exc}")
 
@@ -283,6 +348,7 @@ def create_default_registry() -> CollectorRegistry:
                 projects_dir=projects_dir,
                 provider=root.provider,
                 data_root=str(data_root),
+                account_key=root.account_key,
             )
         )
 
@@ -295,6 +361,7 @@ def create_default_registry() -> CollectorRegistry:
                 sessions_dir=sessions_dir,
                 provider=root.provider,
                 data_root=str(data_root),
+                account_key=root.account_key,
             )
         )
 
@@ -311,6 +378,7 @@ def create_default_registry() -> CollectorRegistry:
                             remote_root=root.path,
                             provider=root.provider,
                             index=idx,
+                            account_key=root.account_key,
                         )
                     )
                 )

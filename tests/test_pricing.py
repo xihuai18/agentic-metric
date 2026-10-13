@@ -15,6 +15,7 @@ from agentic_metric.pricing import (
     get_all_pricing,
     get_cache_write_1h_price,
     get_long_context_rules,
+    get_model_pricing_fingerprints,
     get_pricing,
     get_pricing_fingerprint,
     remove_user_long_context_pricing,
@@ -1258,3 +1259,295 @@ def test_catalog_imports_modes_and_long_context(tmp_path):
         assert get_pricing("gpt-9") == (9.0, 9.0, 9.0, 9.0)
         assert estimate_cost("gpt-9-fast", input_tokens=1) == 9 / 1_000_000
     _reset_cache()
+
+
+# ── Scoped fingerprints ─────────────────────────────────────────────
+
+
+def _write_catalog(tmp_path, models):
+    """Write the aggregate catalog and force the loader to notice the change."""
+    catalog_file = tmp_path / "pricing-catalog.json"
+    previous = catalog_file.stat().st_mtime if catalog_file.exists() else 0
+    catalog_file.write_text(json.dumps({"models": models}))
+    os.utime(catalog_file, (previous + 1, previous + 1))
+
+
+def _record(name, prices=(1.0, 2.0, 0.1, 1.25), **extra):
+    return {"aliases": [name], "prices": list(prices), **extra}
+
+
+def test_scoped_fingerprint_ignores_unused_catalog_models(tmp_path):
+    used = ["vendor-alpha-1", "gpt-5.4"]
+    _write_catalog(tmp_path, {"vendor-alpha-1": _record("vendor-alpha-1")})
+    scoped = get_pricing_fingerprint(used)
+    per_model = get_model_pricing_fingerprints(used)
+    full = get_pricing_fingerprint()
+
+    _write_catalog(
+        tmp_path,
+        {
+            "vendor-alpha-1": _record("vendor-alpha-1"),
+            "audit-model-9": _record(
+                "audit-model-9",
+                modes={"fast": {"prices": [9, 9, 9, 9]}},
+                long_context=[{"threshold": 100, "prices": [7, 7, 7, 7]}],
+            ),
+        },
+    )
+    assert get_pricing_fingerprint() != full
+    assert get_pricing_fingerprint(used) == scoped
+    assert get_model_pricing_fingerprints(used) == per_model
+
+
+def test_scoped_fingerprint_tracks_used_catalog_record(tmp_path):
+    used = ["vendor-alpha-1"]
+    _write_catalog(tmp_path, {"vendor-alpha-1": _record("vendor-alpha-1")})
+    base = get_pricing_fingerprint(used)
+
+    _write_catalog(
+        tmp_path, {"vendor-alpha-1": _record("vendor-alpha-1", (3.0, 2.0, 0.1, 1.25))}
+    )
+    changed_price = get_pricing_fingerprint(used)
+    assert changed_price != base
+
+    _write_catalog(
+        tmp_path,
+        {
+            "vendor-alpha-1": _record(
+                "vendor-alpha-1",
+                (3.0, 2.0, 0.1, 1.25),
+                long_context=[{"threshold": 200_000, "prices": [6, 4, 0.2, 2.5]}],
+            )
+        },
+    )
+    changed_context = get_pricing_fingerprint(used)
+    assert changed_context != changed_price
+
+    _write_catalog(
+        tmp_path,
+        {
+            "vendor-alpha-1": _record(
+                "vendor-alpha-1",
+                (3.0, 2.0, 0.1, 1.25),
+                long_context=[{"threshold": 200_000, "prices": [6, 4, 0.2, 2.5]}],
+                modes={"fast": {"prices": [9, 9, 9, 9]}},
+            )
+        },
+    )
+    assert get_pricing_fingerprint(used) != changed_context
+
+
+def test_scoped_fingerprint_covers_resolution_changes(tmp_path):
+    used = ["acme-unreleased-2", "vendor-big-model-3-fast"]
+    _write_catalog(tmp_path, {"big-model": _record("big-model")})
+    before = get_model_pricing_fingerprints(used)
+
+    # unknown -> known: the used raw name now has an exact catalog entry.
+    _write_catalog(
+        tmp_path,
+        {"big-model": _record("big-model"), "acme-unreleased-2": _record("acme-unreleased-2")},
+    )
+    after = get_model_pricing_fingerprints(used)
+    assert after["acme-unreleased-2"] != before["acme-unreleased-2"]
+    assert after["vendor-big-model-3-fast"] == before["vendor-big-model-3-fast"]
+
+    # A more specific catalog model now wins resolution for the used name.
+    _write_catalog(
+        tmp_path,
+        {
+            "big-model": _record("big-model"),
+            "acme-unreleased-2": _record("acme-unreleased-2"),
+            "vendor-big-model": _record("vendor-big-model", (5, 5, 5, 5)),
+        },
+    )
+    specific = get_model_pricing_fingerprints(used)
+    assert specific["vendor-big-model-3-fast"] != after["vendor-big-model-3-fast"]
+    assert specific["acme-unreleased-2"] == after["acme-unreleased-2"]
+
+    # Removing a catalog model that used to match changes it back.
+    _write_catalog(tmp_path, {"acme-unreleased-2": _record("acme-unreleased-2")})
+    removed = get_model_pricing_fingerprints(used)
+    assert removed["vendor-big-model-3-fast"] != specific["vendor-big-model-3-fast"]
+
+
+def test_scoped_fingerprint_keeps_global_dependencies(tmp_path):
+    used = ["vendor-alpha-1"]
+    base = get_pricing_fingerprint(used)
+    with patch(
+        "agentic_metric.pricing._MODEL_ALIASES", {"alias-model": "claude-sonnet-4-6"}
+    ):
+        assert get_pricing_fingerprint(used) != base
+    with patch("agentic_metric.pricing._NON_STANDARD_MODE_PRICING", {}):
+        assert get_pricing_fingerprint(used) != base
+    with patch("agentic_metric.pricing._LONG_CONTEXT_RULES", []):
+        assert get_pricing_fingerprint(used) != base
+    # Custom overrides stay global so a premium/cache/threshold edit is never missed.
+    set_user_pricing("some-unused-custom-model", 1.0, 2.0)
+    assert get_pricing_fingerprint(used) != base
+    again = get_pricing_fingerprint(used)
+    set_user_cache_pricing("some-unused-custom-model", write_1h=3.0)
+    assert get_pricing_fingerprint(used) != again
+
+
+def test_model_fingerprints_change_independently(tmp_path):
+    _write_catalog(
+        tmp_path,
+        {"model-a-1": _record("model-a-1"), "model-b-1": _record("model-b-1")},
+    )
+    before = get_model_pricing_fingerprints(["model-a-1", "model-b-1"])
+    _write_catalog(
+        tmp_path,
+        {
+            "model-a-1": _record("model-a-1"),
+            "model-b-1": _record("model-b-1", (8, 8, 8, 8)),
+        },
+    )
+    after = get_model_pricing_fingerprints(["model-a-1", "model-b-1"])
+    assert after["model-a-1"] == before["model-a-1"]
+    assert after["model-b-1"] != before["model-b-1"]
+    assert get_model_pricing_fingerprints([]) == {}
+
+
+# ── Automatic catalog refresh cooldown ──────────────────────────────
+
+
+def _stale_catalog(tmp_path, **extra):
+    catalog = {
+        "retrieved_at": "2000-01-01T00:00:00+00:00",
+        "models": {"vendor-alpha-1": _record("vendor-alpha-1")},
+        **extra,
+    }
+    (tmp_path / "pricing-catalog.json").write_text(json.dumps(catalog))
+    return catalog
+
+
+def _attempt_file(tmp_path):
+    return tmp_path / "pricing-catalog.json.attempt"
+
+
+def test_failed_auto_refresh_records_attempt_without_touching_catalog(tmp_path):
+    import agentic_metric.pricing as p
+
+    _stale_catalog(tmp_path)
+    before = (tmp_path / "pricing-catalog.json").read_bytes()
+    full = get_pricing_fingerprint()
+    calls = []
+
+    def fail(**_kwargs):
+        calls.append(1)
+        raise OSError("offline")
+
+    with patch.object(p, "refresh_pricing_catalog", fail):
+        assert p.refresh_pricing_catalog_if_stale() is False
+        assert p.refresh_pricing_catalog_if_stale() is False
+    assert len(calls) == 1
+    assert (tmp_path / "pricing-catalog.json").read_bytes() == before
+    assert "last_attempt" in json.loads(_attempt_file(tmp_path).read_text())
+    assert get_pricing_fingerprint() == full
+    assert [f.name for f in tmp_path.iterdir() if f.name.endswith(".tmp")] == []
+
+
+def test_auto_refresh_retries_after_cooldown_and_manual_bypasses(tmp_path):
+    import agentic_metric.pricing as p
+    from datetime import datetime, timedelta, timezone
+
+    def stamp(seconds):
+        when = datetime.now(timezone.utc) - timedelta(seconds=seconds)
+        _attempt_file(tmp_path).write_text(json.dumps({"last_attempt": when.isoformat()}))
+
+    _stale_catalog(tmp_path)
+    calls = []
+
+    def succeed(**_kwargs):
+        calls.append(1)
+        return 1
+
+    with patch.object(p, "refresh_pricing_catalog", succeed):
+        stamp(5)
+        assert p.refresh_pricing_catalog_if_stale() is False
+        assert calls == []
+        stamp(120)
+        assert p.refresh_pricing_catalog_if_stale() is True
+        assert calls == [1]
+
+    stamp(5)
+    payload = {
+        "openai": {
+            "models": {
+                "gpt-x": {
+                    "id": "gpt-x",
+                    "canonical_model_id": "openai/gpt-x",
+                    "cost": {"input": 1, "output": 2},
+                }
+            }
+        }
+    }
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def read(self):
+            return json.dumps(payload).encode()
+
+    with patch.object(p, "urlopen", lambda *a, **k: _Response()):
+        assert p.refresh_pricing_catalog() == 1
+    assert "gpt-x" in json.loads((tmp_path / "pricing-catalog.json").read_text())["models"]
+
+
+def test_failed_refresh_does_not_overwrite_a_concurrent_successful_install(tmp_path):
+    import agentic_metric.pricing as p
+
+    _stale_catalog(tmp_path)
+    winner = {
+        "retrieved_at": "2099-01-01T00:00:00+00:00",
+        "models": {"winner-1": _record("winner-1")},
+    }
+
+    def slow_failure(**_kwargs):
+        # Process B finishes and installs its catalog while A is still failing.
+        p._write_catalog_file(winner)
+        raise OSError("A lost the race")
+
+    with patch.object(p, "refresh_pricing_catalog", slow_failure):
+        assert p.refresh_pricing_catalog_if_stale() is False
+    assert json.loads((tmp_path / "pricing-catalog.json").read_text()) == winner
+    assert "last_attempt" in json.loads(_attempt_file(tmp_path).read_text())
+
+
+def test_first_failed_auto_refresh_creates_no_catalog_and_still_cools_down(tmp_path):
+    import agentic_metric.pricing as p
+
+    calls = []
+
+    def fail(**_kwargs):
+        calls.append(1)
+        raise OSError("offline")
+
+    with patch.object(p, "refresh_pricing_catalog", fail):
+        assert p.refresh_pricing_catalog_if_stale() is False
+        assert p.refresh_pricing_catalog_if_stale() is False
+    assert len(calls) == 1
+    assert not (tmp_path / "pricing-catalog.json").exists()
+    assert "last_attempt" in json.loads(_attempt_file(tmp_path).read_text())
+
+
+def test_catalog_write_uses_unique_temp_and_cleans_only_its_own(tmp_path):
+    import agentic_metric.pricing as p
+
+    bystander = tmp_path / "pricing-catalog.json.other.tmp"
+    bystander.write_text("another process")
+    with patch("agentic_metric.pricing.os.replace", side_effect=OSError("boom")):
+        with pytest.raises(OSError):
+            p._write_catalog_file({"models": {}})
+    assert [f.name for f in tmp_path.iterdir() if f.name.endswith(".tmp")] == [
+        bystander.name
+    ]
+    p._write_catalog_file({"models": {"m": {}}})
+    assert json.loads((tmp_path / "pricing-catalog.json").read_text())["models"] == {
+        "m": {}
+    }
+    assert bystander.read_text() == "another process"

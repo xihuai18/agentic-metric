@@ -17,6 +17,7 @@ from ..pricing import estimate_cost
 from ..usage import estimate_token_usage_cost, normalize_anthropic_usage
 from . import (
     BaseCollector,
+    check_sync_cancelled,
     local_time_bucket,
     reconcile_scope_sessions,
     reconcile_sync_state_keys,
@@ -24,7 +25,9 @@ from . import (
 )
 
 
-CLAUDE_SYNC_VERSION = "v14"
+from ..accounts import assign_source_account
+
+CLAUDE_SYNC_VERSION = "v15"
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -35,12 +38,12 @@ def _subscriber_account_key(usage: object) -> str:
     if not isinstance(usage, dict):
         return ""
     account = usage.get("wcc_subscriber_account")
-    if not isinstance(account, dict) or account.get("provider") != "codex":
+    if not isinstance(account, dict) or account.get("provider") not in ("codex", "claude"):
         return ""
     fingerprint = account.get("account_fingerprint")
     if not isinstance(fingerprint, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", fingerprint):
         return ""
-    return f"codex:{fingerprint.lower()}"
+    return f"{account['provider']}:{fingerprint.lower()}"
 
 
 def _extract_prompt(content: str) -> str:
@@ -161,6 +164,7 @@ class _SessionAccum:
 
     def read_new_lines(self) -> None:
         """Read only bytes appended since last call."""
+        check_sync_cancelled()
         today_str = datetime.now().strftime("%Y-%m-%d")
         if today_str != self.today_key:
             self._reset_today_counters(today_str)
@@ -255,6 +259,7 @@ class _SessionAccum:
 
     def _process_raw_line(self, raw_line: bytes, today_str: str) -> bool:
         """Process one JSONL line. Return False for an unparsable line."""
+        check_sync_cancelled()
         raw_line = raw_line.strip()
         if not raw_line:
             return True
@@ -627,29 +632,37 @@ class ClaudeCodeCollector(BaseCollector):
         projects_dir: Path | None = None,
         provider: str = "",
         data_root: str = "",
+        *,
+        account_key: str = "",
     ) -> None:
+        from ..accounts import validate_account_key
+
         self.projects_dir = projects_dir
         self.provider = provider.strip()
         self.data_root = data_root
+        self.account_key = validate_account_key(account_key) if account_key else ""
         self.agent_type = "claude_code"
+        self.last_sync_complete = False
 
     @property
     def sync_state_prefix(self) -> str:
-        identity = sync_key_identity(self.provider, self.data_root)
+        identity = sync_key_identity(self.provider, self.data_root, account_key=self.account_key)
         return f"cc_jsonl:{CLAUDE_SYNC_VERSION}:{identity}"
 
-    def sync_history(self, db, *, reconcile: bool = True) -> None:
+    def sync_history(self, db, *, reconcile: bool = True, files: list[Path] | None = None) -> None:
         """Sync Claude Code history into the database.
 
         Parses two data sources:
         1. ``sessions-index.json`` -- session metadata (per project)
         2. ``.jsonl`` files -- per-session token data (incremental via sync_state)
         """
-        indexed_ids, index_complete = self._sync_sessions_index(db)
+        self.last_sync_complete = False
+        indexed_ids, index_complete = self._sync_sessions_index(db, files=files)
         jsonl_ids, jsonl_complete = self._sync_jsonl_tokens(
             db,
             indexed_ids,
             reconcile=reconcile,
+            files=files,
         )
         if reconcile and index_complete and jsonl_complete:
             reconcile_scope_sessions(
@@ -660,10 +673,11 @@ class ClaudeCodeCollector(BaseCollector):
                 owned_providers={self.provider},
             )
         db.commit()
+        self.last_sync_complete = index_complete and jsonl_complete
 
     # ── sessions-index.json ──────────────────────────────────────
 
-    def _sync_sessions_index(self, db) -> tuple[set[str], bool]:
+    def _sync_sessions_index(self, db, *, files: list[Path] | None = None) -> tuple[set[str], bool]:
         """Parse all sessions-index.json files under PROJECTS_DIR."""
         projects_dir = self.projects_dir or PROJECTS_DIR
         if not projects_dir.exists():
@@ -672,7 +686,11 @@ class ClaudeCodeCollector(BaseCollector):
         active_ids: set[str] = set()
         complete = True
         try:
-            index_files = list(projects_dir.glob("*/sessions-index.json"))
+            index_files = (
+                list(projects_dir.glob("*/sessions-index.json")) if files is None else
+                [path for path in files if path.name == "sessions-index.json"
+                 and len(path.relative_to(projects_dir).parts) == 2]
+            )
         except OSError:
             return (active_ids, False)
 
@@ -722,7 +740,7 @@ class ClaudeCodeCollector(BaseCollector):
                     db.replace_session_usage(
                         session_id,
                         self.agent_type,
-                        [_zero_usage_bucket(created, project_path)],
+                        [_zero_usage_bucket(created, project_path, self.account_key)],
                         provider=self.provider,
                         data_root=self.data_root,
                     )
@@ -737,6 +755,7 @@ class ClaudeCodeCollector(BaseCollector):
         indexed_ids: set[str],
         *,
         reconcile: bool = True,
+        files: list[Path] | None = None,
     ) -> tuple[set[str], bool]:
         """Scan .jsonl files for per-session token data.
 
@@ -773,18 +792,25 @@ class ClaudeCodeCollector(BaseCollector):
         assistant_ids_prefix = f"{self.sync_state_prefix}:assistant_ids:"
         checkpoint_prefix = f"{self.sync_state_prefix}:checkpoint:"
 
+        grouped_files: dict[Path, list[Path]] = {}
+        if files is not None:
+            for path in files:
+                parts = path.relative_to(projects_dir).parts
+                if len(parts) >= 2 and path.suffix == ".jsonl":
+                    grouped_files.setdefault(projects_dir / parts[0], []).append(path)
         try:
-            project_dirs = list(projects_dir.iterdir())
+            project_dirs = list(projects_dir.iterdir()) if files is None else list(grouped_files)
         except OSError:
             return (active_ids, False)
 
         for project_dir in project_dirs:
+            check_sync_cancelled()
             if not project_dir.is_dir():
                 continue
 
             try:
                 jsonl_files = sorted(
-                    project_dir.rglob("*.jsonl"),
+                    project_dir.rglob("*.jsonl") if files is None else grouped_files[project_dir],
                     key=lambda path: (len(path.relative_to(project_dir).parts), str(path)),
                 )
             except OSError:
@@ -907,6 +933,7 @@ class ClaudeCodeCollector(BaseCollector):
                             [_zero_usage_bucket(
                                 session["started_at"] if session else "",
                                 session["project_path"] if session else project_path,
+                                self.account_key,
                             )],
                             provider=self.provider,
                             data_root=self.data_root,
@@ -921,7 +948,7 @@ class ClaudeCodeCollector(BaseCollector):
                     db.set_sync_state(sync_key, state, commit=False)
                     continue
 
-                usage_rows = accum.usage_bucket_rows()
+                usage_rows = assign_source_account(accum.usage_bucket_rows(), self.account_key)
                 cost = _usage_rows_cost(usage_rows)
 
                 db.upsert_session(
@@ -1129,6 +1156,7 @@ def _restore_checkpoint(
             initial_stat = os.fstat(f.fileno())
             remaining = offset
             while remaining:
+                check_sync_cancelled()
                 chunk = f.read(min(remaining, 1 << 20))
                 if not chunk:
                     return None
@@ -1198,13 +1226,14 @@ def _session_id_for_jsonl(project_dir: Path, jsonl_file: Path, default: str) -> 
     return default
 
 
-def _zero_usage_bucket(started_at: str, project_path: str) -> dict:
+def _zero_usage_bucket(started_at: str, project_path: str, account_key: str = "") -> dict:
     usage_date, usage_hour = local_time_bucket(started_at)
     return {
         "usage_date": usage_date,
         "usage_hour": usage_hour,
         "project_path": project_path,
         "model": "",
+        "account_key": account_key,
         "message_count": 0,
         "user_turns": 0,
         "input_tokens": 0,

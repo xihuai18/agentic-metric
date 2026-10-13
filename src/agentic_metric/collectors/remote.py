@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 from concurrent.futures import CancelledError, FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextvars import copy_context
 from dataclasses import dataclass
 from hashlib import sha1
 from io import BytesIO
 import json
+import os
 from pathlib import Path, PurePosixPath
 import posixpath
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import tarfile
@@ -19,7 +22,7 @@ from threading import BoundedSemaphore, Event
 import time
 
 from ..config import DATA_DIR, RemoteSpec
-from . import BaseCollector
+from . import BaseCollector, check_sync_cancelled, current_sync_cancel_event
 from .claude_code import ClaudeCodeCollector
 from .codex import CodexCollector
 
@@ -57,6 +60,7 @@ class RemoteSyncTarget:
     remote_root: str
     provider: str
     index: int
+    account_key: str = ""
 
     @property
     def child_dir(self) -> str:
@@ -106,12 +110,14 @@ class RemoteHistoryCollector(BaseCollector):
                 sessions_dir=cache_root / "sessions",
                 provider=self.provider,
                 data_root=self.data_root,
+                account_key=target.account_key,
             )
         elif target.agent_type == "claude_code":
             self._inner = ClaudeCodeCollector(
                 projects_dir=cache_root / "projects",
                 provider=self.provider,
                 data_root=self.data_root,
+                account_key=target.account_key,
             )
         else:
             raise ValueError(f"unsupported remote agent type: {target.agent_type}")
@@ -141,11 +147,15 @@ class RemoteHistoryCollector(BaseCollector):
                 self.last_error = f"remote mirror incomplete: {self.data_root}"
             else:
                 self.last_error = ""
+        except CancelledError:
+            self._prepared = None
+            raise
         except Exception as exc:
             self._prepared = (False, False, "", False)
             self.last_error = str(exc)
 
     def sync_history(self, db) -> None:
+        check_sync_cancelled()
         prepared = self._prepared
         self._prepared = None
         if prepared is None:
@@ -160,11 +170,25 @@ class RemoteHistoryCollector(BaseCollector):
             # The mirror is byte-identical to the last fully parsed state, so
             # the per-file scan of the whole cache tree can be skipped.
             return
-        if cache_changed and complete:
-            _purge_removed_remote_sessions(db, self.target)
-        self._inner.sync_history(db, reconcile=complete)
+        files = None
         if complete:
+            root = _cache_root_for(self.target)
+            manifest = _load_manifest(root)
+            if manifest is not None and _manifest_digest(manifest) == manifest_digest:
+                paths = [_safe_member_path(rel) for rel in manifest]
+                if all(path is not None for path in paths):
+                    files = [root / self.target.source_child / path for path in paths if path is not None]
+        if cache_changed and complete and self.agent_type == "claude_code":
+            _purge_removed_remote_sessions(db, self.target, files=files)
+        if isinstance(self._inner, CodexCollector):
+            self._inner.sync_history(db, reconcile=complete, files=files, preserve_missing_parents=not complete)
+        else:
+            self._inner.sync_history(db, reconcile=complete, files=files)
+        if complete and self._inner.last_sync_complete:
             db.set_sync_state(ready_key, manifest_digest)
+        else:
+            db.conn.execute("DELETE FROM sync_state WHERE key = ?", (ready_key,))
+            db.commit()
 
     def _ready_state_key(self) -> str:
         """Sync-state key marking a fully parsed mirror state.
@@ -174,7 +198,7 @@ class RemoteHistoryCollector(BaseCollector):
         per-file parse states.
         """
         prefix = self._inner.sync_state_prefix
-        return f"{prefix}:remote_ready:{_cache_root_for(self.target).name}"
+        return f"{prefix}:remote_ready:v2:{_cache_root_for(self.target).name}"
 
 
 def _cache_root_for(target: RemoteSyncTarget) -> Path:
@@ -195,9 +219,12 @@ def _cache_root_for(target: RemoteSyncTarget) -> Path:
     return DATA_DIR / "remote-cache" / digest
 
 
-def _purge_removed_remote_sessions(db, target: RemoteSyncTarget) -> None:
+def _purge_removed_remote_sessions(db, target: RemoteSyncTarget, *, files: list[Path] | None = None) -> None:
     """Drop derived DB rows whose remote JSONL no longer exists in active cache."""
-    active_ids = _active_remote_session_ids(target)
+    active_ids = (
+        _active_claude_session_ids(_cache_root_for(target) / target.source_child, files=files)
+        if target.agent_type == "claude_code" else _active_remote_session_ids(target)
+    )
     if not active_ids:
         return
     rows = db.conn.execute(
@@ -269,8 +296,14 @@ def _read_codex_session_identity(path: Path) -> tuple[str, str]:
     return ("", "")
 
 
-def _active_claude_session_ids(active_root: Path) -> set[str]:
+def _active_claude_session_ids(active_root: Path, *, files: list[Path] | None = None) -> set[str]:
     ids: set[str] = set()
+    if files is not None:
+        for path in files:
+            parts = path.relative_to(active_root).parts
+            if len(parts) >= 2 and path.suffix == ".jsonl" and path.is_file():
+                ids.add(_claude_session_id_for_jsonl(active_root / parts[0], path))
+        return ids
     try:
         project_dirs = [path for path in active_root.iterdir() if path.is_dir()]
     except OSError:
@@ -405,7 +438,7 @@ def _sync_target_to_cache(target: RemoteSyncTarget) -> tuple[bool, bool, str, bo
         # actually changed; skipping them keeps unchanged remotes cheap. Stale
         # detection uses the full remote manifest so files that are merely
         # pending download are not archived.
-        _archive_stale_cache_files(cache_root, target, manifest)
+        _archive_stale_cache_files(cache_root, target, manifest, previous=previous if had_manifest else None)
         if missing:
             _mark_manifest_incomplete(cache_root)
         _save_manifest(cache_root, saved_manifest)
@@ -528,6 +561,7 @@ def _download_changed_files(
 
     def download_rsync(batch: list[str], transport: _RsyncPlan) -> set[str]:
         with _RSYNC_TRANSFER_SLOTS:
+            check_sync_cancelled()
             if stop.is_set():
                 raise CancelledError()
             proc = _run_command(
@@ -551,11 +585,14 @@ def _download_changed_files(
                 pending = {}
                 try:
                     while True:
+                        event = current_sync_cancel_event()
+                        if event is not None and event.is_set():
+                            stop.set()
                         while not stop.is_set() and len(pending) < _RSYNC_BATCH_WORKERS:
                             batch = next(rsync_batches, None)
                             if batch is None:
                                 break
-                            pending[pool.submit(download_rsync, batch, rsync_plan)] = batch
+                            pending[pool.submit(copy_context().run, download_rsync, batch, rsync_plan)] = batch
                         if not pending:
                             break
                         done, _ = wait(pending, return_when=FIRST_COMPLETED)
@@ -579,6 +616,7 @@ def _download_changed_files(
                         if stop.is_set():
                             for future in pending:
                                 future.cancel()
+                    check_sync_cancelled()
                     if fatal_error is not None:
                         raise fatal_error
                 finally:
@@ -586,6 +624,7 @@ def _download_changed_files(
                     for future in pending:
                         future.cancel()
         for batch, batch_rsync_plan in plan:
+            check_sync_cancelled()
             if batch_rsync_plan is not None:
                 continue
             payload = "\0".join(batch).encode("utf-8") + b"\0"
@@ -660,21 +699,70 @@ def _run_command(
     input_bytes: bytes | None = None,
     allowed_returncodes: tuple[int, ...] = (0,),
 ) -> subprocess.CompletedProcess:
+    check_sync_cancelled()
     try:
-        proc = subprocess.run(
-            argv,
-            input=input_bytes,
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout,
-        )
+        if current_sync_cancel_event() is None:
+            proc = subprocess.run(
+                argv,
+                input=input_bytes,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+            )
+        else:
+            proc = _run_cancellable_command(argv, input_bytes, timeout)
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(f"{label} timed out after {timeout}s") from exc
     if proc.returncode not in allowed_returncodes:
         stderr = proc.stderr.decode("utf-8", errors="replace").strip()
         raise RuntimeError(stderr or f"{label} exited with status {proc.returncode}")
     return proc
+
+
+def _run_cancellable_command(argv: list[str], payload: bytes | None, timeout: float) -> subprocess.CompletedProcess:
+    process = subprocess.Popen(
+        argv,
+        stdin=subprocess.PIPE if payload is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=os.name != "nt",
+    )
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            check_sync_cancelled()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(argv, timeout)
+            try:
+                stdout, stderr = process.communicate(input=payload, timeout=min(0.1, remaining))
+                return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+            except subprocess.TimeoutExpired:
+                payload = None
+    except BaseException:
+        try:
+            if os.name == "nt":
+                process.terminate()
+            else:
+                os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            process.communicate(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            if os.name == "nt":
+                if process.poll() is None:
+                    process.kill()
+            else:
+                # The leader may exit before descendants that closed their pipes.
+                os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.communicate()
+        raise
 
 
 @dataclass(frozen=True)
@@ -831,27 +919,32 @@ def _archive_stale_cache_files(
     cache_root: Path,
     target: RemoteSyncTarget,
     manifest: dict[str, dict[str, str]],
+    *,
+    previous: dict[str, dict[str, str]] | None = None,
 ) -> None:
     active_root = cache_root / target.source_child
     if not active_root.exists():
         return
 
     patterns = ["rollout-*.jsonl"] if target.agent_type == "codex" else ["*.jsonl", "sessions-index.json"]
-    manifest_paths = set(manifest)
+    if previous is None:
+        candidates = (path for pattern in patterns for path in active_root.rglob(pattern))
+    else:
+        removed = (_safe_member_path(rel) for rel in previous.keys() - manifest.keys())
+        candidates = (active_root / path for path in removed if path is not None)
     stale_root = cache_root / ".stale" / target.source_child
-    for pattern in patterns:
-        for path in active_root.rglob(pattern):
-            if not path.is_file():
-                continue
-            rel = str(PurePosixPath(*path.relative_to(active_root).parts))
-            if rel in manifest_paths:
-                continue
-            archive_path = _next_archive_path(stale_root / rel)
-            archive_path.parent.mkdir(parents=True, exist_ok=True)
-            path.replace(archive_path)
-            # replace() keeps the source mtime; retention must run from the
-            # archive time, or an old file removed today would age out at once.
-            archive_path.touch()
+    for path in candidates:
+        check_sync_cancelled()
+        if not path.is_file():
+            continue
+        rel = str(PurePosixPath(*path.relative_to(active_root).parts))
+        if rel in manifest:
+            continue
+        archive_path = _next_archive_path(stale_root / rel)
+        archive_path.parent.mkdir(parents=True, exist_ok=True)
+        path.replace(archive_path)
+        # Retention starts at archive time, not the original log's mtime.
+        archive_path.touch()
 
 
 def _prune_old_stale_archives(cache_root: Path, retention_days: int = _STALE_RETENTION_DAYS) -> int:
@@ -1039,6 +1132,7 @@ def _extract_tarball(payload: bytes, dest: Path) -> set[str]:
     written: set[str] = set()
     with tarfile.open(fileobj=BytesIO(payload), mode="r:gz") as tar:
         for member in tar.getmembers():
+            check_sync_cancelled()
             if member.issym() or member.islnk():
                 continue
             rel = _safe_member_path(member.name)

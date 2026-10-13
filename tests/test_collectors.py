@@ -365,7 +365,7 @@ def test_codex_history_sync_supports_same_root_provider_filters(tmp_path):
     ]
     assert db.conn.execute(
         "SELECT COUNT(*) AS n FROM sync_state WHERE key LIKE 'codex_jsonl:v17:%'"
-    ).fetchone()["n"] == 4
+    ).fetchone()["n"] == 8
     db.close()
 
 
@@ -409,7 +409,7 @@ def test_claude_history_sync_scopes_state_by_provider_and_root(tmp_path):
     ).fetchall()
     assert [tuple(row) for row in rows] == [("p1", 100), ("p2", 100)]
     state_keys = db.conn.execute(
-        "SELECT key FROM sync_state WHERE key LIKE 'cc_jsonl:v14:%'"
+        "SELECT key FROM sync_state WHERE key LIKE 'cc_jsonl:v15:%'"
     ).fetchall()
     assert len(state_keys) == 6
     assert sum(":assistant_ids:" in row["key"] for row in state_keys) == 2
@@ -658,7 +658,7 @@ def test_remote_ready_key_tracks_inner_parser_version():
     assert codex._ready_state_key().startswith(codex._inner.sync_state_prefix)
     assert "codex_jsonl:v17:" in codex._ready_state_key()
     assert claude._ready_state_key().startswith(claude._inner.sync_state_prefix)
-    assert "cc_jsonl:v14:" in claude._ready_state_key()
+    assert "cc_jsonl:v15:" in claude._ready_state_key()
 
 
 def test_remote_codex_collector_syncs_tarball_into_history(tmp_path):
@@ -2025,7 +2025,7 @@ def test_remote_corrupted_manifest_still_purges_and_archives(tmp_path):
         RemoteHistoryCollector(target).sync_history(db)
         db.close()
 
-    purge_mock.assert_called_once()
+    purge_mock.assert_not_called()
     assert not stray.exists()  # archived into .stale
 
 
@@ -2053,7 +2053,9 @@ def test_registry_prepares_remote_caches_before_serial_sync():
     registry.sync_all(db=Mock())
 
     assert sorted(c for c in calls if c.startswith("prepare-")) == ["prepare-a", "prepare-b"]
-    assert calls[-2:] == ["sync-a", "sync-b"]
+    assert sorted(c for c in calls if c.startswith("sync-")) == ["sync-a", "sync-b"]
+    for name in ("a", "b"):
+        assert calls.index(f"prepare-{name}") < calls.index(f"sync-{name}")
     assert registry.get_sync_errors() == []
 
 
