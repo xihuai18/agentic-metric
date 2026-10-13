@@ -9,7 +9,7 @@ import sqlite3
 import unicodedata
 from uuid import uuid4
 
-_ACCOUNT_KEY = re.compile(r"(?:codex:[0-9a-f]{64}|manual:[a-z0-9][a-z0-9_.-]{0,79})\Z")
+_ACCOUNT_KEY = re.compile(r"(?:(?:codex|claude):[0-9a-f]{64}|manual:[a-z0-9][a-z0-9_.-]{0,79})\Z")
 
 
 def ensure_account_tables(conn: sqlite3.Connection) -> None:
@@ -26,8 +26,30 @@ def ensure_account_tables(conn: sqlite3.Connection) -> None:
 
 def validate_account_key(value: str) -> str:
     if not _ACCOUNT_KEY.fullmatch(value):
-        raise ValueError("Use an observed codex:<fingerprint> or manual:<name> account key")
+        raise ValueError("Use a codex:<fingerprint>, claude:<fingerprint>, or manual:<name> account key")
     return value
+
+
+def assign_source_account(buckets: list[dict], account_key: str) -> list[dict]:
+    if not account_key:
+        return buckets
+    merged: dict[tuple, dict] = {}
+    for bucket in buckets:
+        row = dict(bucket)
+        row["account_key"] = row.get("account_key") or account_key
+        key = (row.get("usage_date"), row.get("usage_hour"), row.get("model"), row["account_key"])
+        if key not in merged:
+            merged[key] = row
+            continue
+        previous = merged[key]
+        for field in ("message_count", "user_turns", "input_tokens", "output_tokens",
+                      "cache_read_tokens", "cache_creation_tokens", "cache_creation_1h_tokens"):
+            previous[field] = previous.get(field, 0) + row.get(field, 0)
+        old_cost, new_cost = previous.get("estimated_cost_usd"), row.get("estimated_cost_usd")
+        previous["estimated_cost_usd"] = (
+            old_cost + new_cost if old_cost is not None and new_cost is not None else None
+        )
+    return list(merged.values())
 
 
 def _text(value: str, limit: int) -> str:
