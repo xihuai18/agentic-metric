@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.8.21 (2026-10-14)
+
+- TUI startup displays cached data before background pricing refresh and historical repricing. Quit cancels unfinished transfers, parsing, pricing fetches, and database initialization; committed usage and completed transfer progress remain available for the next sync.
+- Remote histories are parsed as each mirror finishes, while other mirrors continue. Database writes stay serial.
+- Pricing catalog changes unrelated to stored models preserve parsing checkpoints. Mid-sync pricing changes still force conservative reconciliation, including changes that revert before commit.
+- File-backed databases use WAL where available without weakening the default durability setting. Clean opens avoid unnecessary writes, and dashboard refreshes share one consistent query snapshot and repeated totals.
+- Failed automatic pricing refreshes have a 60-second retry cooldown without modifying a successful cached catalog; manual updates bypass the cooldown. A fresh catalog no longer launches a pricing helper process.
+- Unchanged Codex rollouts reuse scoped identities verified by size, nanosecond timestamps, device and inode. Parent rewrites still invalidate fork dependencies. Complete remote manifests supply collector inventories directly; unknown or incomplete caches retain filesystem discovery.
+- Reports share one consistent query snapshot rather than repeating the fallback probe for every breakdown.
+- Claude-compatible request markers can identify explicit `claude:<fingerprint>` accounts. Both collector types also accept an opt-in per-root `account_key` for dedicated account directories. Explicit request identities override root declarations, local bindings never propagate to remote hosts, and mixed unmarked histories remain unknown without a declaration. Account configuration changes reparse the scope while preserving total usage and manual payments.
+
 ## v0.8.20 (2026-10-13)
 
 - Remote rsync batches run with a shared four-transfer limit and largest-first scheduling. Completed batches retain progress when another transfer fails, while SQLite and manifest updates remain serial.

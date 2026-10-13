@@ -82,6 +82,10 @@ agentic-metric history -d 30         # Last N days (default 14)
 agentic-metric pricing               # Manage model pricing
 ```
 
+The TUI opens cached data first. Press **q** to cancel unfinished background work
+and exit; completed transfers and committed usage remain available, and the next
+sync retries unfinished work. `agentic-metric tui --no-sync` opens only cached data.
+
 ### Report Options
 
 | Option | Description |
@@ -114,6 +118,10 @@ User overrides take precedence, followed by the cached catalog and then builtin
 fallbacks. A catalog model's own context tiers and premium modes are used when
 present; refreshed standard rates are not mixed with stale builtin context tiers.
 Explicit `service_tier` markers and model-name mode suffixes use the same rates.
+The TUI shows cached data before checking for pricing updates in the background.
+Failed automatic checks retry after 60 seconds; manual updates bypass this delay.
+Changes to unused catalog models preserve parsing checkpoints. Effective pricing
+changes for stored models still trigger repricing and safe checkpoint invalidation.
 
 #### Account equivalents and manual payments
 
@@ -123,11 +131,31 @@ Run `agentic-metric sync` to collect new usage. `--json` preserves full account 
 and distinguishes unpriced usage from a zero-dollar estimate.
 
 New WCC Codex transcripts carry a request-bound anonymous account fingerprint.
-Only this explicit marker attributes usage: account switches within a session stay
-separate, while old logs, native Codex logs without identity, and other sources
-remain **Unknown account**. The tool never reads OAuth tokens or assigns history
-to the currently logged-in account. Configure WCC's projects directory as a
-Claude Code collector root using the existing collector-root configuration.
+Account switches within a session stay separate. The same explicit marker format
+accepts `provider: "claude"` for sources that supply Claude account fingerprints;
+native Claude Code logs do not currently provide reliable historical identity.
+The tool never reads OAuth tokens or assigns history to the currently logged-in
+account. Configure WCC's projects directory as a Claude Code collector root.
+
+For a directory dedicated to one account, explicitly set its `account_key`:
+
+```json
+{
+  "collectors": {
+    "claude_code": {"roots": [{"path": "~/.claude-personal", "account_key": "manual:cc-personal"}]},
+    "codex": {"roots": [{"path": "~/.codex-work", "account_key": "manual:codex-work"}]}
+  }
+}
+```
+
+This user-declared binding applies to otherwise unattributed usage in that root,
+including its history. Explicit request markers take precedence. Changing the
+binding reparses that scope without changing total usage or manual payments.
+Set remote bindings explicitly: local account bindings are never inherited by
+another host. Unmarked logs without a binding remain **Unknown account**; a
+mixed-account directory cannot be separated reliably without request markers.
+Account keys accept `codex:<64-hex>`, `claude:<64-hex>`, or `manual:<name>`.
+Use `agentic-metric accounts set manual:cc-personal --label "Personal CC"` to name the account.
 
 ```bash
 agentic-metric accounts report --start 2026-10-01 --end 2026-10-31 --json
@@ -140,7 +168,7 @@ agentic-metric accounts payments remove invoice-october
 
 Replace the fingerprint with the exact key printed by `accounts report --json`.
 For an account without attributable logs, use a key such as `manual:personal`;
-that records payments only and does not reassign any unknown usage. Profile plan
+creating a profile or payment alone does not reassign unknown usage. Profile plan
 labels are manual, current labels, not verified historical entitlements. Each
 payment retains its own optional plan label.
 
@@ -426,6 +454,8 @@ sync uses SSH/tar. The remote files are read-only in either case. Downloads run
 in size-bounded batches, with at most four rsync transfers across all roots.
 The largest batches start first, and the manifest advances after each completed
 batch, so `timeout` applies per batch and interrupted syncs resume.
+A recent rsync version can substantially improve large-log delta performance;
+it is optional, and the system rsync or SSH/tar fallback remains supported.
 Claude parsing checkpoints persist in the local database. Growing logs verify
 the complete previously parsed prefix before processing new records; rewrites,
 truncation, replay ownership, pricing, or timezone changes trigger a full parse.

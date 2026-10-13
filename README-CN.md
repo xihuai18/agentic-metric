@@ -80,6 +80,8 @@ agentic-metric history -d 30         # 最近 N 天(默认 14 天)
 agentic-metric pricing               # 管理模型定价
 ```
 
+TUI 优先显示缓存数据。按 **q** 会取消尚未完成的后台工作并退出；已完成的传输和已提交的用量会保留，下次同步会重试未完成的工作。`agentic-metric tui --no-sync` 只打开缓存数据。
+
 ### Report 选项
 
 | 选项 | 说明 |
@@ -100,9 +102,11 @@ agentic-metric pricing               # 管理模型定价
 
 ### 定价管理
 
-模型定价用于成本估算。正常 sync/report/TUI 启动时会每天从 models.dev 刷新本地聚合目录,内置定价作为离线兜底。你可以通过 CLI 添加新模型、覆盖聚合或内置价格、配置长上下文费率和缓存时长费率。本地聚合快照存储在 `$DATA/agentic_metric/pricing-catalog.json`,手动覆盖存储在 `$DATA/agentic_metric/pricing.json`。
+模型定价用于成本估算。正常 sync/report/TUI 启动时会每天从 models.dev 刷新本地聚合目录,内置定价作为离线兜底。TUI 先显示缓存数据，再在后台检查定价更新；自动刷新失败后至少等待 60 秒再重试，手动更新不受限制。未使用模型的聚合目录变更不会使历史解析检查点失效；影响已用模型费率的变更仍会重新计算成本。你可以通过 CLI 添加新模型、覆盖聚合或内置价格、配置长上下文费率和缓存时长费率。本地聚合快照存储在 `$DATA/agentic_metric/pricing-catalog.json`,手动覆盖存储在 `$DATA/agentic_metric/pricing.json`。
 
-Account-level API equivalents and the separate manual payment ledger are documented in [Account equivalents and manual payments](README.md#account-equivalents-and-manual-payments). Press **a** in the TUI or run `agentic-metric accounts report`; missing historical identity stays unknown, and subscription payments never replace API-equivalent costs.
+按账号统计 API 等价用量，并保留独立的手工付款账本：在 TUI 按 **a**，或运行 `agentic-metric accounts report`。WCC Codex 的逐请求账号指纹会自动归属；兼容日志也可提供明确的 Claude 账号指纹。原生 CC 日志缺少可靠的历史账号标记，工具不会读取 OAuth 凭据或把当前登录账号套到历史记录上。
+
+对于仅供一个账号使用的目录，可以在 collector root 对象中设置 `"account_key": "manual:cc-personal"` 或 `"account_key": "manual:codex-work"`，并通过 `agentic-metric accounts set manual:cc-personal --label "Personal CC"` 命名。这项显式配置会归属该目录中未标记的历史用量，逐请求指纹优先；远端目录必须单独配置，不会继承本机账号。混用账号且没有逐请求标记的目录无法可靠拆分，未配置归属的记录仍显示“未知”。详见 [账号等价用量与手工付款](README.md#account-equivalents-and-manual-payments)。订阅付款始终不替代 API 等价费用。
 
 #### 基础模型定价
 
