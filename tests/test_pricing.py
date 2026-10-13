@@ -1,6 +1,7 @@
 """Tests for pricing module."""
 
 import json
+import os
 from unittest.mock import patch
 
 import pytest
@@ -35,10 +36,12 @@ def _reset_cache():
 
 
 @pytest.fixture(autouse=True)
-def _reset_pricing_state():
+def _reset_pricing_state(tmp_path, monkeypatch):
     """Reset all global pricing state before and after each test."""
     import agentic_metric.pricing as p
 
+    monkeypatch.setattr(p, "PRICING_FILE", tmp_path / "pricing.json")
+    monkeypatch.setattr(p, "PRICING_CATALOG_FILE", tmp_path / "pricing-catalog.json")
     p._user_cache = None
     p._user_cache_mtime = -1.0
     p._catalog_cache = None
@@ -73,6 +76,35 @@ def _patch_empty_user_pricing(tmp_path):
 def test_known_model_pricing():
     p = get_pricing("claude-sonnet-4-6-20250101")
     assert p == (3.0, 15.0, 0.30, 3.75)
+
+
+def test_model_decomposition_reuses_bounded_cache(tmp_path):
+    import agentic_metric.pricing as p
+
+    with _patch_empty_user_pricing(tmp_path):
+        assert p._decompose_model_name("vendor/gpt-6-astra[fast]") == ("gpt-6-astra", "fast")
+        assert p._decompose_model_name("vendor/gpt-6-astra[fast]") == ("gpt-6-astra", "fast")
+        info = p._cached_model_decomposition.cache_info()
+        assert info.misses == 1
+        assert info.hits == 1
+        assert info.maxsize == 4096
+        p._reset_derived_caches()
+        assert p._cached_model_decomposition.cache_info().currsize == 0
+
+
+def test_model_decomposition_observes_external_catalog_changes(tmp_path):
+    import agentic_metric.pricing as p
+
+    catalog_file = tmp_path / "pricing-catalog.json"
+    catalog_file.write_text(json.dumps({"models": {}}))
+    with _patch_empty_user_pricing(tmp_path):
+        assert p.normalize_model("vendor/new-model") == "vendor/new-model"
+        mtime = catalog_file.stat().st_mtime
+        catalog_file.write_text(json.dumps({"models": {"new-model": {"prices": [1, 2, 0, 0]}}}))
+        os.utime(catalog_file, (mtime + 1, mtime + 1))
+        assert p.normalize_model("vendor/new-model") == "new-model"
+        catalog_file.unlink()
+        assert p.normalize_model("vendor/new-model") == "vendor/new-model"
 
 
 def test_claude_opus_4_8_pricing(tmp_path):
@@ -386,6 +418,7 @@ def test_openai_priority_tier_uses_official_priority_prices(tmp_path):
             cache_read_tokens=1_000_000,
             cache_creation_tokens=1_000_000,
             service_tier="priority",
+            apply_long_context=False,
         )
         assert abs(cost - (8.0 + 40.0 + 0.8 + 10.0)) < 1e-9
 
@@ -400,8 +433,7 @@ def test_openai_priority_tier_uses_official_priority_prices(tmp_path):
     _reset_cache()
 
 
-def test_priority_tier_wins_over_long_context(tmp_path):
-    """OpenAI priority processing does not support long context."""
+def test_priority_tier_uses_its_own_long_context_prices(tmp_path):
     with _patch_empty_user_pricing(tmp_path):
         cost = estimate_cost(
             "gpt-5.6-sol",
@@ -409,7 +441,7 @@ def test_priority_tier_wins_over_long_context(tmp_path):
             output_tokens=1_000,
             service_tier="priority",
         )
-        expected = (300_000 * 8.0 + 1_000 * 40.0) / 1_000_000
+        expected = (300_000 * 16.0 + 1_000 * 60.0) / 1_000_000
         assert abs(cost - expected) < 1e-9
     _reset_cache()
 
@@ -1100,6 +1132,62 @@ def test_get_all_pricing_merges(tmp_path):
         assert "new-model" in merged
         assert merged["new-model"] == (1.0, 2.0, 0.1, 0.2)
     _reset_cache()
+
+
+@pytest.mark.parametrize("mode", ["fast", "priority", "ultrafast"])
+@pytest.mark.parametrize("tokens", [272_000, 272_001, 300_000])
+def test_explicit_mode_matches_model_suffix_at_context_boundaries(tmp_path, mode, tokens):
+    with _patch_empty_user_pricing(tmp_path):
+        assert estimate_cost(
+            "gpt-6-astra", input_tokens=tokens, service_tier=mode,
+        ) == estimate_cost(f"gpt-6-astra-{mode}", input_tokens=tokens)
+
+
+def test_partial_catalog_does_not_shadow_more_specific_builtin_model(tmp_path):
+    import agentic_metric.pricing as p
+
+    with _patch_empty_user_pricing(tmp_path):
+        p.PRICING_CATALOG_FILE.write_text(json.dumps({"models": {
+            "gpt-5.4": {"prices": [99, 99, 99, 0]},
+        }}))
+        assert get_pricing("codex/gpt-5.4-mini") == (0.75, 4.5, 0.075, 0)
+        assert get_pricing("gpt-5.4") == (99, 99, 99, 0)
+
+
+def test_catalog_replaces_builtin_rates_and_tiers_but_not_user_overrides(tmp_path):
+    import agentic_metric.pricing as p
+
+    catalog = p._normalize_catalog_payload({"openai": {"models": {
+        "gpt-6-astra": {
+            "id": "gpt-6-astra",
+            "cost": {"input": 3, "output": 9, "cache_read": 0.3, "cache_write": 0},
+            "experimental": {"modes": {"fast": {
+                "cost": {"input": 6, "output": 18, "cache_read": 0.6, "cache_write": 0,
+                         "tiers": [{"tier": {"type": "context", "size": 100},
+                                    "input": 12, "output": 27, "cache_read": 1.2, "cache_write": 0}]},
+                "provider": {"body": {"service_tier": "priority"}},
+            }}},
+        },
+        "gpt-6-astra-special": {
+            "id": "gpt-6-astra-special",
+            "cost": {"input": 7, "output": 21, "cache_read": 0.7, "cache_write": 0},
+        },
+    }}})
+    with _patch_empty_user_pricing(tmp_path):
+        p.PRICING_CATALOG_FILE.write_text(json.dumps(catalog))
+        assert get_pricing("gpt-6-astra") == (3, 9, 0.3, 0)
+        assert get_all_pricing()["gpt-6-astra"] == get_pricing("gpt-6-astra")
+        assert p.get_observed_model_pricing(["gpt-6-astra"])[0]["source"] == "catalog"
+        assert estimate_cost("gpt-6-astra", input_tokens=300_000) == 0.9
+        assert get_pricing("codex/gpt-6-astra-special") == (7, 21, 0.7, 0)
+        assert get_pricing("codex/gpt-6-astra[fast]") == (6, 18, 0.6, 0)
+        assert p.get_observed_model_pricing(["codex/gpt-6-astra[fast]"])[0]["source"] == "catalog"
+        assert estimate_cost("gpt-6-astra", input_tokens=100, service_tier="fast") == 0.0006
+        assert estimate_cost("gpt-6-astra", input_tokens=101, service_tier="fast") == 0.001212
+        assert estimate_cost("gpt-6-astra-fast", input_tokens=101) == 0.001212
+        set_user_pricing("gpt-6-astra", 2, 4, 0.2, 0)
+        assert get_pricing("gpt-6-astra") == (2, 4, 0.2, 0)
+        assert get_pricing("gpt-6-astra-fast") == (2, 4, 0.2, 0)
 
 
 def test_catalog_imports_modes_and_long_context(tmp_path):

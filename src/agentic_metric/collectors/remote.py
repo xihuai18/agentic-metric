@@ -8,8 +8,10 @@ from io import BytesIO
 import json
 from pathlib import Path, PurePosixPath
 import posixpath
+import re
 import shlex
 import shutil
+import stat
 import subprocess
 import tarfile
 import time
@@ -34,6 +36,12 @@ _DOWNLOAD_BATCH_FILES = 500
 # download is treated as failing. Keeps one oversized file from blocking the
 # mirror, without spending one timeout per batch when the remote is down.
 _MAX_SKIPPED_BATCHES = 3
+
+# Exit 24 may omit files; only confirmed deliveries advance the manifest.
+_RSYNC_VANISHED_EXIT = 24
+
+# Openrsync cannot protect remote arguments, so unsafe paths stay on tar.
+_RSYNC_BASE_RE = re.compile(r"^/[A-Za-z0-9_.+=,/-]*$")
 
 
 @dataclass(frozen=True)
@@ -326,6 +334,7 @@ def _manifest_command(target: RemoteSyncTarget) -> str:
         _remote_base_script(target.source_root, target.source_child)
         + 'if [ ! -d "$base" ]; then printf "MISSING\\0"; exit 0; fi; '
         + 'printf "OK\\0"; cd "$base"; '
+        + 'if command -v rsync >/dev/null 2>&1; then printf "RSYNC\\0%s\\0" "$PWD"; fi; '
         + "if find . -maxdepth 0 -printf '' 2>/dev/null; then "
         + f"find . -type f {find_expr} -printf '%s\\t%T@\\t%p\\0'; "
         + f"else find . -type f {find_expr} {_manifest_stat_exec()}; fi"
@@ -358,7 +367,7 @@ def _sync_target_to_cache(target: RemoteSyncTarget) -> tuple[bool, bool, str, bo
     cache_root = _cache_root_for(target)
     cache_root.mkdir(parents=True, exist_ok=True)
 
-    manifest = _read_remote_manifest(target)
+    manifest, rsync_base = _read_remote_inventory(target)
     if manifest is None:
         return (False, False, "", False)
 
@@ -373,7 +382,9 @@ def _sync_target_to_cache(target: RemoteSyncTarget) -> tuple[bool, bool, str, bo
         if previous.get(rel) != meta or not (cache_root / target.source_child / rel).exists()
     ]
     if changed:
-        missing = _download_changed_files(target, cache_root, manifest, previous, changed)
+        missing = _download_changed_files(
+            target, cache_root, manifest, previous, changed, rsync_base=rsync_base
+        )
     else:
         missing = set()
     # A missing saved manifest means the cache state is unknown (first run or
@@ -443,6 +454,8 @@ def _download_changed_files(
     manifest: dict[str, dict[str, str]],
     previous: dict[str, dict[str, str]],
     changed: list[str],
+    *,
+    rsync_base: str | None = None,
 ) -> set[str]:
     """Download changed files batch by batch, persisting progress as it goes.
 
@@ -474,8 +487,20 @@ def _download_changed_files(
             _mark_manifest_incomplete(cache_root)
             _save_manifest(cache_root, progress)
 
+    rsync_plan = _rsync_plan(target.remote, rsync_base) if rsync_base else None
+    if rsync_plan is None:
+        plan = [(batch, None) for batch in _download_batches(manifest, changed)]
+    else:
+        # Names rsync's itemized output cannot round-trip stay on the tar path.
+        via_rsync = [rel for rel in changed if _rsync_name_ok(rel)]
+        via_tar = [rel for rel in changed if not _rsync_name_ok(rel)]
+        plan = [(batch, rsync_plan) for batch in _download_batches(manifest, via_rsync)]
+        plan += [(batch, None) for batch in _download_batches(manifest, via_tar)]
+        if via_rsync:
+            (cache_root / target.source_child).mkdir(parents=True, exist_ok=True)
+
     try:
-        for batch in _download_batches(manifest, changed):
+        for batch, batch_rsync_plan in plan:
             payload = "\0".join(batch).encode("utf-8") + b"\0"
             # tar exits 1 (not fatal) when a file changes/shrinks while it is
             # being read — common when a remote session is live. The archive it
@@ -484,12 +509,21 @@ def _download_changed_files(
             # session would make every sync discard the whole download and never
             # catch up.
             try:
-                proc = _run_ssh(
-                    target.remote,
-                    _download_command(target),
-                    input_bytes=payload,
-                    allowed_returncodes=(0, 1),
-                )
+                if batch_rsync_plan is not None:
+                    proc = _run_command(
+                        _rsync_command(batch_rsync_plan, cache_root, target.source_child),
+                        target.remote.timeout,
+                        "rsync",
+                        input_bytes=payload,
+                        allowed_returncodes=(0, _RSYNC_VANISHED_EXIT),
+                    )
+                else:
+                    proc = _run_ssh(
+                        target.remote,
+                        _download_command(target),
+                        input_bytes=payload,
+                        allowed_returncodes=(0, 1),
+                    )
             except RuntimeError as exc:
                 # Never record the failed batch: a half-extracted file must still
                 # look changed to the next sync even when its manifest metadata
@@ -504,11 +538,16 @@ def _download_changed_files(
                     continue
                 raise
             try:
-                written = (
-                    _extract_tarball(proc.stdout, cache_root / target.source_child)
-                    if proc.stdout
-                    else set()
-                )
+                if batch_rsync_plan is not None:
+                    written = _rsync_delivered(
+                        proc.stdout, batch, cache_root / target.source_child
+                    )
+                else:
+                    written = (
+                        _extract_tarball(proc.stdout, cache_root / target.source_child)
+                        if proc.stdout
+                        else set()
+                    )
             except Exception:
                 # A local extraction failure (full disk, unreadable archive) is
                 # not something another batch can work around, so never skip it.
@@ -522,8 +561,9 @@ def _download_changed_files(
                 if rel in written:
                     progress[rel] = meta
                 else:
-                    # The archive did not carry this member (deleted mid-transfer,
-                    # or dropped by tar). Recording it would let an outdated local
+                    # The transfer did not deliver this file (deleted mid-transfer,
+                    # skipped as a non-regular file, or dropped by tar). Recording
+                    # it would let an outdated local
                     # copy pass as current, so leave it for the next sync.
                     progress.pop(rel, None)
                     missing.add(rel)
@@ -551,33 +591,126 @@ def _run_ssh(
     input_bytes: bytes | None = None,
     allowed_returncodes: tuple[int, ...] = (0,),
 ) -> subprocess.CompletedProcess:
+    return _run_command(
+        _ssh_command(remote, remote_cmd),
+        remote.timeout,
+        "ssh",
+        input_bytes=input_bytes,
+        allowed_returncodes=allowed_returncodes,
+    )
+
+
+def _run_command(
+    argv: list[str],
+    timeout: float,
+    label: str,
+    *,
+    input_bytes: bytes | None = None,
+    allowed_returncodes: tuple[int, ...] = (0,),
+) -> subprocess.CompletedProcess:
     try:
         proc = subprocess.run(
-            _ssh_command(remote, remote_cmd),
+            argv,
             input=input_bytes,
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=remote.timeout,
+            timeout=timeout,
         )
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"ssh timed out after {remote.timeout}s") from exc
+        raise RuntimeError(f"{label} timed out after {timeout}s") from exc
     if proc.returncode not in allowed_returncodes:
         stderr = proc.stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(stderr or f"ssh exited with status {proc.returncode}")
+        raise RuntimeError(stderr or f"{label} exited with status {proc.returncode}")
     return proc
 
 
-def _read_remote_manifest(target: RemoteSyncTarget) -> dict[str, dict[str, str]] | None:
+@dataclass(frozen=True)
+class _RsyncPlan:
+    shell: str
+    source: str
+
+
+def _rsync_plan(remote: RemoteSpec, base: str) -> _RsyncPlan | None:
+    if shutil.which("rsync") is None or not _RSYNC_BASE_RE.fullmatch(base):
+        return None
+    host, user = remote.host, remote.user
+    if not host or any(ch in host + user for ch in "/\\ \t\r\n"):
+        return None
+    words = ["ssh"]
+    if remote.port:
+        words.extend(["-p", str(remote.port)])
+    words.extend(remote.ssh_options)
+    quoted: list[str] = []
+    for word in words:
+        if not word or any(ch in word for ch in "\r\n\0"):
+            return None
+        if any(ch in word for ch in " \t'\""):
+            if '"' not in word:
+                word = f'"{word}"'
+            elif "'" not in word:
+                word = f"'{word}'"
+            else:
+                return None
+        quoted.append(word)
+    host_spec = f"[{host}]" if ":" in host else host
+    source = f"{user + '@' if user else ''}{host_spec}:{base.rstrip('/')}/"
+    if source.startswith("-"):
+        return None
+    return _RsyncPlan(shell=" ".join(quoted), source=source)
+
+
+def _rsync_command(plan: _RsyncPlan, cache_root: Path, child: str) -> list[str]:
+    # Force comparison of same-size rewrites without disabling block deltas.
+    return [
+        "rsync", "-I", "--no-whole-file",
+        "-z", "--compress-level=1",
+        "--from0", "--files-from=-",
+        "--8-bit-output", "--out-format=%i %n",
+        "-e", plan.shell,
+        "--", plan.source, f"{cache_root / child}/",
+    ]
+
+
+def _rsync_name_ok(rel: str) -> bool:
+    """True when rsync can report this name back unescaped."""
+    return rel.isprintable() and "\\" not in rel and rel == rel.strip()
+
+
+def _rsync_delivered(stdout: bytes, batch: list[str], dest: Path) -> set[str]:
+    # A skipped or vanished source can leave an old regular file behind.
+    wanted = set(batch)
+    delivered: set[str] = set()
+    for line in stdout.decode("utf-8", errors="surrogateescape").split("\n"):
+        flags, sep, name = line.partition(" ")
+        if not sep or not flags.startswith(">f") or name not in wanted:
+            continue
+        try:
+            if stat.S_ISREG((dest / name).lstat().st_mode):
+                delivered.add(name)
+        except OSError:
+            continue
+    return delivered
+
+
+def _read_remote_inventory(
+    target: RemoteSyncTarget,
+) -> tuple[dict[str, dict[str, str]] | None, str | None]:
     proc = _run_ssh(target.remote, _manifest_command(target))
     parts = proc.stdout.split(b"\0")
     if not parts or parts[0] == b"MISSING":
-        return None
+        return None, None
     if parts[0] != b"OK":
         raise RuntimeError("unexpected remote manifest response")
 
+    rsync_base: str | None = None
+    entries = parts[1:]
+    if len(entries) >= 2 and entries[0] == b"RSYNC":
+        rsync_base = entries[1].decode("utf-8", errors="replace")
+        entries = entries[2:]
+
     manifest: dict[str, dict[str, str]] = {}
-    for item in parts[1:]:
+    for item in entries:
         if not item:
             continue
         try:
@@ -594,7 +727,7 @@ def _read_remote_manifest(target: RemoteSyncTarget) -> dict[str, dict[str, str]]
             "size": size,
             "mtime": mtime.split(".", 1)[0],
         }
-    return manifest
+    return manifest, rsync_base
 
 
 def _manifest_path(cache_root: Path) -> Path:

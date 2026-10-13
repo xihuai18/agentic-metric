@@ -110,6 +110,48 @@ kept as an offline fallback. You can add new models, override catalog or builtin
 prices, configure long-context rates, and configure observable cache-duration
 rates via CLI. The catalog snapshot is stored in `$DATA/agentic_metric/pricing-catalog.json`;
 manual overrides are stored in `$DATA/agentic_metric/pricing.json`.
+User overrides take precedence, followed by the cached catalog and then builtin
+fallbacks. A catalog model's own context tiers and premium modes are used when
+present; refreshed standard rates are not mixed with stale builtin context tiers.
+Explicit `service_tier` markers and model-name mode suffixes use the same rates.
+
+#### Account equivalents and manual payments
+
+Run `agentic-metric accounts report` or press **a** in the TUI for account totals.
+The CLI defaults to the current month; the TUI uses its selected date range.
+Run `agentic-metric sync` to collect new usage. `--json` preserves full account keys
+and distinguishes unpriced usage from a zero-dollar estimate.
+
+New WCC Codex transcripts carry a request-bound anonymous account fingerprint.
+Only this explicit marker attributes usage: account switches within a session stay
+separate, while old logs, native Codex logs without identity, and other sources
+remain **Unknown account**. The tool never reads OAuth tokens or assigns history
+to the currently logged-in account. Configure WCC's projects directory as a
+Claude Code collector root using the existing collector-root configuration.
+
+```bash
+agentic-metric accounts report --start 2026-10-01 --end 2026-10-31 --json
+agentic-metric accounts set "codex:<fingerprint>" --label "Work" --plan "Pro 200"
+agentic-metric accounts payments add "codex:<fingerprint>" 200 --date 2026-10-01 --kind subscription --plan "Pro 200" --id invoice-october
+agentic-metric accounts payments add "codex:<fingerprint>" 40 --date 2026-10-12 --kind credits --currency USD
+agentic-metric accounts payments list --start 2026-10-01 --end 2026-10-31
+agentic-metric accounts payments remove invoice-october
+```
+
+Replace the fingerprint with the exact key printed by `accounts report --json`.
+For an account without attributable logs, use a key such as `manual:personal`;
+that records payments only and does not reassign any unknown usage. Profile plan
+labels are manual, current labels, not verified historical entitlements. Each
+payment retains its own optional plan label.
+
+**API-equivalent cost and cash outlay are separate.** The ledger records only
+payments you enter, by payment date: no recurring charges are generated, no
+proration is inferred, and a credits purchase is not measured credit consumption.
+Currencies are totaled separately without conversion; amounts accept at most two
+decimal places. Reusing `--id` with identical details is idempotent; conflicting
+details are rejected. No payment records means actual spend is unknown, not zero.
+Subscription allowance multipliers (such as Fast 2.5× / Ultrafast 8×) are not
+applied to the API-equivalent cost calculation.
 
 #### Basic model pricing
 
@@ -378,7 +420,10 @@ and `~/.codex` on the remote. Remote sync expands `~` on the remote host, reads
 `$DATA/agentic_metric/remote-cache/`, and aggregates those rows with local usage.
 It also keeps a remote file manifest in the cache, so repeated syncs only
 download changed session/index files instead of transferring full agent
-directories again. Downloads run in size-bounded batches and the manifest
+directories again. When both hosts have `rsync`, ordinary remote paths use
+verified block deltas instead of retransferring growing logs in full; otherwise
+sync uses SSH/tar. The remote files are read-only in either case. Downloads run
+in size-bounded batches and the manifest
 advances after each batch, so `timeout` applies per batch and an interrupted
 sync of a large remote resumes instead of starting over. Cached files that
 disappear from the remote manifest are

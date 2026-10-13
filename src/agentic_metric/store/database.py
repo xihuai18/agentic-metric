@@ -55,7 +55,8 @@ CREATE TABLE IF NOT EXISTS session_usage (
     cache_creation_1h_tokens INTEGER DEFAULT 0,
     estimated_cost_usd REAL DEFAULT 0,
     cost_is_explicit INTEGER DEFAULT 0,
-    PRIMARY KEY (session_id, agent_type, provider, data_root, usage_date, usage_hour, model)
+    account_key TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (session_id, agent_type, provider, data_root, usage_date, usage_hour, model, account_key)
 );
 """
 
@@ -113,6 +114,7 @@ class Database:
             or "data_root" not in usage_cols
             or "cost_is_explicit" not in usage_cols
             or "cache_creation_1h_tokens" not in usage_cols
+            or "account_key" not in usage_cols
             or usage_pk_cols != [
                 "session_id",
                 "agent_type",
@@ -121,6 +123,7 @@ class Database:
                 "usage_date",
                 "usage_hour",
                 "model",
+                "account_key",
             ]
         ):
             self._rebuild_session_usage_table(usage_cols)
@@ -231,7 +234,7 @@ class Database:
         self._conn.commit()
 
     def _rebuild_session_usage_table(self, cols: set[str]) -> None:
-        """Rebuild session_usage with provider/data_root in the key."""
+        """Extend usage identity, preserving legacy rows as unknown accounts."""
         self._conn.execute("DROP TABLE IF EXISTS session_usage_old")
         self._conn.execute("ALTER TABLE session_usage RENAME TO session_usage_old")
         self._conn.execute(_SESSION_USAGE_TABLE_SQL)
@@ -242,7 +245,7 @@ class Database:
                     message_count, user_turns, input_tokens, output_tokens,
                     cache_read_tokens, cache_creation_tokens, cache_creation_1h_tokens,
                     estimated_cost_usd,
-                    cost_is_explicit)
+                    cost_is_explicit, account_key)
                SELECT session_id,
                       {self._pure_agent_expr()},
                       {self._provider_expr(cols)},
@@ -259,7 +262,8 @@ class Database:
                       {self._column_expr(cols, "cache_creation_tokens", "0")},
                       {self._column_expr(cols, "cache_creation_1h_tokens", "0")},
                       {self._column_expr(cols, "estimated_cost_usd", "0")},
-                      {self._column_expr(cols, "cost_is_explicit", "0")}
+                      {self._column_expr(cols, "cost_is_explicit", "0")},
+                      {self._column_expr(cols, "account_key", "''")}
                FROM session_usage_old"""
         )
         self._conn.execute("DROP TABLE session_usage_old")
@@ -311,7 +315,7 @@ class Database:
 
         usage_rows = self._conn.execute(
             """SELECT session_id, agent_type, provider, data_root, usage_date, usage_hour, model,
-                      input_tokens, output_tokens,
+                      account_key, input_tokens, output_tokens,
                       cache_read_tokens, cache_creation_tokens,
                       cache_creation_1h_tokens
                FROM session_usage
@@ -335,6 +339,7 @@ class Database:
                 row["usage_date"],
                 row["usage_hour"],
                 row["model"] or "",
+                row["account_key"],
             )
             for row in usage_rows
         ]
@@ -348,7 +353,8 @@ class Database:
                      AND data_root = ?
                      AND usage_date = ?
                      AND usage_hour = ?
-                     AND model = ?""",
+                     AND model = ?
+                     AND account_key = ?""",
                 usage_updates,
             )
 
@@ -634,6 +640,7 @@ class Database:
                 cache_creation_1h_tokens,
                 estimated_cost_usd,
                 cost_is_explicit,
+                bucket.get("account_key") or "",
             ))
 
         self._conn.executemany(
@@ -643,8 +650,8 @@ class Database:
                     model, message_count, user_turns, input_tokens, output_tokens,
                     cache_read_tokens, cache_creation_tokens, cache_creation_1h_tokens,
                     estimated_cost_usd,
-                    cost_is_explicit)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    cost_is_explicit, account_key)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             rows,
         )
 

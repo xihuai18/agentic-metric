@@ -34,6 +34,8 @@ from ..pricing import refresh_pricing_catalog
 from ..store.database import Database
 from .widgets import Breakdown, PeriodicHeatmap, SummaryCell, TrendBlocks
 from .pricing_screen import PricingScreen
+from .accounts_screen import AccountsScreen
+from ..accounts import account_report
 from .help_screen import HelpScreen
 
 
@@ -152,6 +154,7 @@ class AgenticMetricApp(App):
         Binding("q", "quit", "Quit"),
         # ── Other ──
         Binding("p", "show_pricing", "Pricing"),
+        Binding("a", "show_accounts", "Accounts"),
         Binding("question_mark,?", "show_help", "Help", key_display="?"),
         # Keep Ctrl+C from quitting so a stray copy shortcut doesn't kill the app.
         Binding("ctrl+c", "noop", show=False, priority=True),
@@ -665,6 +668,10 @@ class AgenticMetricApp(App):
             get_used_models(self._db),
             updating=self._pricing_update_requested or self._pricing_update_running,
         ))
+
+    def action_show_accounts(self) -> None:
+        _, start, end = resolve_range(self._focus, offset=self._offset)
+        self.push_screen(AccountsScreen(lambda: account_report(self._db.conn, start, end)))
 
     def action_show_help(self) -> None:
         """Open the keybinding cheatsheet."""

@@ -61,9 +61,110 @@ app.add_typer(pricing_app, name="pricing")
 pricing_app.add_typer(long_context_app, name="long-context")
 pricing_app.add_typer(cache_pricing_app, name="cache")
 app.add_typer(cache_app, name="cache")
+accounts_app = typer.Typer(help="Account API equivalents and manually recorded payments.")
+payments_app = typer.Typer(help="Manual cash ledger, not measured subscription credit consumption.")
+app.add_typer(accounts_app, name="accounts")
+accounts_app.add_typer(payments_app, name="payments")
 
 
 console = Console()
+
+
+@contextmanager
+def _account_database():
+    from .store.database import Database
+
+    db = Database()
+    try:
+        yield db.conn
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    finally:
+        db.close()
+
+
+@accounts_app.command("set")
+def account_set(
+    account_key: str, label: str = typer.Option(..., "--label"),
+    plan: str = typer.Option("", "--plan", help="Manual current plan label, not an entitlement check."),
+):
+    """Label an observed fingerprint or a manual-only account."""
+    from .accounts import set_account_profile
+
+    with _account_database() as conn:
+        set_account_profile(conn, account_key, label, plan)
+    console.print(Text("Account profile saved."))
+
+
+@accounts_app.command("report")
+def accounts_report(
+    start: str | None = typer.Option(None, "--start", help="YYYY-MM-DD; defaults to this month."),
+    end: str | None = typer.Option(None, "--end", help="YYYY-MM-DD; defaults to today."),
+    json_output: bool = typer.Option(False, "--json"),
+):
+    """Show cached account usage and separate manual payments; sync refreshes usage."""
+    from .accounts import account_report, date_range, format_account_report
+
+    with _account_database() as conn:
+        report = account_report(conn, *date_range(start, end))
+    if json_output:
+        typer.echo(json.dumps(report, ensure_ascii=False))
+    else:
+        console.print(Text(format_account_report(report)))
+
+
+@payments_app.command("add")
+def payment_add(
+    account_key: str, amount: str,
+    paid_on: str = typer.Option(..., "--date", help="Actual payment date, YYYY-MM-DD."),
+    kind: str = typer.Option(..., "--kind", help="subscription or credits"),
+    currency: str = typer.Option("USD", "--currency"),
+    plan: str = typer.Option("", "--plan", help="Plan on this payment; preserved if the profile changes."),
+    note: str = typer.Option("", "--note"),
+    payment_id: str | None = typer.Option(None, "--id", help="Optional unique reference; identical repeats are idempotent."),
+):
+    """Record a manual payment, never infer a charge from token usage."""
+    from .accounts import add_payment
+
+    with _account_database() as conn:
+        identifier = add_payment(conn, account_key, amount, paid_on=paid_on, kind=kind,
+                                 currency=currency, plan=plan, note=note, payment_id=payment_id)
+    console.print(Text(f"Recorded payment: {identifier}"))
+
+
+@payments_app.command("list")
+def payments_list(
+    start: str | None = typer.Option(None, "--start"),
+    end: str | None = typer.Option(None, "--end"),
+    json_output: bool = typer.Option(False, "--json"),
+):
+    """List manual payments by payment date (current month by default)."""
+    from .accounts import date_range, format_money, list_payments
+
+    with _account_database() as conn:
+        rows = list_payments(conn, *date_range(start, end))
+    if json_output:
+        typer.echo(json.dumps(rows, ensure_ascii=False))
+    elif not rows:
+        console.print(Text("No recorded payments in this period; actual spend is unknown."))
+    else:
+        for row in rows:
+            console.print(Text(f"{row['payment_id']} | {row['paid_on']} | {row['account_key']} | "
+                               f"{row['kind']} | {format_money(row['amount_minor'], row['currency'])} | "
+                               f"{row['plan']} | {row['note']}"))
+
+
+@payments_app.command("remove")
+def payment_remove(payment_id: str):
+    """Remove one manually recorded payment by its exact id."""
+    from .accounts import remove_payment
+
+    with _account_database() as conn:
+        removed = remove_payment(conn, payment_id)
+    if not removed:
+        console.print(Text("Payment id not found."))
+        raise typer.Exit(1)
+    console.print(Text("Payment removed."))
 
 
 # ANSI named colors — inherit the terminal's own palette / theme.

@@ -2213,10 +2213,21 @@ def test_pricing_screen_does_not_offer_empty_model_pricing():
     assert "set with: agentic-metric pricing set" in text
 
 
-def test_pricing_screen_lists_only_observed_models():
+def test_pricing_screen_lists_only_observed_models(tmp_path, monkeypatch):
     from rich.console import Console as _C
     import io as _io
+    import json
+    import agentic_metric.pricing as pricing
 
+    catalog = tmp_path / "catalog.json"
+    catalog.write_text(json.dumps({"models": {"gpt-6-astra": {
+        "aliases": ["gpt-6-astra"], "prices": [10, 50, 1, 12.5],
+        "long_context": [{"threshold": 272000, "prices": [20, 75, 2, 25]}],
+    }}}))
+    monkeypatch.setattr(pricing, "PRICING_FILE", tmp_path / "pricing.json")
+    monkeypatch.setattr(pricing, "PRICING_CATALOG_FILE", catalog)
+    pricing._user_cache = pricing._catalog_cache = None
+    pricing._reset_derived_caches()
     buf = _io.StringIO()
     _C(file=buf, width=120, no_color=True).print(
         PricingScreen(
@@ -2233,9 +2244,8 @@ def test_pricing_screen_lists_only_observed_models():
     assert any("gpt-6-astra (fast)" in line for line in text.splitlines())
     assert "claude-opus-5" not in text
     assert "<synthetic>" not in text
-    # Catalog long-context tiers never apply to builtin-priced models.
     lc_lines = [line for line in text.splitlines() if "272,000" in line]
-    assert lc_lines and all("catalog" not in line for line in lc_lines)
+    assert len(lc_lines) == 1 and "catalog" in lc_lines[0]
 
 
 def test_pricing_screen_update_refreshes_catalog_and_resyncs(tmp_path, monkeypatch):

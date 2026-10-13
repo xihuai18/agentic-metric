@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.8.19 (2026-10-13)
+
+- Bounded, catalog-aware model normalization caching speeds up per-event pricing during history sync without delaying external catalog updates.
+- SSH history sync uses verified rsync block deltas when available, avoiding whole-file retransfers of growing logs while retaining atomic cache updates, bounded resume batches, and the SSH/tar fallback.
+- Cached models.dev prices take precedence over builtin fallback rates, including supported premium/context tiers; user overrides remain authoritative. More specific builtin variants still beat shorter catalog family names. Explicit Fast/Ultrafast markers and model suffixes now apply the same long-context rates, and the pricing fingerprint forces historical repricing.
+- Account-attributed usage accepts explicit request-bound WCC Codex fingerprints, preserves account switches within hourly/model buckets, and leaves legacy/unidentified history unknown. Database migration preserves existing scoped usage and manual records.
+- Added `accounts report/set/payments` commands and an **a** account view in the TUI. API-equivalent usage is separate from manually entered subscription/credit payments, with exact decimal amounts, per-currency totals, payment-date filtering and optional idempotent references. Plan labels are manual, not inferred entitlements; no credentials, billing endpoints or subscription allowance percentages are used.
+
 ## v0.8.10 (2026-07-31)
 
 ### Improvements

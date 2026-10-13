@@ -102,6 +102,8 @@ agentic-metric pricing               # 管理模型定价
 
 模型定价用于成本估算。正常 sync/report/TUI 启动时会每天从 models.dev 刷新本地聚合目录,内置定价作为离线兜底。你可以通过 CLI 添加新模型、覆盖聚合或内置价格、配置长上下文费率和缓存时长费率。本地聚合快照存储在 `$DATA/agentic_metric/pricing-catalog.json`,手动覆盖存储在 `$DATA/agentic_metric/pricing.json`。
 
+Account-level API equivalents and the separate manual payment ledger are documented in [Account equivalents and manual payments](README.md#account-equivalents-and-manual-payments). Press **a** in the TUI or run `agentic-metric accounts report`; missing historical identity stays unknown, and subscription payments never replace API-equivalent costs.
+
 #### 基础模型定价
 
 ```bash
@@ -347,7 +349,7 @@ collector 目录,它会复用本机的 collector roots;本机也没有配置时,
 `~/.claude` 和 `~/.codex`。远程同步会在远程主机上展开 `~`,通过 SSH 读取
 `projects/` 和 `sessions/`,缓存到 `$DATA/agentic_metric/remote-cache/`,再和本机用量一起汇总。
 缓存里也会保存远程文件 manifest,所以重复 sync 只会下载变化过的 session/index
-文件,不会每次重新传完整 agent 目录。下载按体积分批进行,每批下载完成后 manifest
+文件,不会每次重新传完整 agent 目录。两端都有 `rsync` 时,常规远程路径会使用校验后的块级差量传输,避免增长中的日志被整份重传;否则使用 SSH/tar。两种方式都只读远程文件。下载按体积分批进行,每批下载完成后 manifest
 就会推进,因此 `timeout` 是按批生效的;大目录第一次同步被中断后,下次只补剩下的
 部分,不会从头重来。已经从远程 manifest 消失的缓存文件会被移到
 `.stale/`,不再参与解析;但之前已入库的用量仍保留在本地数据库里,历史报表照常包含。

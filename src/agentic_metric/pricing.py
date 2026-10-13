@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from collections.abc import Iterable
+from functools import lru_cache
 import json
 import logging
 import re
@@ -249,7 +250,7 @@ _UNKNOWN_MODEL_PREFIXES = (
     "gpt-5-pro",
 )
 
-_PRICING_FINGERPRINT_VERSION = 20
+_PRICING_FINGERPRINT_VERSION = 21
 
 # Long-context pricing applies per request/prompt, not per stored hour/session.
 # Collectors pass single-event usage into ``estimate_cost`` before aggregating
@@ -389,7 +390,12 @@ def _embedded_mode(
 
 
 def _decompose_model_name(name: str) -> tuple[str, str]:
-    """Decompose external model name into a registered base model and mode."""
+    _load_catalog_config()
+    return _cached_model_decomposition(name, _catalog_generation)
+
+
+@lru_cache(maxsize=4096)
+def _cached_model_decomposition(name: str, catalog_generation: int) -> tuple[str, str]:
     if not name:
         return "", ""
 
@@ -417,13 +423,16 @@ def _decompose_model_name(name: str) -> tuple[str, str]:
     for candidate, model in _SORTED_UNKNOWN_MODEL_TOKENS:
         if _contains_model_tokens(tokens, candidate):
             return model, _embedded_mode(tokens, candidate, mode)
-    for candidate, model in _SORTED_BUILTIN_MODEL_TOKENS:
-        if _contains_model_tokens(tokens, candidate):
-            return model, _embedded_mode(tokens, candidate, mode)
-    for candidate, model in _catalog_model_tokens():
-        if _contains_model_tokens(tokens, candidate):
-            return model, _embedded_mode(tokens, candidate, mode)
-
+    matched: tuple[tuple[str, ...], str] | None = None
+    for group in (_catalog_model_tokens(), _SORTED_BUILTIN_MODEL_TOKENS):
+        for candidate, model in group:
+            if _contains_model_tokens(tokens, candidate):
+                if matched is None or len(candidate) > len(matched[0]):
+                    matched = (candidate, model)
+                break
+    if matched is not None:
+        candidate, model = matched
+        return model, _embedded_mode(tokens, candidate, mode)
     return clean, mode
 
 
@@ -433,13 +442,16 @@ def _get_standard_pricing(model: str) -> PriceTuple | None:
     user = _load_user_pricing()
     if model in user:
         return user[model]
+    catalog = _catalog_standard_pricing(model)
+    if catalog is not None:
+        return catalog
     if _matches_any_model_prefix(model, _UNKNOWN_MODEL_PREFIXES):
         return None
     model_tokens = _model_tokens(model)
     for prefix_tokens, pricing in _SORTED_BUILTIN_PRICING_TOKENS:
         if _matches_priced_model_tokens(model_tokens, prefix_tokens):
             return pricing
-    return _catalog_standard_pricing(model)
+    return None
 
 
 def _normalize_mode(mode: str) -> str:
@@ -482,6 +494,7 @@ def _compute_non_standard_mode_prices(
     model: str,
     speed_mode: str,
     tier_mode: str,
+    total_input_tokens: int | None = None,
 ) -> tuple[float, float, float, float] | None:
     base_model = normalize_model(model)
     if base_model in _load_user_pricing():
@@ -489,16 +502,17 @@ def _compute_non_standard_mode_prices(
     if _get_standard_pricing(base_model) is None:
         return None
 
-    if _matches_any_model_prefix(base_model, _UNKNOWN_MODEL_PREFIXES):
-        return None
-    lookups: list[str] = []
+    lookups: list[tuple[str, str, str]] = []
     if speed_mode not in _STANDARD_MODES:
-        lookups.append(speed_mode)
+        lookups.append((speed_mode, "", speed_mode))
     if tier_mode not in _STANDARD_MODES:
-        # The tier alias is Codex-specific; Anthropic's ``speed`` values are
-        # matched against their own table verbatim.
-        lookups.append(_MODE_ALIASES.get(tier_mode, tier_mode))
-    for mode in lookups:
+        lookups.append((_MODE_ALIASES.get(tier_mode, tier_mode), tier_mode, ""))
+    for mode, tier, speed in lookups:
+        catalog = _catalog_mode_pricing(base_model, tier, speed, total_input_tokens)
+        if catalog is not None:
+            return catalog
+        if _matches_any_model_prefix(base_model, _UNKNOWN_MODEL_PREFIXES):
+            continue
         table = _NON_STANDARD_MODE_PRICING.get(mode)
         if not table:
             continue
@@ -506,9 +520,13 @@ def _compute_non_standard_mode_prices(
             table.items(), key=lambda x: len(x[0]), reverse=True
         ):
             if _matches_model_prefix(base_model, prefix):
+                if prices is not None and total_input_tokens is not None and total_input_tokens > 272_000:
+                    long_prices = _NON_STANDARD_MODE_LONG_CONTEXT_PRICING.get(mode, {}).get(base_model)
+                    if long_prices is not None:
+                        return long_prices
                 return prices
 
-    return _catalog_mode_pricing(base_model, tier_mode, speed_mode)
+    return None
 
 
 def _matches_any_model_prefix(model: str, prefixes: tuple[str, ...]) -> bool:
@@ -644,6 +662,7 @@ def _catalog_record(raw: dict[str, object], provider: str) -> dict[str, object] 
             modes[str(mode).strip().lower()] = {
                 "prices": list(mode_prices),
                 "markers": markers,
+                "long_context": _catalog_tiers(value["cost"]),
             }
 
     aliases = {str(raw.get("id") or "").strip()}
@@ -811,7 +830,7 @@ def _catalog_standard_pricing(model: str) -> PriceTuple | None:
 
 
 def _catalog_mode_pricing(
-    model: str, service_tier: str, speed: str
+    model: str, service_tier: str, speed: str, total_input_tokens: int | None = None,
 ) -> PriceTuple | None:
     record = _catalog_record_for_model(model)
     modes = record.get("modes") if record else None
@@ -837,8 +856,11 @@ def _catalog_mode_pricing(
                 continue
             prices = value.get("prices")
             parsed = _price_tuple(prices)
-            if parsed is not None:
-                return parsed
+            if total_input_tokens is not None and isinstance(value.get("long_context"), list):
+                matched = _matched_tier_prices(total_input_tokens, value["long_context"])
+                if matched is not None:
+                    return matched
+            return parsed
     return None
 
 
@@ -863,6 +885,7 @@ def _catalog_long_context_pricing(
 def _reset_derived_caches() -> None:
     """Drop memoized lookups. Needed when module tables are patched in tests."""
     global _derived_generation
+    _cached_model_decomposition.cache_clear()
     _pricing_memo.clear()
     _mode_price_memo.clear()
     _long_context_memo.clear()
@@ -1216,7 +1239,7 @@ def normalize_model(name: str) -> str:
 
 
 def get_pricing(model: str) -> tuple[float, float, float, float] | None:
-    """Look up pricing: user overrides → builtin prefix match → unknown.
+    """Look up pricing: user overrides, catalog, then builtin fallback.
 
     Prefix matching is done longest-prefix-first to ensure ``gpt-5.4-mini``
     matches its own entry before falling back to ``gpt-5.4``. Results are
@@ -1409,6 +1432,8 @@ def _long_context_prices(
             if matched is not None:
                 return matched
 
+    if _catalog_record_for_model(model) is not None:
+        return _catalog_long_context_pricing(model, total_input_tokens)
     if unknown:
         return None
 
@@ -1426,8 +1451,6 @@ def _long_context_prices(
             matched_builtin = tuple(float(v) for v in rule["prices"])  # type: ignore[assignment]
     if matched_builtin is not None:
         return matched_builtin
-    if model not in _BUILTIN_PRICING:
-        return _catalog_long_context_pricing(model, total_input_tokens)
     return None
 
 
@@ -1443,9 +1466,7 @@ def get_catalog_pricing() -> dict[str, PriceTuple]:
 def get_all_pricing() -> dict[str, tuple[float, float, float, float]]:
     """Return catalog and builtin pricing overridden by user values."""
     merged = dict(_BUILTIN_PRICING)
-    for model, pricing in get_catalog_pricing().items():
-        if model not in merged:
-            merged[model] = pricing
+    merged.update(get_catalog_pricing())
     merged.update(_load_user_pricing())
     return merged
 
@@ -1486,6 +1507,8 @@ def _pricing_source(model: str, base_model: str, premium_mode: str) -> str:
             return "custom"
         return "builtin" if tuple(user[key]) == tuple(builtin) else "override"
     if premium_mode:
+        if _catalog_mode_pricing(base_model, premium_mode, premium_mode) is not None:
+            return "catalog"
         tables = (
             _NON_STANDARD_MODE_PRICING.get(premium_mode) or {},
             _NON_STANDARD_MODE_PRICING.get(
@@ -1498,6 +1521,8 @@ def _pricing_source(model: str, base_model: str, premium_mode: str) -> str:
             for prefix in table
         )
         return "builtin" if builtin_mode else "catalog"
+    if _catalog_standard_pricing(base_model) is not None:
+        return "catalog"
     tokens = _model_tokens(base_model)
     if any(
         _matches_priced_model_tokens(tokens, prefix)
@@ -1516,15 +1541,14 @@ def long_context_rule_applies(rule: dict[str, object], models: Iterable[str]) ->
     """
     prefixes = tuple(str(p) for p in rule["prefixes"])
     source = rule.get("source")
+    if source == "catalog":
+        return any(model == prefixes[0] for model in models)
     if source != "user":
         models = [
             model for model in models
             if not _matches_any_model_prefix(model, _UNKNOWN_MODEL_PREFIXES)
+            and _catalog_record_for_model(model) is None
         ]
-    if source == "catalog":
-        return any(
-            model == prefixes[0] and model not in _BUILTIN_PRICING for model in models
-        )
     excluded = tuple(str(p) for p in rule.get("excluded_prefixes", ()))
     return any(
         _matches_any_model_prefix(model, prefixes)
@@ -1581,6 +1605,7 @@ def get_pricing_fingerprint() -> str:
             for mode, table in _NON_STANDARD_MODE_PRICING.items()
             for model, prices in table.items()
         ),
+        "premium_long_context": _NON_STANDARD_MODE_LONG_CONTEXT_PRICING,
         "unknown_model_prefixes": sorted(_UNKNOWN_MODEL_PREFIXES),
         "user_config": _load_user_config(),
     }
@@ -1608,10 +1633,8 @@ def estimate_cost(
     single-request usage; callers that only have hourly/session aggregates
     should pass ``apply_long_context=False``.
 
-    ``service_tier``/``speed`` are collector-observed mode markers. A matched
-    premium mode replaces the standard rate for the whole request (OpenAI
-    priority processing does not support long context; Anthropic fast mode
-    prices the full context window), so long-context tiers are skipped.
+    ``service_tier``/``speed`` and model suffixes select the same premium rates
+    and premium-specific context tiers; standard tiers never price a premium request.
     """
     if (
         input_tokens <= 0
@@ -1640,13 +1663,13 @@ def estimate_cost(
             cache_read_tokens=cache_read_tokens,
             cache_creation_tokens=cache_creation_tokens,
         )
-    elif pricing is not None and apply_long_context and embedded_mode:
-        mode_name = "ultrafast" if embedded_mode == "ultrafast" else "priority"
-        mode_tiers = _NON_STANDARD_MODE_LONG_CONTEXT_PRICING.get(mode_name, {})
-        total_input_tokens = input_tokens + cache_read_tokens + cache_creation_tokens
-        mode_long_prices = mode_tiers.get(base_model)
-        if mode_long_prices is not None and total_input_tokens > 272_000:
-            pricing = mode_long_prices
+    elif pricing is not None and apply_long_context:
+        pricing = _compute_non_standard_mode_prices(
+            base_model,
+            _normalize_mode(effective_speed),
+            _normalize_mode(effective_service_tier),
+            input_tokens + cache_read_tokens + cache_creation_tokens,
+        )
     pricing = pricing or get_pricing(model)
     if pricing is None:
         return None

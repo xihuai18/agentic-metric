@@ -19,10 +19,23 @@ from . import (
 )
 
 
-CLAUDE_SYNC_VERSION = "v13"
+CLAUDE_SYNC_VERSION = "v14"
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
+
+
+def _subscriber_account_key(usage: object) -> str:
+    """Accept only explicit request-local account fingerprints from WCC usage."""
+    if not isinstance(usage, dict):
+        return ""
+    account = usage.get("wcc_subscriber_account")
+    if not isinstance(account, dict) or account.get("provider") != "codex":
+        return ""
+    fingerprint = account.get("account_fingerprint")
+    if not isinstance(fingerprint, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", fingerprint):
+        return ""
+    return f"codex:{fingerprint.lower()}"
 
 
 def _extract_prompt(content: str) -> str:
@@ -127,13 +140,13 @@ class _SessionAccum:
         self.partial_line = b""
         self.file_id: tuple[int, int] | None = None
         self.file_mtime_ns = -1
-        self.assistant_message_dates: dict[str, tuple[str, int, str]] = {}
+        self.assistant_message_dates: dict[str, tuple[str, int, str, str]] = {}
         self.all_assistant_ids: set[str] = set()
         self.assistant_usage_by_id: dict[
             str,
-            tuple[int, int, int, int, int, float | None, str, int, str],
+            tuple[int, int, int, int, int, float | None, str, int, str, str],
         ] = {}
-        self.usage_buckets: dict[tuple[str, int, str], dict] = {}
+        self.usage_buckets: dict[tuple[str, int, str, str], dict] = {}
 
     def read_new_lines(self) -> None:
         """Read only bytes appended since last call."""
@@ -241,6 +254,7 @@ class _SessionAccum:
         usage_hour: int,
         *,
         model: str | None = None,
+        account_key: str = "",
         user_turns: int = 0,
         message_count: int = 0,
         input_tokens: int = 0,
@@ -253,7 +267,7 @@ class _SessionAccum:
         if not usage_date:
             return
         bucket_model = model if model is not None else self.model
-        key = (usage_date, usage_hour, bucket_model or "")
+        key = (usage_date, usage_hour, bucket_model or "", account_key)
         bucket = self.usage_buckets.setdefault(
             key,
             {
@@ -261,6 +275,7 @@ class _SessionAccum:
                 "usage_hour": usage_hour,
                 "project_path": self.project_path,
                 "model": bucket_model or "",
+                "account_key": account_key,
                 "message_count": 0,
                 "user_turns": 0,
                 "input_tokens": 0,
@@ -359,18 +374,20 @@ class _SessionAccum:
                 entry_date, entry_hour = today_str, 0
             bucket_model = msg_model or self.model
             usage = msg.get("usage", {}) if isinstance(msg, dict) else {}
+            normalized = normalize_anthropic_usage(usage)
+            account_key = _subscriber_account_key(usage)
+            if normalized is None and msg_id in self.assistant_usage_by_id:
+                account_key = self.assistant_usage_by_id[msg_id][-1]
             self._count_assistant_message(
                 msg_id,
                 entry_date,
                 entry_hour,
                 today_str,
                 bucket_model,
+                account_key,
             )
 
-            if usage:
-                normalized = normalize_anthropic_usage(usage)
-                if normalized is None:
-                    return
+            if normalized is not None:
                 inp, out, cr, cw = normalized.as_bucket_tuple()
                 cw_1h = normalized.cache_write_1h_tokens
                 # Anthropic reports the speed that actually served the request
@@ -389,6 +406,7 @@ class _SessionAccum:
                     entry_hour,
                     today_str,
                     bucket_model,
+                    account_key,
                 )
 
     def _count_assistant_message(
@@ -398,6 +416,7 @@ class _SessionAccum:
         entry_hour: int,
         today_str: str,
         model: str,
+        account_key: str,
     ) -> None:
         """Count each Claude Code assistant message once by message id."""
         if not msg_id:
@@ -406,6 +425,7 @@ class _SessionAccum:
                 entry_date,
                 entry_hour,
                 model=model,
+                account_key=account_key,
                 message_count=1,
             )
             if entry_date == today_str:
@@ -414,41 +434,44 @@ class _SessionAccum:
 
         prev = self.assistant_message_dates.get(msg_id)
         if prev is None:
-            self.assistant_message_dates[msg_id] = (entry_date, entry_hour, model)
+            self.assistant_message_dates[msg_id] = (entry_date, entry_hour, model, account_key)
             self.message_count += 1
             self._add_usage_bucket(
                 entry_date,
                 entry_hour,
                 model=model,
+                account_key=account_key,
                 message_count=1,
             )
             if entry_date == today_str:
                 self.today_message_count += 1
             return
 
-        prev_date, prev_hour, prev_model = prev
-        if (prev_date, prev_hour, prev_model) == (entry_date, entry_hour, model):
+        prev_date, prev_hour, prev_model, prev_account = prev
+        if prev == (entry_date, entry_hour, model, account_key):
             return
 
-        # A rare cross-midnight update for the same streamed message should
-        # move the day-local count without changing the session total.
+        # Stream updates can change the date, model, or account attribution;
+        # move the count without changing the session total.
         self._add_usage_bucket(
             prev_date,
             prev_hour,
             model=prev_model,
+            account_key=prev_account,
             message_count=-1,
         )
         self._add_usage_bucket(
             entry_date,
             entry_hour,
             model=model,
+            account_key=account_key,
             message_count=1,
         )
         if prev_date == today_str and entry_date != today_str:
             self.today_message_count = max(0, self.today_message_count - 1)
         elif prev_date != today_str and entry_date == today_str:
             self.today_message_count += 1
-        self.assistant_message_dates[msg_id] = (entry_date, entry_hour, model)
+        self.assistant_message_dates[msg_id] = (entry_date, entry_hour, model, account_key)
 
     def _set_assistant_usage(
         self,
@@ -458,6 +481,7 @@ class _SessionAccum:
         entry_hour: int,
         today_str: str,
         model: str,
+        account_key: str,
     ) -> None:
         """Use the last usage snapshot for a Claude Code assistant message."""
         inp, out, cr, cw, cw_1h, cost = usage
@@ -465,7 +489,10 @@ class _SessionAccum:
         if msg_id:
             prev = self.assistant_usage_by_id.get(msg_id)
             if prev is not None:
-                p_in, p_out, p_cr, p_cw, p_cw_1h, p_cost, p_date, p_hour, p_model = prev
+                (
+                    p_in, p_out, p_cr, p_cw, p_cw_1h, p_cost,
+                    p_date, p_hour, p_model, p_account,
+                ) = prev
                 self.input_tokens = max(0, self.input_tokens - p_in)
                 self.output_tokens = max(0, self.output_tokens - p_out)
                 self.cache_read = max(0, self.cache_read - p_cr)
@@ -475,6 +502,7 @@ class _SessionAccum:
                     p_date,
                     p_hour,
                     model=p_model,
+                    account_key=p_account,
                     input_tokens=-p_in,
                     output_tokens=-p_out,
                     cache_read_tokens=-p_cr,
@@ -499,6 +527,7 @@ class _SessionAccum:
                 entry_date,
                 entry_hour,
                 model,
+                account_key,
             )
 
         self.input_tokens += inp
@@ -510,6 +539,7 @@ class _SessionAccum:
             entry_date,
             entry_hour,
             model=model,
+            account_key=account_key,
             input_tokens=inp,
             output_tokens=out,
             cache_read_tokens=cr,
@@ -703,6 +733,8 @@ class ClaudeCodeCollector(BaseCollector):
         # reparse so every usage row has a matching session total row.
         # v13: sync state is scoped by provider/data_root and zero-turn files
         # with unique usage are retained.
+        # v14: usage buckets split explicit request-local account fingerprints;
+        # reparse enriched logs without clearing stored history.
         sync_prefix = f"{self.sync_state_prefix}:"
         assistant_ids_prefix = f"{self.sync_state_prefix}:assistant_ids:"
 

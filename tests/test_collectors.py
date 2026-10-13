@@ -2,10 +2,15 @@
 
 import json
 import os
+import re
+import shutil
+import sys
 import time
 from datetime import date, datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
+
+import pytest
 
 from agentic_metric.collectors import CollectorRegistry, BaseCollector, create_default_registry
 from agentic_metric.collectors.claude_code import (
@@ -24,7 +29,10 @@ from agentic_metric.collectors.remote import (
     _cache_root_for,
     _extract_tarball as remote_extract_tarball,
     _manifest_command,
+    _rsync_command,
+    _rsync_plan,
     _ssh_command,
+    _sync_target_to_cache,
 )
 from agentic_metric.config import (
     RemoteCollectorRoot,
@@ -401,7 +409,7 @@ def test_claude_history_sync_scopes_state_by_provider_and_root(tmp_path):
     ).fetchall()
     assert [tuple(row) for row in rows] == [("p1", 100), ("p2", 100)]
     state_keys = db.conn.execute(
-        "SELECT key FROM sync_state WHERE key LIKE 'cc_jsonl:v13:%'"
+        "SELECT key FROM sync_state WHERE key LIKE 'cc_jsonl:v14:%'"
     ).fetchall()
     assert len(state_keys) == 4
     assert sum(":assistant_ids:" in row["key"] for row in state_keys) == 2
@@ -649,7 +657,7 @@ def test_remote_ready_key_tracks_inner_parser_version():
     assert codex._ready_state_key().startswith(codex._inner.sync_state_prefix)
     assert "codex_jsonl:v17:" in codex._ready_state_key()
     assert claude._ready_state_key().startswith(claude._inner.sync_state_prefix)
-    assert "cc_jsonl:v13:" in claude._ready_state_key()
+    assert "cc_jsonl:v14:" in claude._ready_state_key()
 
 
 def test_remote_codex_collector_syncs_tarball_into_history(tmp_path):
@@ -1282,6 +1290,296 @@ def test_remote_download_stops_after_too_many_skipped_batches(tmp_path):
     # Manifest call, three skipped batches, then one fatal one.
     assert run_mock.call_count == 1 + _MAX_SKIPPED_BATCHES + 1
     db.close()
+
+
+_RSYNC_BASE = "/home/u/.claude/projects"
+_RSYNC_MANIFEST = (
+    b"OK\0RSYNC\0" + _RSYNC_BASE.encode() + b"\0"
+    + b"10\t123\t./proj/a.jsonl\0"
+)
+
+
+def _rsync_target() -> RemoteSyncTarget:
+    return RemoteSyncTarget(
+        remote=RemoteSpec(host="remote-dev", name="dev", user="leo", port=2222, timeout=9),
+        agent_type="claude_code",
+        remote_root="~/.claude",
+        provider="",
+        index=0,
+    )
+
+
+def _run_rsync_sync(data_dir, responses):
+    """Run one mirror sync with scripted subprocess results; returns (error, cache, run)."""
+    target = _rsync_target()
+    run_mock = Mock(side_effect=responses)
+    with patch("agentic_metric.collectors.remote.DATA_DIR", data_dir), \
+         patch("agentic_metric.collectors.remote.shutil.which", return_value="/usr/bin/rsync"), \
+         patch("agentic_metric.collectors.remote.subprocess.run", run_mock):
+        error = ""
+        try:
+            _sync_target_to_cache(target)
+        except RuntimeError as exc:
+            error = str(exc)
+        cache = _cache_root_for(target)
+    return error, cache, run_mock
+
+
+def test_remote_rsync_command_is_read_only_and_safe(monkeypatch):
+    monkeypatch.setattr("agentic_metric.collectors.remote.shutil.which", lambda _: "/usr/bin/rsync")
+    target = _rsync_target()
+    plan = _rsync_plan(target.remote, _RSYNC_BASE)
+    assert plan is not None
+    assert plan.source == f"leo@remote-dev:{_RSYNC_BASE}/"
+    assert plan.shell == "ssh -p 2222"
+
+    cmd = _rsync_command(plan, Path("/cache/x"), "projects")
+    for flag in ("--delete", "--inplace", "--append", "--remove-source-files", "-W"):
+        assert flag not in cmd
+    # NUL-separated names on stdin; -I because the changed list is authoritative.
+    assert {"-I", "--no-whole-file", "--from0", "--files-from=-", "-z"} <= set(cmd)
+    assert "--compress-level=1" in cmd
+    assert cmd[-3:] == ["--", plan.source, "/cache/x/projects/"]
+    assert cmd[cmd.index("-e") + 1] == plan.shell
+
+    # Quoting that rsync would reinterpret, or an unsafe remote path, stays on tar.
+    quoted = RemoteSpec(host="h", ssh_options=["-o", "ProxyCommand=ssh -W %h:%p jump"])
+    assert _rsync_plan(quoted, _RSYNC_BASE).shell == 'ssh -o "ProxyCommand=ssh -W %h:%p jump"'
+    both = RemoteSpec(host="h", ssh_options=["-o", "A=\"x 'y"])
+    assert _rsync_plan(both, _RSYNC_BASE) is None
+    assert _rsync_plan(RemoteSpec(host="-oProxyCommand=x"), _RSYNC_BASE) is None
+    assert _rsync_plan(RemoteSpec(host="a/b"), _RSYNC_BASE) is None
+    assert _rsync_plan(RemoteSpec(host="::1", user="u"), _RSYNC_BASE).source.startswith("u@[::1]:/")
+    for bad in ("/home/my user/p", "/home/u/$(x)/p", "relative/p", "/home/u/a;b", "/home/u/p\n"):
+        assert _rsync_plan(RemoteSpec(host="h"), bad) is None
+
+
+def test_remote_without_rsync_marker_or_local_rsync_keeps_tar(tmp_path):
+    import io
+    import tarfile
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        info = tarfile.TarInfo("proj/a.jsonl")
+        info.size = 10
+        tar.addfile(info, io.BytesIO(b"0123456789"))
+
+    plain = b"OK\0" + b"10\t123\t./proj/a.jsonl\0"
+    for case, manifest in (("no-marker", plain), ("marker", _RSYNC_MANIFEST)):
+        data = tmp_path / case
+        target = _rsync_target()
+        run_mock = Mock(side_effect=[
+            Mock(returncode=0, stdout=manifest, stderr=b""),
+            Mock(returncode=0, stdout=buf.getvalue(), stderr=b""),
+        ])
+        # "marker" case: the remote offers rsync but this machine has none.
+        with patch("agentic_metric.collectors.remote.DATA_DIR", data), \
+             patch("agentic_metric.collectors.remote.shutil.which", return_value=None), \
+             patch("agentic_metric.collectors.remote.subprocess.run", run_mock):
+            found, changed, _, complete = _sync_target_to_cache(target)
+            cached = _cache_root_for(target) / "projects/proj/a.jsonl"
+        assert (found, changed, complete) == (True, True, True)
+        assert run_mock.call_args_list[1].args[0][0] == "ssh"
+        assert "tar -czf" in run_mock.call_args_list[1].args[0][-1]
+        assert cached.read_bytes() == b"0123456789"
+
+
+def test_remote_rsync_failure_never_advances_manifest(tmp_path):
+    for returncode in (23, 12):
+        data = tmp_path / str(returncode)
+        error, cache, run_mock = _run_rsync_sync(data, [
+            Mock(returncode=0, stdout=_RSYNC_MANIFEST, stderr=b""),
+            Mock(returncode=returncode, stdout=b">f+++++++++ proj/a.jsonl\n", stderr=b"boom"),
+        ])
+        argv = run_mock.call_args_list[1].args[0]
+        assert argv[0] == "rsync"
+        assert run_mock.call_args_list[1].kwargs["input"] == b"proj/a.jsonl\0"
+        assert error == "boom"
+        # No completed batch: no manifest, and a partial state is flagged.
+        assert not (cache / ".remote-manifest.json").exists()
+
+
+def test_remote_rsync_requires_itemized_regular_file_delivery(tmp_path):
+    """Exit 0 alone is not delivery: skipped/vanished files and symlinks stay pending."""
+    cases = {
+        "skipped": (b"", None),
+        "vanished": (b"", None),
+        "symlink": (b">f..t...... proj/a.jsonl\n", "symlink"),
+        "not-on-disk": (b">f..t...... proj/a.jsonl\n", None),
+        "other-name": (b">f..t...... proj/other.jsonl\n", "file"),
+    }
+    for name, (stdout, local) in cases.items():
+        data = tmp_path / name
+        target = _rsync_target()
+        with patch("agentic_metric.collectors.remote.DATA_DIR", data):
+            dest = _cache_root_for(target) / "projects" / "proj" / "a.jsonl"
+        if local:
+            dest.parent.mkdir(parents=True)
+            if local == "symlink":
+                (dest.parent / "real").write_text("old")
+                dest.symlink_to(dest.parent / "real")
+            else:
+                dest.write_text("old")
+        returncode = 24 if name == "vanished" else 0
+        error, cache, _ = _run_rsync_sync(data, [
+            Mock(returncode=0, stdout=_RSYNC_MANIFEST, stderr=b""),
+            Mock(returncode=returncode, stdout=stdout, stderr=b""),
+        ])
+        saved = json.loads((cache / ".remote-manifest.json").read_text()) \
+            if (cache / ".remote-manifest.json").exists() else {}
+        assert "proj/a.jsonl" not in saved, name
+        assert (cache / ".remote-manifest.incomplete").exists(), name
+
+    # A real itemized delivery of a regular file is recorded.
+    data = tmp_path / "ok"
+    target = _rsync_target()
+    with patch("agentic_metric.collectors.remote.DATA_DIR", data):
+        dest = _cache_root_for(target) / "projects" / "proj" / "a.jsonl"
+    dest.parent.mkdir(parents=True)
+    dest.write_text("new")
+    _, cache, _ = _run_rsync_sync(data, [
+        Mock(returncode=0, stdout=_RSYNC_MANIFEST, stderr=b""),
+        Mock(returncode=0, stdout=b">f.st...... proj/a.jsonl\n", stderr=b""),
+    ])
+    assert set(json.loads((cache / ".remote-manifest.json").read_text())) == {"proj/a.jsonl"}
+    assert not (cache / ".remote-manifest.incomplete").exists()
+
+
+def test_remote_rsync_odd_names_stay_on_tar(tmp_path):
+    manifest = (
+        b"OK\0RSYNC\0" + _RSYNC_BASE.encode() + b"\0"
+        + b"5\t123\t./proj/a b.jsonl\0"
+        + b"5\t123\t./proj/line\nbreak.jsonl\0"
+    )
+    _, _, run_mock = _run_rsync_sync(tmp_path, [
+        Mock(returncode=0, stdout=manifest, stderr=b""),
+        Mock(returncode=0, stdout=b"", stderr=b""),  # rsync batch
+        Mock(returncode=0, stdout=b"", stderr=b""),  # tar batch
+    ])
+    assert run_mock.call_args_list[1].kwargs["input"] == b"proj/a b.jsonl\0"
+    assert run_mock.call_args_list[2].args[0][0] == "ssh"
+    assert run_mock.call_args_list[2].kwargs["input"] == b"proj/line\nbreak.jsonl\0"
+
+
+# Stands in for ssh: run the remote command locally, as ssh's remote shell would.
+_FAKE_SSH = """#!/bin/sh
+while [ $# -gt 0 ]; do case "$1" in -p|-o) shift 2;; -*) shift;; *) break;; esac; done
+shift
+exec sh -c "$*"
+"""
+
+# Stands in for rsync on PATH: servers run the real binary untouched, while the
+# client adds --stats and keeps a copy of its output to measure bytes received.
+_FAKE_RSYNC = """#!/bin/sh
+case "$1" in --server) exec "$REAL_RSYNC" "$@" ;; esac
+"$REAL_RSYNC" --stats "$@" > "$FAKE_RSYNC_STATS.cur"
+rc=$?
+cat "$FAKE_RSYNC_STATS.cur"
+cat "$FAKE_RSYNC_STATS.cur" >> "$FAKE_RSYNC_STATS"
+exit $rc
+"""
+
+
+@pytest.mark.skipif(shutil.which("rsync") is None, reason="rsync not installed")
+def test_remote_rsync_delta_updates_existing_cache_end_to_end(tmp_path, monkeypatch):
+    """Real rsync through a local fake ssh: only the changed bytes cross the wire."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "ssh").write_text(_FAKE_SSH)
+    (bin_dir / "ssh").chmod(0o755)
+    if sys.platform == "darwin":
+        # BSD stat prints "\t" literally; give the manifest GNU-style --printf.
+        (bin_dir / "stat").write_text(
+            "#!/bin/sh\n"
+            '[ "$1" = "--printf" ] || exec /usr/bin/stat "$@"\n'
+            "set -- $(/usr/bin/stat -f '%z %m' \"$3\") \"$3\"\n"
+            "printf '%s\\t%s\\t%s\\0' \"$1\" \"$2\" \"$3\"\n"
+        )
+        (bin_dir / "stat").chmod(0o755)
+    (bin_dir / "rsync").write_text(_FAKE_RSYNC)
+    (bin_dir / "rsync").chmod(0o755)
+    stats = tmp_path / "rsync-stats.log"
+    home = tmp_path / "home"
+    projects = home / ".claude" / "projects"
+    (projects / "proj x").mkdir(parents=True)
+    monkeypatch.setenv("REAL_RSYNC", shutil.which("rsync"))
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("FAKE_RSYNC_STATS", str(stats))
+
+    def sent_bytes() -> int:
+        """Bytes the client received from the remote across all rsync runs."""
+        text = stats.read_text() if stats.exists() else ""
+        found = re.findall(r"Total (?:bytes )?received: ([\d,]+)", text)
+        if text and not found:
+            pytest.skip("unrecognized rsync --stats format")
+        return sum(int(value.replace(",", "")) for value in found)
+
+    big = projects / "-big" / "big.jsonl"
+    big.parent.mkdir()
+    odd = projects / "proj x" / "#é y.jsonl"
+    big.write_bytes(os.urandom(400_000))
+    odd.write_text("odd\n")
+    mtime = 1_700_000_000
+
+    def touch(path: Path) -> None:
+        nonlocal mtime
+        mtime += 10
+        os.utime(path, (mtime, mtime))
+
+    touch(big)
+    touch(odd)
+    target = RemoteSyncTarget(
+        remote=RemoteSpec(host="remote-dev", name="dev", timeout=60),
+        agent_type="claude_code",
+        remote_root="~/.claude",
+        provider="",
+        index=0,
+    )
+    with patch("agentic_metric.collectors.remote.DATA_DIR", tmp_path / "data"):
+        cache = _cache_root_for(target)
+        cached = cache / "projects" / "-big" / "big.jsonl"
+
+        assert _sync_target_to_cache(target)[3] is True
+        assert cached.read_bytes() == big.read_bytes()
+        assert (cache / "projects" / "proj x" / "#é y.jsonl").read_text() == "odd\n"
+        assert sent_bytes() > 300_000  # first copy went through rsync, in full
+
+        def resync(expect_max: int) -> None:
+            before = sent_bytes()
+            found, changed, _, complete = _sync_target_to_cache(target)
+            assert (found, changed, complete) == (True, True, True)
+            assert cached.read_bytes() == big.read_bytes()
+            assert sent_bytes() - before < expect_max
+            assert not (cache / ".remote-manifest.incomplete").exists()
+            assert not (cache / ".rsync-tmp").exists()
+
+        # Append-only growth sends only the new tail.
+        with big.open("ab") as handle:
+            handle.write(os.urandom(4096))
+        touch(big)
+        resync(60_000)
+
+        # Same-size rewrite whose cached copy looks current to rsync's quick
+        # check (same size and mtime) must still be compared, thanks to -I.
+        data = bytearray(big.read_bytes())
+        data[200_000:200_100] = bytes(100)
+        big.write_bytes(bytes(data))
+        touch(big)
+        os.utime(cached, (mtime, mtime))
+        resync(60_000)
+
+        # Truncation keeps the prefix and drops the rest.
+        with big.open("r+b") as handle:
+            handle.truncate(100_000)
+        touch(big)
+        resync(60_000)
+        assert cached.stat().st_size == 100_000
+
+        # Nothing changed: no rsync run at all.
+        before = sent_bytes()
+        assert _sync_target_to_cache(target)[1] is False
+        assert sent_bytes() == before
 
 
 def test_remote_skipped_file_deleted_upstream_is_still_archived(tmp_path):
