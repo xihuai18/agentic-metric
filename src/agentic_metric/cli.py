@@ -1713,8 +1713,63 @@ def pricing_update() -> None:
     _refresh_history_after_pricing_change()
 
 
+_PRICING_LIST_SOURCES = {"builtin", "catalog", "user", "override", "custom"}
+
+
+def _recorded_used_models() -> list[str]:
+    """Read distinct recorded model ids without modifying or creating the database."""
+    import sqlite3
+    from . import config
+
+    db_path = config.DB_PATH
+    if not db_path.exists():
+        return []
+    try:
+        conn = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return []
+    try:
+        models: set[str] = set()
+        for table in ("session_usage", "sessions"):
+            try:
+                rows = conn.execute(
+                    f"SELECT DISTINCT model FROM {table} WHERE model != ''"
+                ).fetchall()
+            except sqlite3.Error:
+                continue
+            models.update(str(row[0]) for row in rows if row[0])
+        return sorted(models)
+    finally:
+        conn.close()
+
+
+def _matches_pricing_source(actual: str, selected: str) -> bool:
+    if selected == "user":
+        return actual in {"override", "custom", "user"}
+    if selected in {"override", "custom"}:
+        return actual in {selected, "user"}
+    if selected == "builtin":
+        return actual in {"builtin", "disabled"}
+    return actual == selected
+
+
 @pricing_app.command("list")
 def pricing_list(
+    query: str | None = typer.Argument(
+        None,
+        help="Optional substring filter on model name (searches all models).",
+    ),
+    all_: bool = typer.Option(
+        False,
+        "--all",
+        "-a",
+        help="Show the full pricing table instead of only recorded used models.",
+    ),
+    source: str | None = typer.Option(
+        None,
+        "--source",
+        help="Filter by pricing source: builtin, catalog, user, override, custom.",
+    ),
     json_: bool = typer.Option(False, "--json", help="Output pricing as machine-readable JSON."),
 ) -> None:
     """List model pricing plus long-context and cache-duration rules."""
@@ -1722,29 +1777,123 @@ def pricing_list(
         _BUILTIN_PRICING,
         _load_user_pricing,
         get_all_pricing,
-        get_catalog_pricing,
         get_long_context_rules,
+        get_observed_model_pricing,
         get_user_cache_pricing,
+        long_context_rule_applies,
     )
 
+    selected_source = source.strip().lower() if source is not None else None
+    if selected_source is not None and selected_source not in _PRICING_LIST_SOURCES:
+        console.print(
+            f"[{C_RED}]Invalid --source {source!r}. Expected one of: "
+            f"{', '.join(sorted(_PRICING_LIST_SOURCES))}.[/]"
+        )
+        raise typer.Exit(1)
+
+    needle = query.strip().lower() if query is not None and query.strip() else None
     user = _load_user_pricing()
-    catalog = get_catalog_pricing()
+
+    def _entry_source(model: str, prices: tuple[float, float, float, float]) -> str:
+        if model in user:
+            if model not in _BUILTIN_PRICING:
+                return "custom"
+            return "builtin" if tuple(prices) == tuple(_BUILTIN_PRICING[model]) else "override"
+        if model in _BUILTIN_PRICING:
+            return "builtin"
+        return "catalog"
+
+    used_only = not all_ and needle is None and selected_source is None
+    used_fallback = False
+
+    if used_only:
+        rows = get_observed_model_pricing(_recorded_used_models())
+        seen = {str(r["model"]) for r in rows}
+        for model, prices in sorted(user.items()):
+            if model in seen:
+                continue
+            rows.append(
+                {
+                    "model": model,
+                    "base_model": model,
+                    "prices": prices,
+                    "source": _entry_source(model, prices),
+                }
+            )
+        rows.sort(key=lambda r: str(r["model"]))
+        if not rows:
+            used_fallback = True
+            rows = [
+                {
+                    "model": model,
+                    "base_model": model,
+                    "prices": prices,
+                    "source": "builtin",
+                }
+                for model, prices in sorted(_BUILTIN_PRICING.items())
+            ]
+        bases = {str(r["base_model"]) for r in rows}
+        lc_rows = [
+            rule
+            for rule in get_long_context_rules(include_disabled=True)
+            if rule.get("source") == "user"
+            or (
+                used_fallback
+                and rule.get("source") in {"builtin", "disabled"}
+            )
+            or (not used_fallback and long_context_rule_applies(rule, bases))
+        ]
+        cache_rows = get_user_cache_pricing()
+    else:
+        all_models = get_all_pricing()
+        rows = []
+        for model in sorted(all_models):
+            if needle and needle not in model.lower():
+                continue
+            prices = all_models[model]
+            entry_src = _entry_source(model, prices)
+            if selected_source and not _matches_pricing_source(entry_src, selected_source):
+                continue
+            rows.append(
+                {
+                    "model": model,
+                    "base_model": model,
+                    "prices": prices,
+                    "source": entry_src,
+                }
+            )
+        matched_bases = {str(r["base_model"]) for r in rows}
+        lc_rows = []
+        for rule in get_long_context_rules(include_disabled=True):
+            rule_source = str(rule.get("source") or "builtin")
+            if selected_source and not _matches_pricing_source(rule_source, selected_source):
+                continue
+            if needle:
+                prefixes = [str(p).lower() for p in rule["prefixes"]]
+                if not any(needle in p for p in prefixes) and not long_context_rule_applies(
+                    rule, matched_bases
+                ):
+                    continue
+            lc_rows.append(rule)
+        raw_cache = get_user_cache_pricing()
+        if selected_source and selected_source not in {"user", "override", "custom"}:
+            cache_rows = {}
+        elif needle:
+            cache_rows = {m: r for m, r in raw_cache.items() if needle in m.lower()}
+        else:
+            cache_rows = raw_cache
 
     if json_:
-        merged = get_all_pricing()
         payload = {
             "models": {
-                m: {
-                    "input": p[0], "output": p[1],
-                    "cache_read": p[2], "cache_write": p[3],
-                    "source": (
-                        "custom" if m in user and m not in _BUILTIN_PRICING
-                        else "override" if m in user and tuple(p) != tuple(_BUILTIN_PRICING.get(m, ()))
-                        else "builtin" if m in _BUILTIN_PRICING
-                        else "catalog"
-                    ),
+                str(row["model"]): {
+                    "input": row["prices"][0],
+                    "output": row["prices"][1],
+                    "cache_read": row["prices"][2],
+                    "cache_write": row["prices"][3],
+                    "source": str(row["source"]),
                 }
-                for m, p in sorted(merged.items())
+                for row in rows
             },
             "long_context": [
                 {
@@ -1753,56 +1902,69 @@ def pricing_list(
                     "prices": [float(v) for v in r["prices"]],
                     "source": str(r.get("source") or "builtin"),
                 }
-                for r in get_long_context_rules(include_disabled=True)
+                for r in lc_rows
             ],
-            "cache": get_user_cache_pricing(),
+            "cache": cache_rows,
         }
         print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
         return
 
-    table = Table(
-        title="Model Pricing (USD per 1M tokens)",
-        title_style=f"bold {C_TEXT}",
-        box=box.SIMPLE_HEAVY,
-        border_style=C_SURFACE1,
-        header_style=f"bold {C_SUBTEXT}",
-        pad_edge=False,
-    )
-    table.add_column("Model", style=C_MAUVE)
-    table.add_column("Input", justify="right", style=C_TEAL)
-    table.add_column("Output", justify="right", style=C_TEAL)
-    table.add_column("Cache Read", justify="right", style=C_SKY)
-    table.add_column("Cache Write", justify="right", style=C_SKY)
-    table.add_column("Source", style=C_MUTED)
+    source_styles = {
+        "builtin": C_MUTED,
+        "override": C_PEACH,
+        "custom": C_GREEN,
+        "catalog": C_SKY,
+    }
 
-    all_models = get_all_pricing()
-
-    for model in sorted(all_models):
-        p = all_models[model]
-        if model in user and model in _BUILTIN_PRICING:
-            # Don't scream "override" if the value equals builtin
-            if tuple(p) == tuple(_BUILTIN_PRICING[model]):
-                source = Text("builtin", style=C_MUTED)
-            else:
-                source = Text("override", style=C_PEACH)
-        elif model in user:
-            source = Text("custom", style=C_GREEN)
-        elif model in catalog:
-            source = Text("catalog", style=C_SKY)
+    if rows:
+        if used_only and not used_fallback:
+            title = "Model Pricing — used models (USD per 1M tokens)"
+        elif used_fallback:
+            title = "Model Pricing — builtin (USD per 1M tokens)"
         else:
-            source = Text("builtin", style=C_MUTED)
-        table.add_row(
-            model,
-            f"${p[0]:.3f}",
-            f"${p[1]:.3f}",
-            f"${p[2]:.3f}",
-            f"${p[3]:.3f}",
-            source,
+            title = "Model Pricing (USD per 1M tokens)"
+        table = Table(
+            title=title,
+            title_style=f"bold {C_TEXT}",
+            box=box.SIMPLE_HEAVY,
+            border_style=C_SURFACE1,
+            header_style=f"bold {C_SUBTEXT}",
+            pad_edge=False,
         )
+        table.add_column("Model", style=C_MAUVE)
+        table.add_column("Input", justify="right", style=C_TEAL)
+        table.add_column("Output", justify="right", style=C_TEAL)
+        table.add_column("Cache Read", justify="right", style=C_SKY)
+        table.add_column("Cache Write", justify="right", style=C_SKY)
+        table.add_column("Source", style=C_MUTED)
 
-    console.print(table)
+        for row in rows:
+            p = row["prices"]
+            src = str(row["source"])
+            table.add_row(
+                str(row["model"]),
+                f"${p[0]:.3f}",
+                f"${p[1]:.3f}",
+                f"${p[2]:.3f}",
+                f"${p[3]:.3f}",
+                Text(src, style=source_styles.get(src, C_MUTED)),
+            )
 
-    lc_rows = get_long_context_rules(include_disabled=True)
+        console.print(table)
+        if used_only:
+            if used_fallback:
+                console.print(
+                    f"[{C_MUTED}]No recorded usage yet; showing builtin standard rates. "
+                    f"Pass --all for the full catalog or a query to search.[/]"
+                )
+            else:
+                console.print(
+                    f"[{C_MUTED}]Showing {len(rows)} used/configured models. "
+                    f"Pass --all for the full catalog or a query to search.[/]"
+                )
+    else:
+        console.print(f"[{C_MUTED}]No matching models found.[/]")
+
     if lc_rows:
         lc_table = Table(
             title="Long Context Pricing (USD per 1M tokens)",
@@ -1822,8 +1984,13 @@ def pricing_list(
         for rule in lc_rows:
             prefixes = ", ".join(str(p) for p in rule["prefixes"])
             prices = tuple(float(v) for v in rule["prices"])
-            source = str(rule.get("source") or "builtin")
-            source_style = C_PEACH if source == "user" else (C_RED if source == "disabled" else C_MUTED)
+            src = str(rule.get("source") or "builtin")
+            src_style = (
+                C_PEACH if src == "user"
+                else C_RED if src == "disabled"
+                else C_SKY if src == "catalog"
+                else C_MUTED
+            )
             lc_table.add_row(
                 prefixes,
                 f"{int(rule['threshold']):,}",
@@ -1831,12 +1998,11 @@ def pricing_list(
                 f"${prices[1]:.3f}",
                 f"${prices[2]:.3f}",
                 f"${prices[3]:.3f}",
-                Text(source, style=source_style),
+                Text(src, style=src_style),
             )
         console.print()
         console.print(lc_table)
 
-    cache_rows = get_user_cache_pricing()
     if cache_rows:
         cache_table = Table(
             title="Cache Duration Overrides (USD per 1M tokens)",

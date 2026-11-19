@@ -25,33 +25,24 @@ PriceTuple = tuple[float, float, float, float]
 PRICING_CATALOG_URL = "https://models.dev/api.json"
 _PRICING_CATALOG_TTL_SECONDS = 24 * 60 * 60
 _PRICING_CATALOG_RETRY_SECONDS = 60
-_CATALOG_EXCLUDED_PROVIDERS = {
-    "amazon-bedrock",
-    "azure",
-    "cloudflare-workers-ai",
-    "deepinfra",
-    "fireworks-ai",
-    "github-copilot",
-    "groq",
-    "huggingface",
-    "llmgateway",
-    "openrouter",
-    "perplexity-agent",
-    "poe",
-    "togetherai",
-}
 _CATALOG_FIRST_PARTY_PROVIDERS = {
     "alibaba",
     "anthropic",
     "cohere",
     "deepseek",
     "google",
+    "meta",
     "minimax",
     "mistral",
     "moonshot",
+    "moonshotai",
     "openai",
+    "perplexity",
+    "stepfun",
     "xai",
+    "xiaomi",
     "zai",
+    "zhipuai",
 }
 
 # (input, output, cache_read, cache_write) — USD per million tokens.
@@ -73,7 +64,9 @@ _CATALOG_FIRST_PARTY_PROVIDERS = {
 # permanent $2/$10 standard rate were rechecked on 2026-09-23. GPT-5.6 Sol
 # retains its $5/$30 regular rate; the current $4/$20 rate is promotional.
 # Gemini 3.7/3.8 Flash use their published post-introductory standard rates;
-# Grok 4.5/4.7 use xAI's standard text rates, checked on 2026-09-23.
+# Gemini 4 Neon/Carbon/Argon/Hydrogen standard list rates were verified on
+# 2026-11-19 (ignoring Carbon/Argon's $2/$10 introductory promo through
+# 2026-11-30); Grok 4.5/4.7 use xAI's standard text rates, checked on 2026-09-23.
 #   https://developers.openai.com/api/docs/pricing/
 #   https://developers.openai.com/api/docs/models/gpt-6-sol/
 #   https://developers.openai.com/api/docs/models/gpt-6-luna/
@@ -124,7 +117,7 @@ _BUILTIN_PRICING: dict[str, PriceTuple] = {
     "gpt-6-sol": (2.0, 10.0, 0.20, 2.50),
     "gpt-6-luna": (0.10, 0.50, 0.01, 0.125),
     # Ignore the current introductory/promotion price; use the standard list rate.
-    "gpt-5.6-sol": (4.0, 20.0, 0.40, 5.0),
+    "gpt-5.6-sol": (5.0, 30.0, 0.50, 6.25),
     "gpt-5.6-terra": (2.0, 12.0, 0.20, 2.50),
     "gpt-5.6-luna": (0.20, 1.20, 0.02, 0.25),
     "gpt-5.5": (5.0, 30.0, 0.50, 0.0),
@@ -150,6 +143,10 @@ _BUILTIN_PRICING: dict[str, PriceTuple] = {
     "grok-4.6": (2.0, 6.0, 0.50, 0.0),
     "grok-4.5": (2.0, 6.0, 0.30, 0.0),
     # ── Google Gemini ──
+    "gemini-4-neon": (3.00, 15.00, 0.15, 0.0),
+    "gemini-4-carbon": (4.00, 20.00, 0.20, 0.0),
+    "gemini-4-argon": (4.00, 20.00, 0.20, 0.0),
+    "gemini-4-hydrogen": (1.50, 7.50, 0.075, 0.0),
     "gemini-3.8-flash": (1.50, 7.50, 0.15, 0.0),
     "gemini-3.7-flash": (1.50, 7.50, 0.15, 0.0),
     "gemini-3.6-flash": (1.50, 7.50, 0.15, 0.0),
@@ -197,7 +194,7 @@ _NON_STANDARD_MODE_PRICING: dict[str, dict[str, PriceTuple | None]] = {
         "gpt-6-astra": (20.0, 100.0, 2.0, 25.0),
         "gpt-6-sol": (4.0, 20.0, 0.40, 5.0),
         "gpt-6-luna": (0.20, 1.0, 0.02, 0.25),
-        "gpt-5.6-sol": (8.0, 40.0, 0.8, 10.0),
+        "gpt-5.6-sol": (10.0, 60.0, 1.0, 12.5),
         "gpt-5.6-terra": (4.0, 24.0, 0.40, 5.0),
         "gpt-5.6-luna": (0.40, 2.40, 0.04, 0.50),
         "gpt-5.5": (12.5, 75.0, 1.25, 0.0),
@@ -230,7 +227,7 @@ _MODE_ALIASES: dict[str, str] = {"fast": "priority"}
 _NON_STANDARD_MODE_LONG_CONTEXT_PRICING: dict[str, dict[str, PriceTuple]] = {
     "priority": {
         "gpt-6-astra": (40.0, 150.0, 4.0, 50.0),
-        "gpt-5.6-sol": (16.0, 60.0, 1.6, 20.0),
+        "gpt-5.6-sol": (20.0, 90.0, 2.0, 25.0),
     },
     "ultrafast": {
         "gpt-6-astra": (120.0, 450.0, 12.0, 150.0),
@@ -255,7 +252,7 @@ _UNKNOWN_MODEL_PREFIXES = (
     "gpt-5-pro",
 )
 
-_PRICING_FINGERPRINT_VERSION = 21
+_PRICING_FINGERPRINT_VERSION = 22
 
 # Long-context pricing applies per request/prompt, not per stored hour/session.
 # Collectors pass single-event usage into ``estimate_cost`` before aggregating
@@ -275,7 +272,7 @@ _LONG_CONTEXT_RULES: list[dict[str, object]] = [
     },
     {
         "prefixes": ("gpt-5.6-sol",),
-        "tiers": ({"threshold": 272_000, "prices": (8.0, 30.0, 0.8, 10.0)},),
+        "tiers": ({"threshold": 272_000, "prices": (10.0, 45.0, 1.0, 12.5)},),
     },
     {
         "prefixes": ("gpt-5.6-terra",),
@@ -434,7 +431,7 @@ def _cached_model_decomposition(name: str, catalog_generation: int) -> tuple[str
         if _contains_model_tokens(tokens, candidate):
             return model, _embedded_mode(tokens, candidate, mode)
     matched: tuple[tuple[str, ...], str] | None = None
-    for group in (_catalog_model_tokens(), _SORTED_BUILTIN_MODEL_TOKENS):
+    for group in (_SORTED_BUILTIN_MODEL_TOKENS, _catalog_model_tokens()):
         for candidate, model in group:
             if _contains_model_tokens(tokens, candidate):
                 if matched is None or len(candidate) > len(matched[0]):
@@ -452,6 +449,8 @@ def _get_standard_pricing(model: str) -> PriceTuple | None:
     user = _load_user_pricing()
     if model in user:
         return user[model]
+    if model in _BUILTIN_PRICING:
+        return _BUILTIN_PRICING[model]
     catalog = _catalog_standard_pricing(model)
     if catalog is not None:
         return catalog
@@ -500,6 +499,34 @@ def _non_standard_mode_prices(
         return prices
 
 
+def _builtin_mode_pricing(
+    base_model: str,
+    mode: str,
+    total_input_tokens: int | None,
+) -> tuple[bool, PriceTuple | None]:
+    if _matches_any_model_prefix(base_model, _UNKNOWN_MODEL_PREFIXES):
+        return False, None
+    table = _NON_STANDARD_MODE_PRICING.get(mode)
+    if not table:
+        return False, None
+    for prefix, prices in sorted(
+        table.items(), key=lambda x: len(x[0]), reverse=True
+    ):
+        if _matches_model_prefix(base_model, prefix):
+            if (
+                prices is not None
+                and total_input_tokens is not None
+                and total_input_tokens > 272_000
+            ):
+                long_prices = _NON_STANDARD_MODE_LONG_CONTEXT_PRICING.get(
+                    mode, {}
+                ).get(base_model)
+                if long_prices is not None:
+                    return True, long_prices
+            return True, prices
+    return False, None
+
+
 def _compute_non_standard_mode_prices(
     model: str,
     speed_mode: str,
@@ -517,24 +544,22 @@ def _compute_non_standard_mode_prices(
         lookups.append((speed_mode, "", speed_mode))
     if tier_mode not in _STANDARD_MODES:
         lookups.append((_MODE_ALIASES.get(tier_mode, tier_mode), tier_mode, ""))
+    catalog_only = (
+        base_model not in _BUILTIN_PRICING
+        and _catalog_standard_pricing(base_model) is not None
+    )
     for mode, tier, speed in lookups:
+        if catalog_only:
+            catalog = _catalog_mode_pricing(base_model, tier, speed, total_input_tokens)
+            if catalog is not None:
+                return catalog
+            continue
+        matched, builtin = _builtin_mode_pricing(base_model, mode, total_input_tokens)
+        if matched:
+            return builtin
         catalog = _catalog_mode_pricing(base_model, tier, speed, total_input_tokens)
         if catalog is not None:
             return catalog
-        if _matches_any_model_prefix(base_model, _UNKNOWN_MODEL_PREFIXES):
-            continue
-        table = _NON_STANDARD_MODE_PRICING.get(mode)
-        if not table:
-            continue
-        for prefix, prices in sorted(
-            table.items(), key=lambda x: len(x[0]), reverse=True
-        ):
-            if _matches_model_prefix(base_model, prefix):
-                if prices is not None and total_input_tokens is not None and total_input_tokens > 272_000:
-                    long_prices = _NON_STANDARD_MODE_LONG_CONTEXT_PRICING.get(mode, {}).get(base_model)
-                    if long_prices is not None:
-                        return long_prices
-                return prices
 
     return None
 
@@ -700,6 +725,8 @@ def _normalize_catalog_payload(data: object) -> dict[str, object]:
         if not isinstance(provider_data, dict):
             continue
         provider_name = str(provider).strip().lower()
+        if provider_name not in _CATALOG_FIRST_PARTY_PROVIDERS:
+            continue
         raw_models = provider_data.get("models")
         if not isinstance(raw_models, dict):
             continue
@@ -711,7 +738,11 @@ def _normalize_catalog_payload(data: object) -> dict[str, object]:
                 canonical_provider = canonical.split("/", 1)[0].lower()
                 if canonical_provider != provider_name:
                     continue
-            elif provider_name in _CATALOG_EXCLUDED_PROVIDERS:
+            modalities = raw_model.get("modalities")
+            output_modalities = (
+                modalities.get("output") if isinstance(modalities, dict) else None
+            )
+            if isinstance(output_modalities, list) and "text" not in output_modalities:
                 continue
             record = _catalog_record(raw_model, provider_name)
             if record is None:
@@ -721,13 +752,7 @@ def _normalize_catalog_payload(data: object) -> dict[str, object]:
             for alias in aliases:
                 if not alias:
                     continue
-                existing = models.get(alias)
-                if existing is None or (
-                    provider_name in _CATALOG_FIRST_PARTY_PROVIDERS
-                    and str(existing.get("provider") or "")
-                    not in _CATALOG_FIRST_PARTY_PROVIDERS
-                ):
-                    models[alias] = record
+                models.setdefault(alias, record)
     if not models:
         raise ValueError("pricing catalog contains no usable token prices")
     return {
@@ -1303,7 +1328,7 @@ def normalize_model(name: str) -> str:
 
 
 def get_pricing(model: str) -> tuple[float, float, float, float] | None:
-    """Look up pricing: user overrides, catalog, then builtin fallback.
+    """Look up pricing: user overrides, builtin standard rates, then catalog fallback.
 
     Prefix matching is done longest-prefix-first to ensure ``gpt-5.4-mini``
     matches its own entry before falling back to ``gpt-5.4``. Results are
@@ -1395,6 +1420,8 @@ def get_long_context_rules(
             row["prices"] = tuple(float(v) for v in tier["prices"])
             rules.append(row)
     for model, record in _catalog_models().items():
+        if model in _BUILTIN_PRICING:
+            continue
         aliases = record.get("aliases") if isinstance(record, dict) else None
         tiers = record.get("long_context") if isinstance(record, dict) else None
         if not isinstance(aliases, list) or not aliases or aliases[0] != model:
@@ -1496,7 +1523,7 @@ def _long_context_prices(
             if matched is not None:
                 return matched
 
-    if _catalog_record_for_model(model) is not None:
+    if model not in _BUILTIN_PRICING and _catalog_record_for_model(model) is not None:
         return _catalog_long_context_pricing(model, total_input_tokens)
     if unknown:
         return None
@@ -1528,9 +1555,9 @@ def get_catalog_pricing() -> dict[str, PriceTuple]:
 
 
 def get_all_pricing() -> dict[str, tuple[float, float, float, float]]:
-    """Return catalog and builtin pricing overridden by user values."""
-    merged = dict(_BUILTIN_PRICING)
-    merged.update(get_catalog_pricing())
+    """Return catalog pricing overridden by builtin standard rates and user values."""
+    merged = dict(get_catalog_pricing())
+    merged.update(_BUILTIN_PRICING)
     merged.update(_load_user_pricing())
     return merged
 
@@ -1571,8 +1598,6 @@ def _pricing_source(model: str, base_model: str, premium_mode: str) -> str:
             return "custom"
         return "builtin" if tuple(user[key]) == tuple(builtin) else "override"
     if premium_mode:
-        if _catalog_mode_pricing(base_model, premium_mode, premium_mode) is not None:
-            return "catalog"
         tables = (
             _NON_STANDARD_MODE_PRICING.get(premium_mode) or {},
             _NON_STANDARD_MODE_PRICING.get(
@@ -1584,7 +1609,13 @@ def _pricing_source(model: str, base_model: str, premium_mode: str) -> str:
             for table in tables
             for prefix in table
         )
+        if base_model in _BUILTIN_PRICING:
+            return "builtin" if builtin_mode else "catalog"
+        if _catalog_mode_pricing(base_model, premium_mode, premium_mode) is not None:
+            return "catalog"
         return "builtin" if builtin_mode else "catalog"
+    if base_model in _BUILTIN_PRICING:
+        return "builtin"
     if _catalog_standard_pricing(base_model) is not None:
         return "catalog"
     tokens = _model_tokens(base_model)
@@ -1606,12 +1637,15 @@ def long_context_rule_applies(rule: dict[str, object], models: Iterable[str]) ->
     prefixes = tuple(str(p) for p in rule["prefixes"])
     source = rule.get("source")
     if source == "catalog":
-        return any(model == prefixes[0] for model in models)
+        return any(
+            model == prefixes[0] and model not in _BUILTIN_PRICING
+            for model in models
+        )
     if source != "user":
         models = [
             model for model in models
             if not _matches_any_model_prefix(model, _UNKNOWN_MODEL_PREFIXES)
-            and _catalog_record_for_model(model) is None
+            and (model in _BUILTIN_PRICING or _catalog_record_for_model(model) is None)
         ]
     excluded = tuple(str(p) for p in rule.get("excluded_prefixes", ()))
     return any(

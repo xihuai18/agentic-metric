@@ -1063,7 +1063,13 @@ def test_unknown_model_cost_stays_null_and_surfaces_as_unknown(tmp_path):
 
     pricing._user_cache = None
     pricing._user_cache_mtime = -1.0
-    with patch("agentic_metric.pricing.PRICING_FILE", tmp_path / "pricing.json"):
+    pricing._catalog_cache = None
+    pricing._catalog_cache_mtime = -1.0
+    pricing._reset_derived_caches()
+    with (
+        patch("agentic_metric.pricing.PRICING_FILE", tmp_path / "pricing.json"),
+        patch("agentic_metric.pricing.PRICING_CATALOG_FILE", tmp_path / "catalog.json"),
+    ):
         db = _make_db()
         db.upsert_session(
             "s_unknown",
@@ -2220,10 +2226,16 @@ def test_pricing_screen_lists_only_observed_models(tmp_path, monkeypatch):
     import agentic_metric.pricing as pricing
 
     catalog = tmp_path / "catalog.json"
-    catalog.write_text(json.dumps({"models": {"gpt-6-astra": {
-        "aliases": ["gpt-6-astra"], "prices": [10, 50, 1, 12.5],
-        "long_context": [{"threshold": 272000, "prices": [20, 75, 2, 25]}],
-    }}}))
+    catalog.write_text(json.dumps({"models": {
+        "gpt-6-astra": {
+            "aliases": ["gpt-6-astra"], "prices": [10, 50, 1, 12.5],
+            "long_context": [{"threshold": 272000, "prices": [20, 75, 2, 25]}],
+        },
+        "gpt-6.2-astra": {
+            "aliases": ["gpt-6.2-astra"], "prices": [8, 40, 0.4, 10],
+            "long_context": [{"threshold": 272000, "prices": [16, 60, 0.8, 20]}],
+        },
+    }}))
     monkeypatch.setattr(pricing, "PRICING_FILE", tmp_path / "pricing.json")
     monkeypatch.setattr(pricing, "PRICING_CATALOG_FILE", catalog)
     pricing._user_cache = pricing._catalog_cache = None
@@ -2232,7 +2244,13 @@ def test_pricing_screen_lists_only_observed_models(tmp_path, monkeypatch):
     _C(file=buf, width=120, no_color=True).print(
         PricingScreen(
             ["cursor/default"],
-            ["codex/gpt-6-astra", "codex/gpt-6-astra[fast]", "cursor/default", "<synthetic>"],
+            [
+                "codex/gpt-6-astra",
+                "codex/gpt-6-astra[fast]",
+                "codex/gpt-6.2-astra",
+                "cursor/default",
+                "<synthetic>",
+            ],
         )._build_content()
     )
     text = buf.getvalue()
@@ -2241,11 +2259,14 @@ def test_pricing_screen_lists_only_observed_models(tmp_path, monkeypatch):
         if line.strip().startswith("gpt-") and "$" in line
     ]
     assert "gpt-6-astra" in model_rows
+    assert "gpt-6.2-astra" in model_rows
     assert any("gpt-6-astra (fast)" in line for line in text.splitlines())
     assert "claude-opus-5" not in text
     assert "<synthetic>" not in text
     lc_lines = [line for line in text.splitlines() if "272,000" in line]
-    assert len(lc_lines) == 1 and "catalog" in lc_lines[0]
+    assert len(lc_lines) == 2
+    assert any("gpt-6-astra" in line and "builtin" in line for line in lc_lines)
+    assert any("gpt-6.2-astra" in line and "catalog" in line for line in lc_lines)
 
 
 def test_pricing_screen_update_refreshes_catalog_and_resyncs(tmp_path, monkeypatch):

@@ -3345,7 +3345,13 @@ def test_codex_unknown_model_event_cost_stays_unknown(tmp_path):
 
     pricing._user_cache = None
     pricing._user_cache_mtime = -1.0
-    with patch("agentic_metric.pricing.PRICING_FILE", tmp_path / "pricing.json"):
+    pricing._catalog_cache = None
+    pricing._catalog_cache_mtime = -1.0
+    pricing._reset_derived_caches()
+    with (
+        patch("agentic_metric.pricing.PRICING_FILE", tmp_path / "pricing.json"),
+        patch("agentic_metric.pricing.PRICING_CATALOG_FILE", tmp_path / "catalog.json"),
+    ):
         accum = CodexSessionAccum(Path("/tmp/fake.jsonl"), project_path="/test")
         accum._process_entry({
             "timestamp": "2026-04-24T09:59:59Z",

@@ -108,20 +108,24 @@ breakdown, top projects, and optional extra drill-down tables.
 
 ### Pricing Management
 
-Model pricing is used for cost estimation. A local catalog from models.dev is
-refreshed daily during normal sync/report/TUI startup, while builtin pricing is
-kept as an offline fallback. You can add new models, override catalog or builtin
-prices, configure long-context rates, and configure observable cache-duration
-rates via CLI. The catalog snapshot is stored in `$DATA/agentic_metric/pricing-catalog.json`;
-manual overrides are stored in `$DATA/agentic_metric/pricing.json`.
-User overrides take precedence, followed by the cached catalog and then builtin
-fallbacks. A catalog model's own context tiers and premium modes are used when
-present; refreshed standard rates are not mixed with stale builtin context tiers.
-Explicit `service_tier` markers and model-name mode suffixes use the same rates.
-The TUI shows cached data before checking for pricing updates in the background.
-Failed automatic checks retry after 60 seconds; manual updates bypass this delay.
-Changes to unused catalog models preserve parsing checkpoints. Effective pricing
-changes for stored models still trigger repricing and safe checkpoint invalidation.
+Model pricing is used for cost estimation at official standard list rates
+(ignoring introductory, promotional, and reseller discounts). Builtin standard
+rates are verified against official provider docs, while a local first-party
+catalog from models.dev is refreshed daily during normal sync/report/TUI startup
+to cover newer models automatically. You can add new models, override builtin or
+catalog prices, configure long-context rates, and configure observable
+cache-duration rates via CLI. The catalog snapshot is stored in
+`$DATA/agentic_metric/pricing-catalog.json`; manual overrides are stored in
+`$DATA/agentic_metric/pricing.json`. User overrides take precedence, followed by
+builtin standard rates and then the cached first-party catalog for models not in
+the builtin table. A catalog model's own context tiers and premium modes are used
+when present; catalog rates are not mixed with another model's builtin context
+tiers. Explicit `service_tier` markers and model-name mode suffixes use the same
+rates. The TUI shows cached data before checking for pricing updates in the
+background. Failed automatic checks retry after 60 seconds; manual updates bypass
+this delay. Changes to unused catalog models preserve parsing checkpoints.
+Effective pricing changes for stored models still trigger repricing and safe
+checkpoint invalidation.
 
 #### Account equivalents and manual payments
 
@@ -185,7 +189,10 @@ applied to the API-equivalent cost calculation.
 
 ```bash
 agentic-metric pricing update                                              # Refresh the models.dev catalog now
-agentic-metric pricing list                                                # List all model pricing
+agentic-metric pricing list                                                # List pricing for used/configured models
+agentic-metric pricing list --all                                          # List full builtin + catalog pricing
+agentic-metric pricing list gemini                                         # Filter models by name substring
+agentic-metric pricing list --source user                                  # Filter by source (builtin/catalog/user)
 agentic-metric pricing set deepseek-r2 -i 0.5 -o 2.0                       # Add a new model
 agentic-metric pricing set claude-opus-4-7 -i 4.0 -o 20.0 -cr 0.4 -cw 5.0  # Override builtin
 agentic-metric pricing reset deepseek-r2                                   # Reset one model to builtin
@@ -301,7 +308,7 @@ The table uses regular published rates, excluding time-limited promotions.
 | gpt-6-astra | $10.00 | $50.00 | $1.00 | $12.50 |
 | gpt-6-sol | $2.00 | $10.00 | $0.20 | $2.50 |
 | gpt-6-luna | $0.10 | $0.50 | $0.01 | $0.125 |
-| gpt-5.6-sol | $4.00 | $20.00 | $0.40 | $5.00 |
+| gpt-5.6-sol | $5.00 | $30.00 | $0.50 | $6.25 |
 | gpt-5.6-terra | $2.00 | $12.00 | $0.20 | $2.50 |
 | gpt-5.6-luna | $0.20 | $1.20 | $0.02 | $0.25 |
 | gpt-5.5 | $5.00 | $30.00 | $0.50 | — |
@@ -333,6 +340,9 @@ The table uses regular published rates, excluding time-limited promotions.
 | Model | Input | Output | Cache Read | Cache Write |
 |-------|------:|-------:|-----------:|------------:|
 <!-- pricing:gemini:start -->
+| gemini-4-neon | $3.00 | $15.00 | $0.15 | — |
+| gemini-4-carbon / gemini-4-argon | $4.00 | $20.00 | $0.20 | — |
+| gemini-4-hydrogen | $1.50 | $7.50 | $0.075 | — |
 | gemini-3.8-flash / gemini-3.7-flash / gemini-3.6-flash | $1.50 | $7.50 | $0.15 | — |
 | gemini-3.5-flash | $1.50 | $9.00 | $0.15 | — |
 | gemini-3.1-pro / gemini-3-pro | $2.00 | $12.00 | $0.20 | — |

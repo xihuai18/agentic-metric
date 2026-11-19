@@ -228,8 +228,8 @@ def test_no_family_fallback_gpt5():
 
 def test_gpt_56_family_pricing(tmp_path):
     with _patch_empty_user_pricing(tmp_path):
-        assert get_pricing("gpt-5.6") == (4.0, 20.0, 0.40, 5.0)
-        assert get_pricing("gpt-5.6-sol") == (4.0, 20.0, 0.40, 5.0)
+        assert get_pricing("gpt-5.6") == (5.0, 30.0, 0.50, 6.25)
+        assert get_pricing("gpt-5.6-sol") == (5.0, 30.0, 0.50, 6.25)
         assert get_pricing("gpt-5.6-terra") == (2.0, 12.0, 0.20, 2.50)
         assert get_pricing("gpt-5.6-luna") == (0.20, 1.20, 0.02, 0.25)
 
@@ -348,8 +348,8 @@ def test_gpt_55_long_context_uses_long_context_rate(tmp_path):
 @pytest.mark.parametrize(
     ("model", "prices"),
     [
-        ("gpt-5.6", (8.0, 30.0, 0.8, 10.0)),
-        ("gpt-5.6-sol", (8.0, 30.0, 0.8, 10.0)),
+        ("gpt-5.6", (10.0, 45.0, 1.0, 12.5)),
+        ("gpt-5.6-sol", (10.0, 45.0, 1.0, 12.5)),
         ("gpt-5.6-terra", (4.0, 18.0, 0.40, 5.0)),
         ("gpt-5.6-luna", (0.40, 1.80, 0.04, 0.50)),
     ],
@@ -421,7 +421,7 @@ def test_openai_priority_tier_uses_official_priority_prices(tmp_path):
             service_tier="priority",
             apply_long_context=False,
         )
-        assert abs(cost - (8.0 + 40.0 + 0.8 + 10.0)) < 1e-9
+        assert abs(cost - (10.0 + 60.0 + 1.0 + 12.5)) < 1e-9
 
         standard = estimate_cost(
             "gpt-5.6-sol",
@@ -430,7 +430,7 @@ def test_openai_priority_tier_uses_official_priority_prices(tmp_path):
             service_tier="default",
             apply_long_context=False,
         )
-        assert abs(standard - (4.0 + 20.0)) < 1e-9
+        assert abs(standard - (5.0 + 30.0)) < 1e-9
     _reset_cache()
 
 
@@ -442,7 +442,7 @@ def test_priority_tier_uses_its_own_long_context_prices(tmp_path):
             output_tokens=1_000,
             service_tier="priority",
         )
-        expected = (300_000 * 16.0 + 1_000 * 60.0) / 1_000_000
+        expected = (300_000 * 20.0 + 1_000 * 90.0) / 1_000_000
         assert abs(cost - expected) < 1e-9
     _reset_cache()
 
@@ -507,7 +507,7 @@ def test_anthropic_speed_fast_does_not_bill_gpt_priority(tmp_path):
             speed="fast",
             apply_long_context=False,
         )
-        assert abs(cost - (4.0 + 20.0)) < 1e-9
+        assert abs(cost - (5.0 + 30.0)) < 1e-9
     _reset_cache()
 
 
@@ -751,7 +751,7 @@ def test_wrapped_model_decomposition(tmp_path):
         assert get_pricing("cursor/claude-4.6-opus") == (5.0, 25.0, 0.50, 6.25)
         assert get_pricing("cursor/claude-opus-5-medium") == (5.0, 25.0, 0.50, 6.25)
         assert get_pricing("cursor/gemini-3-flash-high") == (0.50, 3.00, 0.05, 0.0)
-        assert get_pricing("openrouter/openai/gpt-5.6-sol") == (4.0, 20.0, 0.40, 5.0)
+        assert get_pricing("openrouter/openai/gpt-5.6-sol") == (5.0, 30.0, 0.50, 6.25)
         assert get_pricing("my-proxy/gemini-3.8-flash") == (1.50, 7.50, 0.15, 0.0)
 
         # Bedrock prefix and version suffix
@@ -770,8 +770,8 @@ def test_wrapped_model_decomposition(tmp_path):
         assert get_pricing("anthropic/claude-opus-5") == (5.0, 25.0, 0.50, 6.25)
 
         # Fast mode markers on wrapped models
-        assert get_pricing("codex/gpt-5.6-sol[fast]") == (8.0, 40.0, 0.8, 10.0)
-        assert get_pricing("cursor/gpt-5.6-sol-high-fast") == (8.0, 40.0, 0.8, 10.0)
+        assert get_pricing("codex/gpt-5.6-sol[fast]") == (10.0, 60.0, 1.0, 12.5)
+        assert get_pricing("cursor/gpt-5.6-sol-high-fast") == (10.0, 60.0, 1.0, 12.5)
         assert get_pricing("cursor/gpt-5.6-terra-high-fast") == (4.0, 24.0, 0.40, 5.0)
 
         # Non-supported / unknown models remain None
@@ -798,10 +798,10 @@ def test_model_name_normalization_ignores_case_and_separators(tmp_path):
         assert get_pricing("cursor/cursor_grok_4_6_xhigh_fast") == grok
         assert get_pricing("cursor.cursor-grok-4.6-high") == grok
         assert get_pricing("grok-4.6:latest") == grok
-        assert get_pricing("openrouter.openai/GPT_5_6_SOL") == (4.0, 20.0, 0.4, 5.0)
-        assert get_pricing("gpt.5.6.sol") == (4.0, 20.0, 0.4, 5.0)
+        assert get_pricing("openrouter.openai/GPT_5_6_SOL") == (5.0, 30.0, 0.5, 6.25)
+        assert get_pricing("gpt.5.6.sol") == (5.0, 30.0, 0.5, 6.25)
         assert get_pricing("cursor/GPT_6_MAX") == (10.0, 50.0, 1.0, 12.5)
-        assert get_pricing("codex/gpt_5_6_sol_fast_20260912") == (8.0, 40.0, 0.8, 10.0)
+        assert get_pricing("codex/gpt_5_6_sol_fast_20260912") == (10.0, 60.0, 1.0, 12.5)
 
 
 def test_model_name_normalization_respects_token_boundaries(tmp_path):
@@ -1144,51 +1144,215 @@ def test_explicit_mode_matches_model_suffix_at_context_boundaries(tmp_path, mode
         ) == estimate_cost(f"gpt-6-astra-{mode}", input_tokens=tokens)
 
 
-def test_partial_catalog_does_not_shadow_more_specific_builtin_model(tmp_path):
+def test_partial_catalog_does_not_shadow_builtin_models(tmp_path):
     import agentic_metric.pricing as p
 
     with _patch_empty_user_pricing(tmp_path):
         p.PRICING_CATALOG_FILE.write_text(json.dumps({"models": {
             "gpt-5.4": {"prices": [99, 99, 99, 0]},
+            "gpt-5-nano": {"prices": [0.05, 0.4, 0.005, 0]},
         }}))
         assert get_pricing("codex/gpt-5.4-mini") == (0.75, 4.5, 0.075, 0)
-        assert get_pricing("gpt-5.4") == (99, 99, 99, 0)
+        assert get_pricing("gpt-5.4") == (2.5, 15.0, 0.25, 0)
+        assert get_pricing("codex/gpt-5-nano") == (0.05, 0.4, 0.005, 0)
 
 
-def test_catalog_replaces_builtin_rates_and_tiers_but_not_user_overrides(tmp_path):
+def test_builtin_standard_rates_beat_catalog_promos_while_catalog_covers_new_models(tmp_path):
     import agentic_metric.pricing as p
 
-    catalog = p._normalize_catalog_payload({"openai": {"models": {
-        "gpt-6-astra": {
-            "id": "gpt-6-astra",
-            "cost": {"input": 3, "output": 9, "cache_read": 0.3, "cache_write": 0},
-            "experimental": {"modes": {"fast": {
-                "cost": {"input": 6, "output": 18, "cache_read": 0.6, "cache_write": 0,
-                         "tiers": [{"tier": {"type": "context", "size": 100},
-                                    "input": 12, "output": 27, "cache_read": 1.2, "cache_write": 0}]},
-                "provider": {"body": {"service_tier": "priority"}},
-            }}},
-        },
-        "gpt-6-astra-special": {
-            "id": "gpt-6-astra-special",
-            "cost": {"input": 7, "output": 21, "cache_read": 0.7, "cache_write": 0},
-        },
-    }}})
+    catalog = p._normalize_catalog_payload({
+        "openai": {"models": {
+            "gpt-6-astra": {
+                "id": "gpt-6-astra",
+                "cost": {"input": 3, "output": 9, "cache_read": 0.3, "cache_write": 0},
+                "experimental": {"modes": {"fast": {
+                    "cost": {"input": 6, "output": 18, "cache_read": 0.6, "cache_write": 0,
+                             "tiers": [{"tier": {"type": "context", "size": 100},
+                                        "input": 12, "output": 27, "cache_read": 1.2, "cache_write": 0}]},
+                    "provider": {"body": {"service_tier": "priority"}},
+                }}},
+            },
+            "gpt-6-astra-special": {
+                "id": "gpt-6-astra-special",
+                "cost": {
+                    "input": 7, "output": 21, "cache_read": 0.7, "cache_write": 0,
+                    "tiers": [{"tier": {"type": "context", "size": 100},
+                               "input": 14, "output": 30, "cache_read": 1.4, "cache_write": 0}],
+                },
+                "experimental": {"modes": {"fast": {
+                    "cost": {"input": 14, "output": 42, "cache_read": 1.4, "cache_write": 0,
+                             "tiers": [{"tier": {"type": "context", "size": 100},
+                                        "input": 28, "output": 60, "cache_read": 2.8, "cache_write": 0}]},
+                    "provider": {"body": {"service_tier": "priority"}},
+                }}},
+            },
+        }},
+        "google": {"models": {
+            "gemini-3.8-flash": {
+                "id": "gemini-3.8-flash",
+                "cost": {"input": 0.75, "output": 3.75, "cache_read": 0.075},
+            },
+            "gemini-4-argon": {
+                "id": "gemini-4-argon",
+                "cost": {"input": 2.0, "output": 10.0, "cache_read": 0.1},
+            },
+            "gemini-4-carbon": {
+                "id": "gemini-4-carbon",
+                "cost": {"input": 2.0, "output": 10.0, "cache_read": 0.1},
+            },
+        }},
+    })
     with _patch_empty_user_pricing(tmp_path):
         p.PRICING_CATALOG_FILE.write_text(json.dumps(catalog))
-        assert get_pricing("gpt-6-astra") == (3, 9, 0.3, 0)
+        # Builtin standard list rates beat catalog promotional rates.
+        assert get_pricing("gpt-6-astra") == (10.0, 50.0, 1.0, 12.5)
         assert get_all_pricing()["gpt-6-astra"] == get_pricing("gpt-6-astra")
-        assert p.get_observed_model_pricing(["gpt-6-astra"])[0]["source"] == "catalog"
-        assert estimate_cost("gpt-6-astra", input_tokens=300_000) == 0.9
+        assert p.get_observed_model_pricing(["gpt-6-astra"])[0]["source"] == "builtin"
+        assert estimate_cost("gpt-6-astra", input_tokens=300_000) == 6.0
+        assert get_pricing("codex/gpt-6-astra[fast]") == (20.0, 100.0, 2.0, 25.0)
+        assert p.get_observed_model_pricing(["codex/gpt-6-astra[fast]"])[0]["source"] == "builtin"
+        assert get_pricing("gemini-3.8-flash") == (1.50, 7.50, 0.15, 0.0)
+        assert get_pricing("gemini-4-argon") == (4.0, 20.0, 0.20, 0.0)
+        assert get_pricing("gemini-4-carbon") == (4.0, 20.0, 0.20, 0.0)
+        assert get_pricing("gemini-4-hydrogen") == (1.50, 7.50, 0.075, 0.0)
+        assert get_pricing("gemini-4-neon") == (3.00, 15.00, 0.15, 0.0)
+
+        # Models absent from builtin fall back to the first-party catalog, including modes & tiers.
         assert get_pricing("codex/gpt-6-astra-special") == (7, 21, 0.7, 0)
-        assert get_pricing("codex/gpt-6-astra[fast]") == (6, 18, 0.6, 0)
-        assert p.get_observed_model_pricing(["codex/gpt-6-astra[fast]"])[0]["source"] == "catalog"
-        assert estimate_cost("gpt-6-astra", input_tokens=100, service_tier="fast") == 0.0006
-        assert estimate_cost("gpt-6-astra", input_tokens=101, service_tier="fast") == 0.001212
-        assert estimate_cost("gpt-6-astra-fast", input_tokens=101) == 0.001212
+        assert p.get_observed_model_pricing(["codex/gpt-6-astra-special"])[0]["source"] == "catalog"
+        assert estimate_cost("gpt-6-astra-special", input_tokens=101) == 101 * 14 / 1_000_000
+        assert get_pricing("codex/gpt-6-astra-special[fast]") == (14, 42, 1.4, 0)
+        assert p.get_observed_model_pricing(["codex/gpt-6-astra-special[fast]"])[0]["source"] == "catalog"
+        assert estimate_cost("gpt-6-astra-special", input_tokens=100, service_tier="fast") == 100 * 14 / 1_000_000
+        assert estimate_cost("gpt-6-astra-special", input_tokens=101, service_tier="fast") == 101 * 28 / 1_000_000
+
+        # User overrides still beat both builtin and catalog.
         set_user_pricing("gpt-6-astra", 2, 4, 0.2, 0)
         assert get_pricing("gpt-6-astra") == (2, 4, 0.2, 0)
         assert get_pricing("gpt-6-astra-fast") == (2, 4, 0.2, 0)
+
+
+def test_catalog_normalization_keeps_only_first_party_text_models():
+    import agentic_metric.pricing as p
+
+    catalog = p._normalize_catalog_payload({
+        "openai": {"models": {
+            "gpt-6.2-sol": {
+                "id": "gpt-6.2-sol",
+                "canonical_model_id": "openai/gpt-6.2-sol",
+                "modalities": {"input": ["text"], "output": ["text"]},
+                "cost": {"input": 2, "output": 10, "cache_read": 0.1, "cache_write": 2.5},
+            },
+        }},
+        "google": {"models": {
+            "gemini-3.1-flash-tts-preview": {
+                "id": "gemini-3.1-flash-tts-preview",
+                "modalities": {"input": ["text"], "output": ["audio"]},
+                "cost": {"input": 1, "output": 20},
+            },
+        }},
+        "meta": {"models": {
+            "muse-wonder-1.0": {
+                "id": "muse-wonder-1.0",
+                "canonical_model_id": "meta/muse-wonder-1.0",
+                "cost": {"input": 4, "output": 20, "cache_read": 0.2},
+            },
+        }},
+        "nano-gpt": {"models": {
+            "reseller-discount-model": {
+                "id": "reseller-discount-model",
+                "cost": {"input": 0.1, "output": 0.2},
+            },
+        }},
+        "kilo": {"models": {
+            "free-gateway-model": {
+                "id": "free-gateway-model",
+                "cost": {"input": 0, "output": 0},
+            },
+        }},
+        "llmgateway-providers": {"models": {
+            "gateway-model": {
+                "id": "gateway-model",
+                "cost": {"input": 1, "output": 2},
+            },
+        }},
+    })
+    models = catalog["models"]
+    assert "gpt-6.2-sol" in models
+    assert "muse-wonder-1.0" in models
+    assert "gemini-3.1-flash-tts-preview" not in models
+    assert "reseller-discount-model" not in models
+    assert "free-gateway-model" not in models
+    assert "gateway-model" not in models
+
+
+def test_cli_pricing_list_defaults_to_used_and_supports_filters(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+    from agentic_metric import cli, config
+    from agentic_metric.store.database import Database
+
+    db_path = tmp_path / "data.db"
+    monkeypatch.setattr(config, "DB_PATH", db_path)
+    _write_catalog(
+        tmp_path,
+        {
+            "gpt-6.2-sol": {
+                "aliases": ["gpt-6.2-sol"],
+                "prices": [2.0, 10.0, 0.1, 2.5],
+                "long_context": [{"threshold": 272000, "prices": [4.0, 15.0, 0.2, 5.0]}],
+            },
+            "unused-catalog-model": {
+                "aliases": ["unused-catalog-model"],
+                "prices": [1.0, 2.0, 0.1, 0.0],
+            },
+        },
+    )
+    runner = CliRunner()
+
+    # Empty DB falls back to builtin standard pricing (without flooding catalog rows).
+    res_empty = runner.invoke(cli.app, ["pricing", "list", "--json"])
+    assert res_empty.exit_code == 0, res_empty.output
+    empty_data = json.loads(res_empty.output)
+    assert "claude-opus-5" in empty_data["models"]
+    assert "unused-catalog-model" not in empty_data["models"]
+
+    # Seed recorded usage + a user custom model not yet used.
+    db = Database(db_path=str(db_path))
+    db.upsert_session("s1", "codex", model="codex/gpt-6.2-sol", input_tokens=100)
+    db.upsert_session("s2", "claude_code", model="claude-opus-5", input_tokens=100)
+    db.commit()
+    db.close()
+    set_user_pricing("my-custom-model", 1.2, 3.4)
+
+    # Default shows only recorded used models + user-configured overrides.
+    res_used = runner.invoke(cli.app, ["pricing", "list", "--json"])
+    assert res_used.exit_code == 0, res_used.output
+    used_data = json.loads(res_used.output)
+    assert set(used_data["models"]) == {"claude-opus-5", "gpt-6.2-sol", "my-custom-model"}
+    assert used_data["models"]["claude-opus-5"]["source"] == "builtin"
+    assert used_data["models"]["gpt-6.2-sol"]["source"] == "catalog"
+    assert used_data["models"]["my-custom-model"]["source"] == "custom"
+    assert [r["prefixes"] for r in used_data["long_context"]] == [["gpt-6.2-sol"]]
+
+    # --all includes unused catalog and builtin models.
+    res_all = runner.invoke(cli.app, ["pricing", "list", "--all", "--json"])
+    assert res_all.exit_code == 0
+    all_data = json.loads(res_all.output)
+    assert "unused-catalog-model" in all_data["models"]
+    assert "claude-haiku-4-5" in all_data["models"]
+
+    # Positional substring query searches across all models.
+    res_query = runner.invoke(cli.app, ["pricing", "list", "unused-catalog", "--json"])
+    assert res_query.exit_code == 0
+    assert list(json.loads(res_query.output)["models"]) == ["unused-catalog-model"]
+
+    # --source filters by source cleanly.
+    res_user = runner.invoke(cli.app, ["pricing", "list", "--source", "user", "--json"])
+    assert res_user.exit_code == 0
+    assert list(json.loads(res_user.output)["models"]) == ["my-custom-model"]
+
+    res_bad = runner.invoke(cli.app, ["pricing", "list", "--source", "bogus"])
+    assert res_bad.exit_code == 1
 
 
 def test_catalog_imports_modes_and_long_context(tmp_path):

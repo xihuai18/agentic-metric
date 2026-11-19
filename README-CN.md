@@ -102,7 +102,7 @@ TUI 优先显示缓存数据。按 **q** 会取消尚未完成的后台工作并
 
 ### 定价管理
 
-模型定价用于成本估算。正常 sync/report/TUI 启动时会每天从 models.dev 刷新本地聚合目录,内置定价作为离线兜底。TUI 先显示缓存数据，再在后台检查定价更新；自动刷新失败后至少等待 60 秒再重试，手动更新不受限制。未使用模型的聚合目录变更不会使历史解析检查点失效；影响已用模型费率的变更仍会重新计算成本。你可以通过 CLI 添加新模型、覆盖聚合或内置价格、配置长上下文费率和缓存时长费率。本地聚合快照存储在 `$DATA/agentic_metric/pricing-catalog.json`,手动覆盖存储在 `$DATA/agentic_metric/pricing.json`。
+模型定价按官方标准挂牌价估算成本（忽略首发促销、限时折扣和第三方渠道价）。内置定价为人工核对的官方标准价，正常 sync/report/TUI 启动时会每天从 models.dev 刷新一方厂商聚合目录，用来自动补齐内置表之外的新模型。优先级为：用户手动覆盖 > 内置标准价 > models.dev 一方目录兜底。TUI 先显示缓存数据，再在后台检查定价更新；自动刷新失败后至少等待 60 秒再重试，手动更新不受限制。未使用模型的聚合目录变更不会使历史解析检查点失效；影响已用模型费率的变更仍会重新计算成本。你可以通过 CLI 添加新模型、覆盖内置或聚合价格、配置长上下文费率和缓存时长费率。本地聚合快照存储在 `$DATA/agentic_metric/pricing-catalog.json`，手动覆盖存储在 `$DATA/agentic_metric/pricing.json`。
 
 按账号统计 API 等价用量，并保留独立的手工付款账本：在 TUI 按 **a**，或运行 `agentic-metric accounts report`。WCC Codex 的逐请求账号指纹会自动归属；兼容日志也可提供明确的 Claude 账号指纹。原生 CC 日志缺少可靠的历史账号标记，工具不会读取 OAuth 凭据或把当前登录账号套到历史记录上。
 
@@ -112,7 +112,10 @@ TUI 优先显示缓存数据。按 **q** 会取消尚未完成的后台工作并
 
 ```bash
 agentic-metric pricing update                                              # 立即刷新 models.dev 聚合目录
-agentic-metric pricing list                                                # 查看所有模型定价
+agentic-metric pricing list                                                # 查看已用过及手动配置的模型定价
+agentic-metric pricing list --all                                          # 查看完整内置 + 聚合目录定价
+agentic-metric pricing list gemini                                         # 按模型名子串过滤
+agentic-metric pricing list --source user                                  # 按来源过滤（builtin/catalog/user）
 agentic-metric pricing set deepseek-r2 -i 0.5 -o 2.0                       # 添加新模型
 agentic-metric pricing set claude-opus-4-7 -i 4.0 -o 20.0 -cr 0.4 -cw 5.0  # 覆盖内置定价
 agentic-metric pricing reset deepseek-r2                                   # 恢复单个模型为内置默认
@@ -209,7 +212,7 @@ agentic-metric pricing cache reset claude-sonnet-4                # 删除覆盖
 | gpt-6-astra | $10.00 | $50.00 | $1.00 | $12.50 |
 | gpt-6-sol | $2.00 | $10.00 | $0.20 | $2.50 |
 | gpt-6-luna | $0.10 | $0.50 | $0.01 | $0.125 |
-| gpt-5.6-sol | $4.00 | $20.00 | $0.40 | $5.00 |
+| gpt-5.6-sol | $5.00 | $30.00 | $0.50 | $6.25 |
 | gpt-5.6-terra | $2.00 | $12.00 | $0.20 | $2.50 |
 | gpt-5.6-luna | $0.20 | $1.20 | $0.02 | $0.25 |
 | gpt-5.5 | $5.00 | $30.00 | $0.50 | — |
@@ -241,6 +244,9 @@ agentic-metric pricing cache reset claude-sonnet-4                # 删除覆盖
 | 模型 | Input | Output | Cache Read | Cache Write |
 |------|------:|-------:|-----------:|------------:|
 <!-- pricing:gemini:start -->
+| gemini-4-neon | $3.00 | $15.00 | $0.15 | — |
+| gemini-4-carbon / gemini-4-argon | $4.00 | $20.00 | $0.20 | — |
+| gemini-4-hydrogen | $1.50 | $7.50 | $0.075 | — |
 | gemini-3.8-flash / gemini-3.7-flash / gemini-3.6-flash | $1.50 | $7.50 | $0.15 | — |
 | gemini-3.5-flash | $1.50 | $9.00 | $0.15 | — |
 | gemini-3.1-pro / gemini-3-pro | $2.00 | $12.00 | $0.20 | — |

@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.8.22 (2026-11-19)
+
+- Prioritize verified builtin standard list rates over the cached models.dev catalog (`user override > builtin > catalog`) so temporary introductory/promotional rates in models.dev do not overwrite standard pricing, while catalog entries still cover newer models absent from the builtin table (including their modes and long-context tiers).
+- Restrict models.dev catalog ingestion to an explicit first-party provider whitelist and text-output models, dropping third-party aggregator/reseller gateways and pure audio/video models.
+- Add builtin standard list rates for Gemini 4 Neon ($3/$15), Carbon ($4/$20), Argon ($4/$20), and Hydrogen ($1.50/$7.50), restore GPT-5.6 Sol to its regular $5/$30 standard rate (plus matching priority and long-context tiers), and bump the pricing fingerprint version so history reprices on the next sync.
+- Default `agentic-metric pricing list` to recorded used models plus user-configured overrides (falling back to builtin rates when no usage is recorded), and add `--all` / `-a`, positional substring query filtering, and `--source` filtering.
+
 ## v0.8.21 (2026-10-14)
 
 - TUI startup displays cached data before background pricing refresh and historical repricing. Quit cancels unfinished transfers, parsing, pricing fetches, and database initialization; committed usage and completed transfer progress remain available for the next sync.
