@@ -1715,3 +1715,25 @@ def test_catalog_write_uses_unique_temp_and_cleans_only_its_own(tmp_path):
         "m": {}
     }
     assert bystander.read_text() == "another process"
+
+
+def test_bracket_ultrafast_mode_prices_from_builtin_and_catalog(tmp_path):
+    with _patch_empty_user_pricing(tmp_path):
+        assert get_pricing("codex/gpt-6-astra[ultrafast]") == (60.0, 300.0, 6.0, 75.0)
+        _write_catalog(
+            tmp_path,
+            {
+                "gpt-6.1-sol": {
+                    "aliases": ["gpt-6.1-sol"],
+                    "prices": [2.0, 10.0, 0.1, 2.5],
+                    "modes": {
+                        "ultrafast": {
+                            "prices": [12.0, 60.0, 0.6, 15.0],
+                            "markers": {"service_tier": "ultrafast"},
+                            "long_context": [],
+                        }
+                    },
+                }
+            },
+        )
+        assert get_pricing("codex/gpt-6.1-sol[ultrafast]") == (12.0, 60.0, 0.6, 15.0)

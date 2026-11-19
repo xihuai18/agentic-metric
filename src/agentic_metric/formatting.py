@@ -4,6 +4,64 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
+
+_VALID_PROVIDER_SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+_NON_PROVIDER_MODELS = {"<synthetic>", "mock"}
+
+
+def resolve_model_provider(
+    model: str,
+    default_provider: str = "",
+    *,
+    auto_provider: bool = True,
+    provider_rules: tuple[tuple[str, str], ...] = (),
+) -> str:
+    """Resolve the billing/routing provider for one model id."""
+    raw = (model or "").strip()
+    fallback = (default_provider or "").strip()
+    if not raw or raw in _NON_PROVIDER_MODELS:
+        return fallback
+    raw_lower = raw.lower()
+    for prefix, target_provider in provider_rules:
+        if prefix and raw_lower.startswith(prefix.lower()):
+            return target_provider.strip()
+    if not auto_provider or "/" not in raw:
+        return fallback
+    parts = [part.strip() for part in raw.split("/")]
+    if (
+        len(parts) >= 3
+        and parts[0].lower() == "custom"
+        and _VALID_PROVIDER_SLUG_RE.fullmatch(parts[1])
+    ):
+        return parts[1].lower()
+    if len(parts) >= 2 and _VALID_PROVIDER_SLUG_RE.fullmatch(parts[0]):
+        return parts[0].lower()
+    return fallback
+
+
+def strip_provider_prefix(model: str, provider: str = "") -> str:
+    """Strip a leading routing provider prefix (e.g. ``codex/`` or ``custom/welm/``)."""
+    raw = (model or "").strip()
+    if not raw or "/" not in raw or raw in _NON_PROVIDER_MODELS:
+        return raw
+    parts = [part.strip() for part in raw.split("/")]
+    prov = (provider or "").strip().lower()
+    if (
+        len(parts) >= 3
+        and parts[0].lower() == "custom"
+        and _VALID_PROVIDER_SLUG_RE.fullmatch(parts[1])
+    ):
+        if not prov or parts[1].lower() == prov:
+            rest = "/".join(parts[2:]).strip()
+            if rest:
+                return rest
+    if len(parts) >= 2 and _VALID_PROVIDER_SLUG_RE.fullmatch(parts[0]):
+        if not prov or parts[0].lower() == prov:
+            rest = "/".join(parts[1:]).strip()
+            if rest:
+                return rest
+    return raw
 
 
 def fmt_cost(cost: float | None, *, unknown: bool = False) -> str:
@@ -119,9 +177,12 @@ def share_pct(
     unknown: bool = False,
     total_unknown: bool = False,
 ) -> str:
-    if unknown or total_unknown or total_cost <= 0:
+    if cost <= 0 or total_cost <= 0:
         return "—"
-    return f"{(100.0 * cost / total_cost):.1f}%"
+    pct = 100.0 * cost / total_cost
+    if unknown or total_unknown:
+        return f"~{pct:.1f}%"
+    return f"{pct:.1f}%"
 
 
 def share_suffix(

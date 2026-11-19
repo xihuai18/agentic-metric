@@ -2017,6 +2017,19 @@ def test_report_renders_tables_sequentially_and_highlights_cache_pct(monkeypatch
         periodic,
         "week",
         full=True,
+        by_agent_provider=[
+            {
+                "agent_type": "claude_code",
+                "provider": "ichat",
+                "session_count": 2,
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "cache_read_tokens": 300,
+                "cache_creation_tokens": 0,
+                "estimated_cost_usd": 4.0,
+                "unknown_cost_count": 0,
+            }
+        ],
         by_provider_model=by_provider_model,
         by_agent_type_model=by_agent_type_model,
         by_project_model=by_project_model,
@@ -2029,6 +2042,7 @@ def test_report_renders_tables_sequentially_and_highlights_cache_pct(monkeypatch
     assert "By agent" in rendered
     assert "By provider" in rendered
     assert "By model" in rendered
+    assert "By agent × provider" in rendered
     assert "By project × agent" in rendered
     assert "By provider × model" in rendered
     assert "By agent × model" in rendered
@@ -3618,6 +3632,71 @@ def test_interrupted_sql_during_open_becomes_cancellation_and_closes(tmp_path, p
     db = Database(db_path=path)  # the file reopens and repairs
     assert db.pricing_changed is True
     db.close()
+
+
+def test_share_pct_shows_approximate_share_when_total_has_unpriced():
+    from agentic_metric.formatting import share_pct
+
+    assert share_pct(75.0, 100.0) == "75.0%"
+    assert share_pct(75.0, 100.0, total_unknown=True) == "~75.0%"
+    assert share_pct(75.0, 100.0, unknown=True, total_unknown=True) == "~75.0%"
+    assert share_pct(0.0, 100.0, unknown=True, total_unknown=True) == "—"
+
+
+def test_database_vacuum_reclaims_freelist_and_cli_config_commands(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+    from agentic_metric import config as cfg
+
+    db_path = tmp_path / "data.db"
+    cfg_path = tmp_path / "config.json"
+    monkeypatch.setattr(cfg, "DB_PATH", db_path)
+    monkeypatch.setattr(cfg, "CONFIG_FILE", cfg_path)
+    monkeypatch.setattr("agentic_metric.store.database.DB_PATH", db_path)
+
+    # Create freelist bloat, then compact with `cache vacuum`.
+    db = Database(db_path=str(db_path))
+    for i in range(40):
+        db.set_sync_state(f"pad:{i}", "x" * 20_000, commit=False)
+    db.commit()
+    db.conn.execute("DELETE FROM sync_state WHERE key LIKE 'pad:%'")
+    db.commit()
+    total_before, free_before = db.storage_stats()
+    assert free_before > 500_000
+    db.close()
+
+    runner = CliRunner()
+    res_vac = runner.invoke(cli_module.app, ["cache", "vacuum"])
+    assert res_vac.exit_code == 0, res_vac.output
+    assert "Compacted database" in res_vac.output
+
+    db = Database(db_path=str(db_path), reprice_on_open=False)
+    total_after, free_after = db.storage_stats()
+    db.close()
+    assert total_after < total_before
+    assert free_after == 0
+
+    # `config path`, `config remote add`, `archive`, `unarchive`, `show --json`
+    res_path = runner.invoke(cli_module.app, ["config", "path"])
+    assert res_path.exit_code == 0
+    assert str(cfg_path) in res_path.output
+
+    res_add = runner.invoke(cli_module.app, ["config", "remote", "add", "devbox", "--name", "dev", "-t", "90"])
+    assert res_add.exit_code == 0, res_add.output
+    assert json.loads(cfg_path.read_text())["remotes"] == [{"name": "dev", "host": "devbox", "timeout": 90}]
+
+    res_arch = runner.invoke(cli_module.app, ["config", "remote", "archive", "dev"])
+    assert res_arch.exit_code == 0, res_arch.output
+    assert json.loads(cfg_path.read_text())["remotes"][0]["archived"] is True
+
+    res_show = runner.invoke(cli_module.app, ["config", "show", "--json"])
+    assert res_show.exit_code == 0, res_show.output
+    shown = json.loads(res_show.output)
+    assert shown["remotes"][0]["name"] == "dev"
+    assert shown["remotes"][0]["archived"] is True
+
+    res_unarch = runner.invoke(cli_module.app, ["config", "remote", "unarchive", "dev"])
+    assert res_unarch.exit_code == 0, res_unarch.output
+    assert "archived" not in json.loads(cfg_path.read_text())["remotes"][0]
 
 
 def test_interrupted_sql_without_cancellation_is_not_converted(tmp_path, pricing_env, monkeypatch):

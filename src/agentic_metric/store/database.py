@@ -364,6 +364,31 @@ class Database:
     def close(self) -> None:
         self._conn.close()
 
+    def storage_stats(self) -> tuple[int, int]:
+        """Return (total_bytes, reclaimable_freelist_bytes) for the SQLite database."""
+        page_size = int(self._conn.execute("PRAGMA page_size").fetchone()[0])
+        page_count = int(self._conn.execute("PRAGMA page_count").fetchone()[0])
+        freelist = int(self._conn.execute("PRAGMA freelist_count").fetchone()[0])
+        return (page_size * page_count, page_size * freelist)
+
+    def vacuum(self) -> tuple[int, int]:
+        """Reclaim SQLite freelist pages via VACUUM; returns (before_bytes, after_bytes)."""
+        before, _ = self.storage_stats()
+        self._conn.commit()
+        if self._path != ":memory:":
+            try:
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.OperationalError:
+                pass
+        self._conn.execute("VACUUM")
+        if self._path != ":memory:":
+            try:
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.OperationalError:
+                pass
+        after, _ = self.storage_stats()
+        return (before, after)
+
     @property
     def conn(self) -> sqlite3.Connection:
         return self._conn

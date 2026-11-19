@@ -14,7 +14,10 @@ from ..formatting import cache_hit_rate as _cache_hit_rate
 from ..formatting import cache_hit_rate_band as _cache_hit_rate_band
 from ..formatting import clip as _clip
 from ..formatting import root_label as _root_label
+from ..formatting import share_pct as _share_pct
+from ..formatting import share_suffix as _share_suffix
 from ..formatting import source_prefixed_path as _source_prefixed_path
+from ..formatting import strip_provider_prefix as _strip_provider_prefix
 from ..formatting import token_summary as _token_summary
 
 
@@ -838,9 +841,12 @@ def _top_providers_block(
     lines: list[Text] = []
     for i, p in enumerate(entries):
         unknown = _has_unknown_cost(p)
-        share = None
-        if total_cost and not any_unknown:
-            share = (p.get("estimated_cost_usd") or 0) / total_cost * 100
+        share_text = _share_suffix(
+            p.get("estimated_cost_usd") or 0.0,
+            total_cost,
+            unknown=unknown,
+            total_unknown=any_unknown,
+        )
 
         line = Text("  ")
         if i == 0:
@@ -853,8 +859,8 @@ def _top_providers_block(
             f" · {fmt_cost(p.get('estimated_cost_usd'), unknown=unknown)}",
             style="bold bright_yellow" if i == 0 else "bright_yellow",
         )
-        if share is not None:
-            line.append(f" ({share:.1f}%)", style="white")
+        if share_text:
+            line.append(share_text, style="white")
         lines.append(line)
 
     hidden = len(all_entries) - len(entries)
@@ -890,10 +896,6 @@ def _top_projects_block(
     lines: list[Text] = []
     for i, p in enumerate(entries):
         unknown = _has_unknown_cost(p)
-        share = None
-        if total_cost and not any_unknown:
-            share = (p.get("estimated_cost_usd") or 0) / total_cost * 100
-
         line = Text("  ")
         if i == 0:
             line.append(label_text, style="white")
@@ -901,7 +903,12 @@ def _top_projects_block(
             line.append(" " * len(label_text), style="default")
         line.append("  ")
         cost = fmt_cost(p.get("estimated_cost_usd"), unknown=unknown)
-        share_text = f" ({share:.1f}%)" if share is not None else ""
+        share_text = _share_suffix(
+            p.get("estimated_cost_usd") or 0.0,
+            total_cost,
+            unknown=unknown,
+            total_unknown=any_unknown,
+        )
         prefix_width = 2 + len(label_text) + 2
         path_max = max(12, min(44, available - prefix_width - len(cost) - len(share_text) - 3))
         line.append(
@@ -970,7 +977,7 @@ class Breakdown(Static):
     # Fixed widths keep them aligned and stop the line from wrapping; the
     # column titles are shown once on a header row at the top of the panel.
     _W_COST = 10
-    _W_SHARE = 6
+    _W_SHARE = 7
     _W_IN = 7
     _W_OUT = 7
     _W_CACHED = 10
@@ -1057,9 +1064,7 @@ class Breakdown(Static):
 
     @staticmethod
     def _share(cost: float, unknown: bool, total: float, total_unknown: bool) -> str:
-        if unknown or total_unknown:
-            return "—"
-        return f"{(cost / total) * 100:.1f}%"
+        return _share_pct(cost, total, unknown=unknown, total_unknown=total_unknown)
 
     def _emit_agent(
         self,
@@ -1075,17 +1080,38 @@ class Breakdown(Static):
         compact: bool,
     ) -> None:
         """Render one agent subtree (agent → provider → model)."""
+        providers = agent.get("providers") or [agent]
+        distinct_roots = {
+            str(g.get("data_root") or "") for g in providers if g.get("data_root")
+        }
+        shared_root = next(iter(distinct_roots)) if len(distinct_roots) == 1 else ""
+
         if top_level:
             # No host above it: agent sits at column 0, like a plain list.
             agent_parts = [(self._truncate(agent["agent"], label_width), "bold bright_magenta")]
+            if shared_root:
+                rem = label_width - len(agent["agent"]) - 1
+                if rem >= 4:
+                    agent_parts.extend([
+                        (" ", "white"),
+                        (_root_label(shared_root, max_len=rem), "white"),
+                    ])
             provider_base = "  "
         else:
             connector = "└ " if agent_last else "├ "
             agent_prefix = base_bar + connector
+            agent_name = self._truncate(agent["agent"], label_width - len(agent_prefix))
             agent_parts = [
                 (agent_prefix, "white"),
-                (self._truncate(agent["agent"], label_width - len(agent_prefix)), "bold bright_magenta"),
+                (agent_name, "bold bright_magenta"),
             ]
+            if shared_root:
+                rem = label_width - len(agent_prefix) - len(agent_name) - 1
+                if rem >= 4:
+                    agent_parts.extend([
+                        (" ", "white"),
+                        (_root_label(shared_root, max_len=rem), "white"),
+                    ])
             provider_base = base_bar + ("  " if agent_last else "│ ")
 
         agent_cost = agent.get("cost") or 0.0
@@ -1101,28 +1127,31 @@ class Breakdown(Static):
             compact=compact,
         )
 
-        providers = agent.get("providers") or [agent]
         for p_index, provider_group in enumerate(providers):
             provider_last = p_index == len(providers) - 1
             provider_connector = "└ " if provider_last else "├ "
             provider = provider_group.get("provider") or "—"
             provider_prefix = provider_base + provider_connector
-            provider_width = 9
-            path_width = max(6, label_width - len(provider_prefix) - provider_width - 1)
-            data_root = _root_label(provider_group.get("data_root") or "", max_len=path_width)
             provider_cost = provider_group.get("cost") or 0.0
             provider_unknown = _has_unknown_cost(provider_group)
 
-            self._append_label(
-                t,
-                [
+            if shared_root:
+                provider_parts = [
+                    (provider_prefix, "white"),
+                    (self._truncate(provider, label_width - len(provider_prefix)), "bright_cyan"),
+                ]
+            else:
+                provider_width = 9
+                path_width = max(6, label_width - len(provider_prefix) - provider_width - 1)
+                data_root = _root_label(provider_group.get("data_root") or "", max_len=path_width)
+                provider_parts = [
                     (provider_prefix, "white"),
                     (self._truncate(provider, provider_width).ljust(provider_width), "bright_cyan"),
                     (" ", "white"),
                     (data_root, "white"),
-                ],
-                label_width,
-            )
+                ]
+
+            self._append_label(t, provider_parts, label_width)
             self._append_value_columns(
                 t,
                 provider_group,
@@ -1145,7 +1174,11 @@ class Breakdown(Static):
                 model_prefix = model_base + ("└ " if last else "├ ")
                 model_name = m.get("model") or "(unknown)"
                 if model_name == "Unknown" and m.get("raw_model"):
-                    model_name = f"Unknown: {m['raw_model']}"
+                    raw_display = _strip_provider_prefix(
+                        str(m["raw_model"]),
+                        "" if provider == "—" else str(provider),
+                    )
+                    model_name = f"Unknown: {raw_display}"
                 self._append_label(
                     t,
                     [

@@ -347,11 +347,21 @@ def test_disappearing_owner_forces_child_full_parse(tmp_path, isolated):
     fresh_matches(tmp_path, isolated, restored)
 
 
+def _decode_assistant_cache(raw: str) -> dict:
+    import base64
+    import zlib
+
+    if raw.startswith("z1:"):
+        return json.loads(zlib.decompress(base64.b64decode(raw[3:].encode("ascii"))).decode("utf-8"))
+    return json.loads(raw)
+
+
 def test_legacy_assistant_id_cache_without_ownership_is_reparsed(tmp_path, isolated):
     parent, child = setup_replay(tmp_path, isolated, [user("p"), asst("shared", tokens=10)])
     db = Database(str(tmp_path / "state.db"))
     for row in db.conn.execute("SELECT key, value FROM sync_state WHERE key LIKE '%:assistant_ids:%'").fetchall():
-        payload = json.loads(row["value"])
+        assert row["value"].startswith("z1:")
+        payload = _decode_assistant_cache(row["value"])
         payload.pop("owned_ids")
         db.set_sync_state(row["key"], json.dumps(payload))
     db.close()
@@ -359,7 +369,7 @@ def test_legacy_assistant_id_cache_without_ownership_is_reparsed(tmp_path, isola
     restored = sync(tmp_path, "state.db", isolated)
     assert isolated["n"] == 1
     db = Database(str(tmp_path / "state.db"))
-    cached = [json.loads(row[0]) for row in db.conn.execute(
+    cached = [_decode_assistant_cache(row[0]) for row in db.conn.execute(
         "SELECT value FROM sync_state WHERE key LIKE '%:assistant_ids:%'")]
     db.close()
     assert all("owned_ids" in payload for payload in cached)

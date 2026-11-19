@@ -29,6 +29,7 @@ from .formatting import (
     shorten_home as _shorten_home,
     source_prefixed_path as _source_prefixed_path,
     source_root_label as _source_root_label,
+    strip_provider_prefix as _strip_provider_prefix,
     token_summary as _token_summary,
 )
 
@@ -53,7 +54,17 @@ cache_pricing_app = typer.Typer(
     context_settings={"help_option_names": ["-h", "--help"]},
 )
 cache_app = typer.Typer(
-    help="Inspect and prune the local remote-mirror cache.",
+    help="Inspect and prune the local remote-mirror cache and database.",
+    invoke_without_command=True,
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
+config_app = typer.Typer(
+    help="Inspect and update agentic-metric configuration.",
+    invoke_without_command=True,
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
+config_remote_app = typer.Typer(
+    help="Manage SSH remotes in config.json.",
     invoke_without_command=True,
     context_settings={"help_option_names": ["-h", "--help"]},
 )
@@ -61,6 +72,8 @@ app.add_typer(pricing_app, name="pricing")
 pricing_app.add_typer(long_context_app, name="long-context")
 pricing_app.add_typer(cache_pricing_app, name="cache")
 app.add_typer(cache_app, name="cache")
+app.add_typer(config_app, name="config")
+config_app.add_typer(config_remote_app, name="remote")
 accounts_app = typer.Typer(help="Account API equivalents and manually recorded payments.")
 payments_app = typer.Typer(help="Manual cash ledger, not measured subscription credit consumption.")
 app.add_typer(accounts_app, name="accounts")
@@ -541,6 +554,9 @@ def report(
             by_provider_model = (
                 aggregator.get_range_by_provider_model(db, frm, to) if detailed else []
             )
+            by_agent_provider = (
+                aggregator.get_range_by_agent_provider(db, frm, to) if detailed else []
+            )
             by_agent_type_model = (
                 aggregator.get_range_by_agent_type_model(db, frm, to) if detailed else []
             )
@@ -570,6 +586,7 @@ def report(
                 by_host, by_agent_type, by_provider, by_model,
                 by_agent, by_agent_model, by_project, by_project_agent,
                 sync_errors=sync_errors,
+                by_agent_provider=by_agent_provider,
                 by_provider_model=by_provider_model,
                 by_agent_type_model=by_agent_type_model,
                 by_project_model=by_project_model,
@@ -584,6 +601,7 @@ def report(
                 by_host, by_agent_type, by_provider, by_model,
                 by_agent, by_agent_model, by_project, by_project_agent,
                 periodic, focus_kind, prev_totals, full=full, limit=limit,
+                by_agent_provider=by_agent_provider,
                 by_provider_model=by_provider_model,
                 by_agent_type_model=by_agent_type_model,
                 by_project_model=by_project_model,
@@ -609,6 +627,7 @@ def _emit_report_json(
     by_provider: list[dict], by_model: list[dict], by_agent: list[dict],
     by_agent_model: list[dict], by_project: list[dict], by_project_agent: list[dict],
     sync_errors: list[str] | None = None,
+    by_agent_provider: list[dict] | None = None,
     by_provider_model: list[dict] | None = None,
     by_agent_type_model: list[dict] | None = None,
     by_project_model: list[dict] | None = None,
@@ -624,6 +643,7 @@ def _emit_report_json(
         "by_provider": [dict(r) for r in by_provider],
         "by_model": [dict(r) for r in by_model],
         "by_agent": [dict(r) for r in by_agent],
+        "by_agent_provider": [dict(r) for r in (by_agent_provider or [])],
         "by_agent_model": [dict(r) for r in by_agent_model],
         "by_provider_model": [dict(r) for r in (by_provider_model or [])],
         "by_agent_type_model": [dict(r) for r in (by_agent_type_model or [])],
@@ -708,6 +728,7 @@ def _print_report(
     *,
     full: bool = False,
     limit: int = 8,
+    by_agent_provider: list[dict] | None = None,
     by_provider_model: list[dict] | None = None,
     by_agent_type_model: list[dict] | None = None,
     by_project_model: list[dict] | None = None,
@@ -789,17 +810,24 @@ def _print_report(
     model_tbl = _build_dimension_table("By model", "Model", by_model, "model", max_label_width=32) if full else None
     periodic_tbl = _build_periodic_table(periodic, focus_kind) if full else None
 
-    # A × model cross tables (full only). Each gives model one extra lens:
-    # by billing channel, by agent, and by project.
-    provider_model_tbl = agent_type_model_tbl = project_model_tbl = None
+    # Cross tables (full only): harness × provider, provider × model,
+    # harness × model, and project × model.
+    agent_provider_tbl = provider_model_tbl = agent_type_model_tbl = project_model_tbl = None
     if full:
+        agent_provider_tbl = _build_cross_table(
+            "By agent × provider", "Agent", by_agent_provider or [],
+            lambda r: r.get("agent_type") or "—", a_width=_scale_width(12, 16),
+            b_title="Provider",
+            b_value=lambda r: r.get("provider") or "—",
+            b_width=_scale_width(10, 18),
+        )
         provider_model_tbl = _build_cross_table(
             "By provider × model", "Provider", by_provider_model or [],
             lambda r: r.get("provider") or "—", a_width=_scale_width(10, 16),
         )
         agent_type_model_tbl = _build_cross_table(
             "By agent × model", "Agent", by_agent_type_model or [],
-            lambda r: r.get("agent_type") or "—", a_width=_scale_width(10, 16),
+            lambda r: r.get("agent_type") or "—", a_width=_scale_width(12, 16),
         )
         pm_width = max(28, min(120, _console_width() - 60))
         project_model_tbl = _build_cross_table(
@@ -813,15 +841,16 @@ def _print_report(
 
     # ─── Render ───
     # Non-full keeps the consolidated 4-D cross plus Top projects.
-    # Full drills down coarse → fine: single-dim aggregates, the model
-    # cross lenses, the project block, the full cross, and finally the
-    # time breakdown.
+    # Full drills down coarse → fine: single-dim aggregates, the harness /
+    # provider / model cross lenses, the project block, the full cross, and
+    # finally the time breakdown.
     if full:
         ordered = (
             host_tbl,            # By host
-            agent_type_tbl,      # By agent
+            agent_type_tbl,      # By agent (harness)
             provider_tbl,        # By provider
             model_tbl,           # By model
+            agent_provider_tbl,  # By agent × provider
             provider_model_tbl,  # By provider × model
             agent_type_model_tbl,# By agent × model
             project_tbl,         # Top projects
@@ -875,13 +904,17 @@ def _build_pricing_missing_note(models: list[str]) -> Panel | None:
             "Records labeled (unknown model) have no model id; pricing cannot be configured.",
             style=C_MUTED,
         ))
-    if configurable:
-        lines.append(Text("Set pricing (USD per 1M tokens):", style=C_MUTED))
-    for name in configurable:
+    if len(configurable) == 1:
         lines.append(Text.assemble(
-            ("  agentic-metric pricing set ", C_MUTED),
-            (name, C_MAUVE),
-            (" -i <input> -o <output>", C_MUTED),
+            ("Set pricing (USD/1M): ", C_MUTED),
+            ("agentic-metric pricing set ", C_MUTED),
+            (configurable[0], C_MAUVE),
+            (" -i <input> -o <output>  (-i 0 -o 0 for free)", C_MUTED),
+        ))
+    elif configurable:
+        lines.append(Text(
+            "Set pricing (USD/1M): agentic-metric pricing set <model> -i <input> -o <output>  (-i 0 -o 0 for free)",
+            style=C_MUTED,
         ))
     return Panel(
         Group(*lines),
@@ -1162,7 +1195,7 @@ def _build_dimension_table(
         turns = r.get("user_turns") or 0
         messages = r.get("message_count") or 0
         cp = _cache_hit_rate(r)
-        values = [display, f"{r.get('session_count') or 0:,}"]
+        values = [Text(str(display)), f"{r.get('session_count') or 0:,}"]
         if not ultra_narrow:
             values.extend((f"{max(0, messages - turns):,}", f"{turns:,}"))
         if narrow:
@@ -1230,10 +1263,10 @@ def _build_by_agent_model_table(rows: list[dict], *, limit: int = 8) -> Table | 
     ultra_narrow = console_width < 80
     if ultra_narrow:
         nonzero = _merge_rows_by_model(nonzero)
-    source_width = 14 if narrow else _scale_width(16, 34)
-    agent_width = 10 if narrow else _scale_width(8, 14)
-    provider_width = 10 if narrow else _scale_width(6, 12)
-    model_width = 24 if ultra_narrow else (18 if narrow else _scale_width(14, 32))
+    source_width = 14 if narrow else _scale_width(18, 34)
+    agent_width = 10 if narrow else _scale_width(12, 14)
+    provider_width = 10 if narrow else _scale_width(10, 14)
+    model_width = 24 if ultra_narrow else (20 if narrow else 32)
     tbl = Table(
         show_header=True,
         header_style=f"bold {C_SUBTEXT}",
@@ -1272,17 +1305,19 @@ def _build_by_agent_model_table(rows: list[dict], *, limit: int = 8) -> Table | 
     def _model_row(r: dict, show_group: bool) -> None:
         model_display = r["model"]
         if model_display == "Unknown" and r.get("raw_model"):
-            model_display = f"Unknown: {r['raw_model']}"
+            prov = str(r.get("provider") or "")
+            raw_display = _strip_provider_prefix(str(r["raw_model"]), prov) if not ultra_narrow else str(r["raw_model"])
+            model_display = f"Unknown: {raw_display}"
         data_root = r.get("data_root") or ""
         cp = _cache_hit_rate(r)
         values = []
         if not ultra_narrow:
             values.extend((
-                _source_root_label(data_root, max_len=source_width) if show_group else "",
-                r["agent_type"] if show_group else "",
-                (r.get("provider") or "—") if show_group else "",
+                Text(_source_root_label(data_root, max_len=source_width)) if show_group else "",
+                Text(str(r["agent_type"])) if show_group else "",
+                Text(str(r.get("provider") or "—")) if show_group else "",
             ))
-        values.append(model_display)
+        values.append(Text(str(model_display)))
         if narrow:
             values.append(_fmt_tokens(_token_summary(r)["total_tokens"]))
         else:
@@ -1339,18 +1374,21 @@ def _build_cross_table(
     *,
     a_width: int,
     model_width: int | None = None,
+    b_title: str = "Model",
+    b_value=None,
+    b_width: int | None = None,
 ) -> Table | None:
-    """Render a two-key A × model breakdown (one row per A × model).
+    """Render a two-key A × B breakdown (defaulting B to model).
 
-    ``a_value`` maps a row to its left-column display string; the model
-    column handles the ``Unknown: <raw>`` relabel. Rows arrive pre-sorted
-    by cost, so A repeats across its models instead of being grouped.
+    ``a_value`` maps a row to its left-column display string; when ``b_value``
+    is omitted the right label column shows the model and handles the
+    ``Unknown: <raw>`` relabel. Rows arrive pre-sorted by cost.
     """
     nonzero = [r for r in rows if _has_cost_signal(r)]
     if not nonzero:
         return None
     narrow, ultra_narrow = _metric_layout()
-    model_width = model_width or _scale_width(14, 32)
+    right_width = b_width or model_width or 32
     tbl = Table(
         show_header=True,
         header_style=f"bold {C_SUBTEXT}",
@@ -1362,7 +1400,7 @@ def _build_cross_table(
         title_justify="left",
     )
     tbl.add_column(a_title, style=C_MAUVE, overflow="ellipsis", no_wrap=True, max_width=a_width)
-    tbl.add_column("Model", style=C_SKY, overflow="ellipsis", no_wrap=True, max_width=model_width)
+    tbl.add_column(b_title, style=C_SKY, overflow="ellipsis", no_wrap=True, max_width=right_width)
     if not ultra_narrow:
         tbl.add_column("Sess", justify="right", style=C_TEXT, no_wrap=True)
     if narrow:
@@ -1375,11 +1413,18 @@ def _build_cross_table(
         tbl.add_column("C%", justify="right", no_wrap=True)
     tbl.add_column("Cost", justify="right", style=f"bold {C_YELLOW}", no_wrap=True, min_width=7)
     for r in nonzero:
-        model_display = r.get("model") or "—"
-        if model_display == "Unknown" and r.get("raw_model"):
-            model_display = f"Unknown: {r['raw_model']}"
+        if b_value is not None:
+            right_display = b_value(r)
+        else:
+            right_display = r.get("model") or "—"
+            if right_display == "Unknown" and r.get("raw_model"):
+                raw_display = str(r["raw_model"])
+                if a_title == "Provider":
+                    prov = str(r.get("provider") or "")
+                    raw_display = _strip_provider_prefix(raw_display, "" if prov == "—" else prov)
+                right_display = f"Unknown: {raw_display}"
         cp = _cache_hit_rate(r)
-        values = [a_value(r), model_display]
+        values = [Text(str(a_value(r))), Text(str(right_display))]
         if not ultra_narrow:
             values.append(f"{r.get('session_count') or 0:,}")
         if narrow:
@@ -2275,7 +2320,25 @@ def cache_info(
             f"`agentic-metric cache prune` to free)[/]"
         )
     else:
-        console.print(f"[{C_MUTED}]Nothing to reclaim.[/]")
+        console.print(f"[{C_MUTED}]Nothing to reclaim from remote cache.[/]")
+
+    from . import config as cfg
+    from .store.database import Database
+
+    if cfg.DB_PATH.exists():
+        db = Database(reprice_on_open=False)
+        try:
+            db_total, db_free = db.storage_stats()
+        finally:
+            db.close()
+        if db_free >= 1024 * 1024:
+            console.print(
+                f"Database: [bold {C_SKY}]{_fmt_bytes(db_total)}[/] "
+                f"[{C_MUTED}](reclaimable freelist: [/][bold {C_PEACH}]{_fmt_bytes(db_free)}[/]"
+                f"[{C_MUTED}] — run `agentic-metric cache vacuum` to compact)[/]"
+            )
+        else:
+            console.print(f"Database: [bold {C_SKY}]{_fmt_bytes(db_total)}[/]")
 
 
 @cache_app.command("prune")
@@ -2315,3 +2378,260 @@ def cache_prune(
         console.print(f"Total reclaimable: [bold {C_PEACH}]{total}[/] (dry run — nothing deleted)")
     else:
         console.print(f"[bold {C_GREEN}]✓[/] Reclaimed [bold {C_PEACH}]{total}[/].")
+
+
+@cache_app.command("vacuum")
+def cache_vacuum() -> None:
+    """Compact the SQLite database to reclaim unused freelist pages."""
+    from . import config as cfg
+    from .store.database import Database
+
+    if not cfg.DB_PATH.exists():
+        console.print(f"[{C_MUTED}]Database does not exist yet.[/]")
+        return
+    db = Database(reprice_on_open=False)
+    try:
+        with _sync_status("Compacting SQLite database…"):
+            before, after = db.vacuum()
+    finally:
+        db.close()
+    reclaimed = max(0, before - after)
+    console.print(
+        f"[bold {C_GREEN}]✓[/] Compacted database: "
+        f"[bold {C_SKY}]{_fmt_bytes(before)}[/] → [bold {C_SKY}]{_fmt_bytes(after)}[/] "
+        f"[{C_MUTED}](reclaimed {_fmt_bytes(reclaimed)})[/]"
+    )
+
+
+# ── config subcommands ─────────────────────────────────────────────
+
+
+@config_app.callback(invoke_without_command=True)
+def _config_default(ctx: typer.Context) -> None:
+    if ctx.invoked_subcommand is None:
+        console.print(ctx.get_help())
+        raise typer.Exit()
+
+
+@config_remote_app.callback(invoke_without_command=True)
+def _config_remote_default(ctx: typer.Context) -> None:
+    if ctx.invoked_subcommand is None:
+        console.print(ctx.get_help())
+        raise typer.Exit()
+
+
+@config_app.command("path")
+def config_path() -> None:
+    """Print the active config.json path."""
+    from . import config as cfg
+
+    print(str(cfg.CONFIG_FILE))
+
+
+@config_app.command("show")
+def config_show(
+    json_: bool = typer.Option(False, "--json", help="Output resolved config as JSON."),
+) -> None:
+    """Display active collector roots and SSH remote settings."""
+    from . import config as cfg
+
+    claude_roots = cfg.get_claude_code_roots()
+    codex_roots = cfg.get_codex_roots()
+    remotes = cfg.get_remote_specs()
+
+    if json_:
+        payload = {
+            "config_file": str(cfg.CONFIG_FILE),
+            "exists": cfg.CONFIG_FILE.exists(),
+            "collectors": {
+                "claude_code": [
+                    {
+                        "path": r.raw_path or str(r.path),
+                        "provider": r.provider,
+                        "auto_provider": r.auto_provider,
+                        "provider_rules": [
+                            {"prefix": p, "provider": prov} for p, prov in r.provider_rules
+                        ],
+                        "account_key": r.account_key,
+                    }
+                    for r in claude_roots
+                ],
+                "codex": [
+                    {
+                        "path": r.raw_path or str(r.path),
+                        "provider": r.provider,
+                        "account_key": r.account_key,
+                    }
+                    for r in codex_roots
+                ],
+            },
+            "remotes": [
+                {
+                    "name": rem.name or rem.host,
+                    "host": rem.host,
+                    "user": rem.user,
+                    "port": rem.port,
+                    "timeout": rem.timeout,
+                    "archived": rem.archived,
+                }
+                for rem in remotes
+            ],
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+
+    status = "loaded" if cfg.CONFIG_FILE.exists() else "default (not created)"
+    console.print(f"[{C_MUTED}]Config:[/] {cfg.CONFIG_FILE} [{C_MUTED}]({status})[/]")
+
+    roots_tbl = Table(
+        title="Local Collector Roots",
+        title_style=f"bold {C_TEXT}",
+        box=box.SIMPLE_HEAVY,
+        border_style=C_SURFACE1,
+        header_style=f"bold {C_SUBTEXT}",
+        pad_edge=False,
+    )
+    roots_tbl.add_column("Agent", style=C_MAUVE)
+    roots_tbl.add_column("Path", style=C_TEXT)
+    roots_tbl.add_column("Default Provider", style=C_SKY)
+    roots_tbl.add_column("Auto Provider", style=C_TEAL)
+    for r in claude_roots:
+        auto_label = "on" if r.auto_provider else "off"
+        if r.provider_rules:
+            auto_label += f" (+{len(r.provider_rules)} rules)"
+        roots_tbl.add_row(
+            "claude_code",
+            r.raw_path or _shorten_home(str(r.path)),
+            r.provider or "—",
+            auto_label,
+        )
+    for r in codex_roots:
+        roots_tbl.add_row(
+            "codex",
+            r.raw_path or _shorten_home(str(r.path)),
+            r.provider or "—",
+            "jsonl",
+        )
+    console.print()
+    console.print(roots_tbl)
+
+    if remotes:
+        rem_tbl = Table(
+            title="SSH Remotes",
+            title_style=f"bold {C_TEXT}",
+            box=box.SIMPLE_HEAVY,
+            border_style=C_SURFACE1,
+            header_style=f"bold {C_SUBTEXT}",
+            pad_edge=False,
+        )
+        rem_tbl.add_column("Name", style=C_MAUVE)
+        rem_tbl.add_column("Host", style=C_SKY)
+        rem_tbl.add_column("Timeout", justify="right", style=C_TEAL)
+        rem_tbl.add_column("Status")
+        for rem in remotes:
+            rem_tbl.add_row(
+                rem.name or rem.host,
+                rem.host,
+                f"{rem.timeout}s",
+                Text("archived", style=C_MUTED) if rem.archived else Text("active", style=C_GREEN),
+            )
+        console.print()
+        console.print(rem_tbl)
+
+
+def _load_editable_config() -> dict:
+    from . import config as cfg
+
+    if not cfg.CONFIG_FILE.exists():
+        return {}
+    try:
+        data = json.loads(cfg.CONFIG_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        console.print(f"[{C_RED}]Failed to read {cfg.CONFIG_FILE}: {exc}[/]")
+        raise typer.Exit(1)
+    if not isinstance(data, dict):
+        console.print(f"[{C_RED}]{cfg.CONFIG_FILE} must contain a JSON object.[/]")
+        raise typer.Exit(1)
+    return data
+
+
+def _set_remote_archived(target: str, *, archived: bool) -> None:
+    from . import config as cfg
+
+    data = _load_editable_config()
+    raw_remotes = data.get("remotes")
+    if not isinstance(raw_remotes, list) or not raw_remotes:
+        console.print(f"[{C_RED}]No remotes configured in {cfg.CONFIG_FILE}.[/]")
+        raise typer.Exit(1)
+
+    matched = False
+    updated: list[object] = []
+    for item in raw_remotes:
+        if isinstance(item, str) and item.strip() == target:
+            entry: dict[str, object] = {"host": item.strip(), "archived": archived}
+            updated.append(entry)
+            matched = True
+        elif isinstance(item, dict) and (
+            str(item.get("name") or "").strip() == target
+            or str(item.get("host") or "").strip() == target
+        ):
+            entry = dict(item)
+            if archived:
+                entry["archived"] = True
+            else:
+                entry.pop("archived", None)
+            updated.append(entry)
+            matched = True
+        else:
+            updated.append(item)
+
+    if not matched:
+        console.print(f"[{C_RED}]Remote {target!r} not found in {cfg.CONFIG_FILE}.[/]")
+        raise typer.Exit(1)
+
+    data["remotes"] = updated
+    cfg.save_config(data)
+    verb = "Archived" if archived else "Unarchived"
+    note = " (SSH sync skipped; history preserved)" if archived else " (SSH sync re-enabled)"
+    console.print(f"[bold {C_GREEN}]✓[/] {verb} remote [bold {C_MAUVE}]{target}[/]{note}.")
+
+
+@config_remote_app.command("archive")
+def config_remote_archive(
+    target: str = typer.Argument(..., help="Remote name or host to archive."),
+) -> None:
+    """Archive a remote so SSH sync stops while historical usage stays intact."""
+    _set_remote_archived(target, archived=True)
+
+
+@config_remote_app.command("unarchive")
+def config_remote_unarchive(
+    target: str = typer.Argument(..., help="Remote name or host to re-enable."),
+) -> None:
+    """Re-enable SSH sync for a previously archived remote."""
+    _set_remote_archived(target, archived=False)
+
+
+@config_remote_app.command("add")
+def config_remote_add(
+    host: str = typer.Argument(..., help="SSH host or alias from ~/.ssh/config."),
+    name: str | None = typer.Option(None, "--name", "-n", help="Display name (defaults to host)."),
+    timeout: int = typer.Option(60, "--timeout", "-t", min=5, help="Per-batch SSH timeout in seconds."),
+) -> None:
+    """Add an SSH remote to config.json."""
+    from . import config as cfg
+
+    host = host.strip()
+    label = (name or host).strip()
+    data = _load_editable_config()
+    remotes = list(data.get("remotes") or []) if isinstance(data.get("remotes"), list) else []
+    for item in remotes:
+        existing_host = item.strip() if isinstance(item, str) else str(item.get("host") or "").strip() if isinstance(item, dict) else ""
+        existing_name = existing_host if isinstance(item, str) else str(item.get("name") or existing_host).strip() if isinstance(item, dict) else ""
+        if label == existing_name or host == existing_host:
+            console.print(f"[{C_RED}]Remote {label!r} ({host}) is already configured.[/]")
+            raise typer.Exit(1)
+    remotes.append({"name": label, "host": host, "timeout": timeout})
+    data["remotes"] = remotes
+    cfg.save_config(data)
+    console.print(f"[bold {C_GREEN}]✓[/] Added remote [bold {C_MAUVE}]{label}[/] ({host}, timeout {timeout}s).")

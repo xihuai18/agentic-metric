@@ -26,8 +26,9 @@ from . import (
 
 
 from ..accounts import assign_source_account
+from ..formatting import resolve_model_provider
 
-CLAUDE_SYNC_VERSION = "v15"
+CLAUDE_SYNC_VERSION = "v16"
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -634,6 +635,8 @@ class ClaudeCodeCollector(BaseCollector):
         data_root: str = "",
         *,
         account_key: str = "",
+        auto_provider: bool = True,
+        provider_rules: tuple[tuple[str, str], ...] = (),
     ) -> None:
         from ..accounts import validate_account_key
 
@@ -641,12 +644,32 @@ class ClaudeCodeCollector(BaseCollector):
         self.provider = provider.strip()
         self.data_root = data_root
         self.account_key = validate_account_key(account_key) if account_key else ""
+        self.auto_provider = bool(auto_provider)
+        self.provider_rules = tuple(provider_rules)
         self.agent_type = "claude_code"
         self.last_sync_complete = False
 
     @property
+    def _dynamic_providers(self) -> bool:
+        return self.auto_provider or bool(self.provider_rules)
+
+    def _resolve_provider(self, model: str) -> str:
+        return resolve_model_provider(
+            model,
+            self.provider,
+            auto_provider=self.auto_provider,
+            provider_rules=self.provider_rules,
+        )
+
+    @property
     def sync_state_prefix(self) -> str:
-        identity = sync_key_identity(self.provider, self.data_root, account_key=self.account_key)
+        identity = sync_key_identity(
+            self.provider,
+            self.data_root,
+            account_key=self.account_key,
+            auto_provider=self.auto_provider,
+            provider_rules=self.provider_rules,
+        )
         return f"cc_jsonl:{CLAUDE_SYNC_VERSION}:{identity}"
 
     def sync_history(self, db, *, reconcile: bool = True, files: list[Path] | None = None) -> None:
@@ -665,13 +688,36 @@ class ClaudeCodeCollector(BaseCollector):
             files=files,
         )
         if reconcile and index_complete and jsonl_complete:
-            reconcile_scope_sessions(
-                db,
-                agent_type=self.agent_type,
-                data_root=self.data_root,
-                active_by_provider={self.provider: indexed_ids | jsonl_ids},
-                owned_providers={self.provider},
-            )
+            active_ids = indexed_ids | jsonl_ids
+            if self._dynamic_providers:
+                active_by_provider: dict[str, set[str]] = {}
+                if active_ids:
+                    rows = db.conn.execute(
+                        """SELECT session_id, provider FROM sessions
+                           WHERE agent_type = ? AND data_root = ?""",
+                        (self.agent_type, self.data_root),
+                    ).fetchall()
+                    for row in rows:
+                        sid = str(row["session_id"] or "")
+                        if sid in active_ids:
+                            active_by_provider.setdefault(
+                                str(row["provider"] or ""), set()
+                            ).add(sid)
+                reconcile_scope_sessions(
+                    db,
+                    agent_type=self.agent_type,
+                    data_root=self.data_root,
+                    active_by_provider=active_by_provider,
+                    owned_providers=None,
+                )
+            else:
+                reconcile_scope_sessions(
+                    db,
+                    agent_type=self.agent_type,
+                    data_root=self.data_root,
+                    active_by_provider={self.provider: active_ids},
+                    owned_providers={self.provider},
+                )
         db.commit()
         self.last_sync_complete = index_complete and jsonl_complete
 
@@ -717,33 +763,45 @@ class ClaudeCodeCollector(BaseCollector):
                 modified = entry.get("modified", "")
 
                 project_path = entry.get("projectPath", "")
-                db.upsert_session(
-                    session_id,
-                    self.agent_type,
-                    provider=self.provider,
-                    data_root=self.data_root,
-                    project_path=project_path,
-                    git_branch=entry.get("gitBranch", ""),
-                    message_count=entry.get("messageCount", 0),
-                    started_at=created,
-                    ended_at=modified,
-                    summary=entry.get("summary", ""),
-                )
-                has_usage = db.conn.execute(
-                    """SELECT 1 FROM session_usage
-                       WHERE session_id = ? AND agent_type = ?
-                         AND provider = ? AND data_root = ?
-                       LIMIT 1""",
-                    (session_id, self.agent_type, self.provider, self.data_root),
-                ).fetchone()
-                if has_usage is None:
-                    db.replace_session_usage(
+                existing_providers: list[str] = []
+                if self._dynamic_providers:
+                    existing_rows = db.conn.execute(
+                        """SELECT provider FROM sessions
+                           WHERE session_id = ? AND agent_type = ? AND data_root = ?""",
+                        (session_id, self.agent_type, self.data_root),
+                    ).fetchall()
+                    existing_providers = [str(r["provider"] or "") for r in existing_rows]
+
+                target_providers = existing_providers or [self.provider]
+                for prov in target_providers:
+                    db.upsert_session(
                         session_id,
                         self.agent_type,
-                        [_zero_usage_bucket(created, project_path, self.account_key)],
-                        provider=self.provider,
+                        provider=prov,
                         data_root=self.data_root,
+                        project_path=project_path,
+                        git_branch=entry.get("gitBranch", ""),
+                        message_count=entry.get("messageCount", 0) if not existing_providers else None,
+                        started_at=created,
+                        ended_at=modified,
+                        summary=entry.get("summary", ""),
                     )
+                if not existing_providers:
+                    has_usage = db.conn.execute(
+                        """SELECT 1 FROM session_usage
+                           WHERE session_id = ? AND agent_type = ?
+                             AND provider = ? AND data_root = ?
+                           LIMIT 1""",
+                        (session_id, self.agent_type, self.provider, self.data_root),
+                    ).fetchone()
+                    if has_usage is None:
+                        db.replace_session_usage(
+                            session_id,
+                            self.agent_type,
+                            [_zero_usage_bucket(created, project_path, self.account_key)],
+                            provider=self.provider,
+                            data_root=self.data_root,
+                        )
 
         return (active_ids, complete)
 
@@ -938,47 +996,90 @@ class ClaudeCodeCollector(BaseCollector):
                             provider=self.provider,
                             data_root=self.data_root,
                         )
+                        if self._dynamic_providers:
+                            self._delete_other_session_providers(db, session_id, {self.provider})
                     else:
-                        db.delete_session(
-                            session_id,
-                            self.agent_type,
-                            provider=self.provider,
-                            data_root=self.data_root,
-                        )
+                        if self._dynamic_providers:
+                            self._delete_other_session_providers(db, session_id, set())
+                        else:
+                            db.delete_session(
+                                session_id,
+                                self.agent_type,
+                                provider=self.provider,
+                                data_root=self.data_root,
+                            )
                     db.set_sync_state(sync_key, state, commit=False)
                     continue
 
                 usage_rows = assign_source_account(accum.usage_bucket_rows(), self.account_key)
-                cost = _usage_rows_cost(usage_rows)
+                by_provider: dict[str, list[dict]] = {}
+                for row in usage_rows:
+                    row_model = str(row.get("model") or "")
+                    if not row_model or row_model == "<synthetic>":
+                        prov = self._resolve_provider(accum.model)
+                    else:
+                        prov = self._resolve_provider(row_model)
+                    by_provider.setdefault(prov, []).append(row)
+                if not by_provider:
+                    by_provider[self._resolve_provider(accum.model)] = []
 
-                db.upsert_session(
-                    session_id,
-                    self.agent_type,
-                    provider=self.provider,
-                    data_root=self.data_root,
-                    project_path=project_path,
-                    git_branch=accum.git_branch,
-                    model=accum.model,
-                    message_count=accum.message_count,
-                    user_turns=accum.user_turns,
-                    input_tokens=accum.input_tokens,
-                    output_tokens=accum.output_tokens,
-                    cache_read_tokens=accum.cache_read,
-                    cache_creation_tokens=accum.cache_create,
-                    cache_creation_1h_tokens=accum.cache_create_1h,
-                    estimated_cost_usd=cost,
-                    started_at=accum.first_ts,
-                    ended_at=accum.last_ts,
-                    first_prompt=accum.first_prompt,
-                    last_prompt=accum.last_prompt,
-                )
-                db.replace_session_usage(
-                    session_id,
-                    self.agent_type,
-                    usage_rows,
-                    provider=self.provider,
-                    data_root=self.data_root,
-                )
+                for prov, prov_rows in by_provider.items():
+                    if len(by_provider) == 1:
+                        prov_messages = accum.message_count
+                        prov_turns = accum.user_turns
+                        prov_in = accum.input_tokens
+                        prov_out = accum.output_tokens
+                        prov_cr = accum.cache_read
+                        prov_cw = accum.cache_create
+                        prov_cw_1h = accum.cache_create_1h
+                        prov_model = accum.model
+                    else:
+                        prov_messages = sum(int(r.get("message_count") or 0) for r in prov_rows)
+                        prov_turns = sum(int(r.get("user_turns") or 0) for r in prov_rows)
+                        prov_in = sum(int(r.get("input_tokens") or 0) for r in prov_rows)
+                        prov_out = sum(int(r.get("output_tokens") or 0) for r in prov_rows)
+                        prov_cr = sum(int(r.get("cache_read_tokens") or 0) for r in prov_rows)
+                        prov_cw = sum(int(r.get("cache_creation_tokens") or 0) for r in prov_rows)
+                        prov_cw_1h = sum(int(r.get("cache_creation_1h_tokens") or 0) for r in prov_rows)
+                        prov_models = [
+                            str(r.get("model") or "")
+                            for r in prov_rows
+                            if r.get("model") and r.get("model") != "<synthetic>"
+                        ]
+                        prov_model = prov_models[-1] if prov_models else accum.model
+                    cost = _usage_rows_cost(prov_rows)
+
+                    db.upsert_session(
+                        session_id,
+                        self.agent_type,
+                        provider=prov,
+                        data_root=self.data_root,
+                        project_path=project_path,
+                        git_branch=accum.git_branch,
+                        model=prov_model,
+                        message_count=prov_messages,
+                        user_turns=prov_turns,
+                        input_tokens=prov_in,
+                        output_tokens=prov_out,
+                        cache_read_tokens=prov_cr,
+                        cache_creation_tokens=prov_cw,
+                        cache_creation_1h_tokens=prov_cw_1h,
+                        estimated_cost_usd=cost,
+                        started_at=accum.first_ts,
+                        ended_at=accum.last_ts,
+                        first_prompt=accum.first_prompt,
+                        last_prompt=accum.last_prompt,
+                    )
+                    db.replace_session_usage(
+                        session_id,
+                        self.agent_type,
+                        prov_rows,
+                        provider=prov,
+                        data_root=self.data_root,
+                    )
+
+                if self._dynamic_providers:
+                    self._delete_other_session_providers(db, session_id, set(by_provider))
 
                 db.set_sync_state(sync_key, state, commit=False)
 
@@ -989,6 +1090,35 @@ class ClaudeCodeCollector(BaseCollector):
                 active_sync_keys,
             )
         return (active_ids, complete)
+
+    def _delete_other_session_providers(
+        self, db, session_id: str, keep_providers: set[str]
+    ) -> None:
+        rows = db.conn.execute(
+            """SELECT DISTINCT provider FROM sessions
+               WHERE session_id = ? AND agent_type = ? AND data_root = ?
+               UNION
+               SELECT DISTINCT provider FROM session_usage
+               WHERE session_id = ? AND agent_type = ? AND data_root = ?""",
+            (
+                session_id,
+                self.agent_type,
+                self.data_root,
+                session_id,
+                self.agent_type,
+                self.data_root,
+            ),
+        ).fetchall()
+        for row in rows:
+            prov = str(row["provider"] or "")
+            if prov in keep_providers:
+                continue
+            db.delete_session(
+                session_id,
+                self.agent_type,
+                provider=prov,
+                data_root=self.data_root,
+            )
 
 
 def _sync_state_value(file_size: int, mtime_ns: int) -> str:
@@ -1006,8 +1136,12 @@ def _cached_assistant_ids(
     if not cached:
         return None
     try:
-        payload = json.loads(cached)
-    except (json.JSONDecodeError, TypeError):
+        if cached.startswith("z1:"):
+            raw = zlib.decompress(base64.b64decode(cached[3:].encode("ascii"))).decode("utf-8")
+            payload = json.loads(raw)
+        else:
+            payload = json.loads(cached)
+    except (json.JSONDecodeError, TypeError, ValueError, zlib.error):
         return None
     if not isinstance(payload, dict) or payload.get("state") != state:
         return None
@@ -1031,12 +1165,13 @@ def _store_assistant_ids(
     ids: set[str],
     owned_ids: set[str],
 ) -> None:
-    value = json.dumps(
+    raw = json.dumps(
         {"state": state, "ids": sorted(ids), "owned_ids": sorted(owned_ids)},
         ensure_ascii=False,
         separators=(",", ":"),
-    )
-    db.set_sync_state(cache_key, value, commit=False)
+    ).encode("utf-8")
+    compressed = "z1:" + base64.b64encode(zlib.compress(raw, level=6)).decode("ascii")
+    db.set_sync_state(cache_key, compressed, commit=False)
 
 
 # ── Persistent parse checkpoints ─────────────────────────────────────────

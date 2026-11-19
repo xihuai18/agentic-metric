@@ -400,6 +400,7 @@ def test_claude_history_sync_scopes_state_by_provider_and_root(tmp_path):
             projects_dir=projects,
             provider=provider,
             data_root=data_root,
+            auto_provider=False,
         ).sync_history(db)
 
     rows = db.conn.execute(
@@ -409,11 +410,193 @@ def test_claude_history_sync_scopes_state_by_provider_and_root(tmp_path):
     ).fetchall()
     assert [tuple(row) for row in rows] == [("p1", 100), ("p2", 100)]
     state_keys = db.conn.execute(
-        "SELECT key FROM sync_state WHERE key LIKE 'cc_jsonl:v15:%'"
+        "SELECT key FROM sync_state WHERE key LIKE 'cc_jsonl:v16:%'"
     ).fetchall()
     assert len(state_keys) == 6
     assert sum(":assistant_ids:" in row["key"] for row in state_keys) == 2
     assert sum(":checkpoint:" in row["key"] for row in state_keys) == 2
+    db.close()
+
+
+def test_claude_auto_provider_splits_session_and_dedups_session_count(tmp_path):
+    from agentic_metric.store.aggregator import (
+        get_range_by_agent_model,
+        get_range_by_agent_provider,
+        get_range_by_agent_type,
+        get_range_by_agent_type_model,
+        get_range_by_model,
+        get_range_by_provider,
+        get_range_by_provider_model,
+        get_range_totals,
+    )
+
+    projects = tmp_path / "projects"
+    project = projects / "-tmp-project"
+    project.mkdir(parents=True)
+    session_file = project / "multi.jsonl"
+    session_file.write_text("".join(json.dumps(line) + "\n" for line in [
+        {
+            "timestamp": "2026-11-18T10:00:00Z",
+            "type": "user",
+            "cwd": "/tmp/project",
+            "message": {"content": "start"},
+        },
+        {
+            "timestamp": "2026-11-18T10:00:01Z",
+            "type": "assistant",
+            "cwd": "/tmp/project",
+            "message": {
+                "id": "m-1",
+                "model": "codex/gpt-6-astra",
+                "usage": {"input_tokens": 1000, "output_tokens": 100},
+            },
+        },
+        {
+            "timestamp": "2026-11-18T10:00:02Z",
+            "type": "assistant",
+            "cwd": "/tmp/project",
+            "message": {
+                "id": "m-2",
+                "model": "google-ai/gemini-4-carbon",
+                "usage": {"input_tokens": 2000, "output_tokens": 200},
+            },
+        },
+        {
+            "timestamp": "2026-11-18T10:00:03Z",
+            "type": "assistant",
+            "cwd": "/tmp/project",
+            "message": {
+                "id": "m-3",
+                "model": "custom/welm/welm-v4.5-flash-vl-latest",
+                "usage": {"input_tokens": 300, "output_tokens": 30},
+            },
+        },
+        {
+            "timestamp": "2026-11-18T10:00:04Z",
+            "type": "assistant",
+            "cwd": "/tmp/project",
+            "message": {
+                "id": "m-4",
+                "model": "gemini-4-carbon",
+                "usage": {"input_tokens": 500, "output_tokens": 50},
+            },
+        },
+    ]))
+
+    db = Database(db_path=str(tmp_path / "data.db"))
+    # Seed a stale single-provider row from an older static sync to verify cleanup.
+    db.upsert_session("multi", "claude_code", provider="legacy", data_root=str(tmp_path), input_tokens=9999)
+    db.commit()
+
+    registry = CollectorRegistry(reconcile_scopes=True)
+    registry.register(
+        ClaudeCodeCollector(
+            projects_dir=projects,
+            provider="ichat",
+            data_root=str(tmp_path),
+            auto_provider=True,
+        )
+    )
+    registry.sync_all(db)
+    db.commit()
+
+    by_provider = {r["provider"]: r["input_tokens"] for r in get_range_by_provider(db, "2026-11-18", "2026-11-18")}
+    assert by_provider == {"codex": 1000, "google-ai": 2000, "ichat": 500, "welm": 300}
+    assert "legacy" not in by_provider
+
+    # One multi-provider session still counts as 1 session overall and per agent.
+    totals = get_range_totals(db, "2026-11-18", "2026-11-18")
+    assert totals["session_count"] == 1
+    assert get_range_by_agent_type(db, "2026-11-18", "2026-11-18")[0]["session_count"] == 1
+
+    # By agent × provider breaks down harness -> provider cleanly.
+    by_ap = {(r["agent_type"], r["provider"]): r["input_tokens"] for r in get_range_by_agent_provider(db, "2026-11-18", "2026-11-18")}
+    assert by_ap == {
+        ("claude_code", "codex"): 1000,
+        ("claude_code", "google-ai"): 2000,
+        ("claude_code", "ichat"): 500,
+        ("claude_code", "welm"): 300,
+    }
+
+    # By provider × model strips redundant routing prefixes while keeping Unknown raw_model.
+    by_pm = {(r["provider"], r["model"]): r["input_tokens"] for r in get_range_by_provider_model(db, "2026-11-18", "2026-11-18")}
+    assert by_pm[("codex", "gpt-6-astra")] == 1000
+    assert by_pm[("google-ai", "gemini-4-carbon")] == 2000
+    assert by_pm[("ichat", "gemini-4-carbon")] == 500
+    assert by_pm[("welm", "Unknown")] == 300
+
+    # By model and By agent × model merge gemini-4-carbon across google-ai and ichat.
+    by_model = {r["model"]: r["input_tokens"] for r in get_range_by_model(db, "2026-11-18", "2026-11-18")}
+    assert by_model["gemini-4-carbon"] == 2500
+    assert by_model["gpt-6-astra"] == 1000
+    by_am = {(r["agent_type"], r["model"]): r["input_tokens"] for r in get_range_by_agent_type_model(db, "2026-11-18", "2026-11-18")}
+    assert by_am[("claude_code", "gemini-4-carbon")] == 2500
+
+    # By source × agent × provider × model strips prefix from model while keeping raw_model.
+    detailed = {(r["provider"], r["model"]): r["raw_model"] for r in get_range_by_agent_model(db, "2026-11-18", "2026-11-18")}
+    assert detailed[("codex", "gpt-6-astra")] == "codex/gpt-6-astra"
+    assert detailed[("welm", "Unknown")] == "custom/welm/welm-v4.5-flash-vl-latest"
+
+    # Custom provider_rules override default prefix extraction.
+    ClaudeCodeCollector(
+        projects_dir=projects,
+        provider="ichat",
+        data_root=str(tmp_path),
+        auto_provider=True,
+        provider_rules=(("custom/welm/", "internal-welm"), ("codex/", "openai-sub")),
+    ).sync_history(db)
+    by_provider_ruled = {r["provider"]: r["input_tokens"] for r in get_range_by_provider(db, "2026-11-18", "2026-11-18")}
+    assert by_provider_ruled == {"openai-sub": 1000, "google-ai": 2000, "ichat": 500, "internal-welm": 300}
+    db.close()
+
+
+def test_archived_remote_skips_ssh_and_preserves_history(tmp_path, monkeypatch):
+    from agentic_metric.collectors import remote as remote_module
+
+    monkeypatch.setattr(remote_module, "DATA_DIR", tmp_path)
+    def _fail_ssh(*_args, **_kwargs):
+        raise AssertionError("archived remote must never invoke SSH")
+    monkeypatch.setattr(remote_module, "_run_ssh", _fail_ssh)
+    monkeypatch.setattr(remote_module, "_read_remote_inventory", _fail_ssh)
+
+    target = RemoteSyncTarget(
+        remote=RemoteSpec(host="dead-host", name="devcloud", archived=True),
+        agent_type="claude_code",
+        remote_root="~/.wcc",
+        provider="ichat",
+        index=0,
+    )
+    collector = RemoteHistoryCollector(target)
+
+    db = Database(db_path=str(tmp_path / "data.db"))
+    db.upsert_session(
+        "old-sid",
+        "claude_code",
+        provider="ichat",
+        data_root=target.data_root,
+        model="claude-opus-5",
+        input_tokens=500,
+        estimated_cost_usd=2.5,
+    )
+    db.replace_session_usage(
+        "old-sid",
+        "claude_code",
+        [{"usage_date": "2026-10-01", "usage_hour": 9, "model": "claude-opus-5", "input_tokens": 500, "estimated_cost_usd": 2.5}],
+        provider="ichat",
+        data_root=target.data_root,
+    )
+    db.commit()
+
+    registry = CollectorRegistry(reconcile_scopes=True)
+    registry.register(collector)
+    registry.sync_all(db)
+    db.commit()
+
+    assert registry.get_sync_errors() == []
+    kept = db.conn.execute(
+        "SELECT input_tokens FROM sessions WHERE session_id = 'old-sid'"
+    ).fetchone()
+    assert kept is not None and kept["input_tokens"] == 500
     db.close()
 
 
@@ -658,7 +841,7 @@ def test_remote_ready_key_tracks_inner_parser_version():
     assert codex._ready_state_key().startswith(codex._inner.sync_state_prefix)
     assert "codex_jsonl:v17:" in codex._ready_state_key()
     assert claude._ready_state_key().startswith(claude._inner.sync_state_prefix)
-    assert "cc_jsonl:v15:" in claude._ready_state_key()
+    assert "cc_jsonl:v16:" in claude._ready_state_key()
 
 
 def test_remote_codex_collector_syncs_tarball_into_history(tmp_path):

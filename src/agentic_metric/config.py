@@ -61,6 +61,8 @@ class CollectorRoot:
     provider: str = ""
     raw_path: str = ""
     account_key: str = ""
+    auto_provider: bool = True
+    provider_rules: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -70,6 +72,8 @@ class RemoteCollectorRoot:
     path: str
     provider: str = ""
     account_key: str = ""
+    auto_provider: bool = True
+    provider_rules: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -83,6 +87,7 @@ class RemoteSpec:
     timeout: int = 30
     ssh_options: tuple[str, ...] = ()
     collectors: dict[str, list[RemoteCollectorRoot]] | None = None
+    archived: bool = False
 
 
 def _expand_path(raw: object) -> Path | None:
@@ -97,6 +102,29 @@ def _load_config() -> dict:
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def save_config(data: dict) -> Path:
+    """Atomically write ``CONFIG_FILE`` after ensuring it is a JSON object."""
+    if not isinstance(data, dict):
+        raise ValueError("config must be a JSON object")
+    import tempfile
+
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=CONFIG_FILE.parent, prefix=CONFIG_FILE.name + ".", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+        os.replace(tmp_path, CONFIG_FILE)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    return CONFIG_FILE
 
 
 def config_is_reconcilable() -> bool:
@@ -130,15 +158,37 @@ def config_is_reconcilable() -> bool:
     return True
 
 
-def _parse_root_items(raw_roots: object, label: str) -> list[tuple[str, str, str]]:
+def _parse_provider_rules(raw: object) -> tuple[tuple[str, str], ...]:
+    if not isinstance(raw, list):
+        return ()
+    rules: list[tuple[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        prefix = str(item.get("prefix") or "").strip()
+        provider = str(item.get("provider") or "").strip()
+        if prefix and provider:
+            rules.append((prefix, provider))
+    return tuple(rules)
+
+
+def _parse_root_items(
+    raw_roots: object,
+    label: str,
+    *,
+    default_auto_provider: bool = True,
+    default_provider_rules: tuple[tuple[str, str], ...] = (),
+) -> list[tuple[str, str, str, bool, tuple[tuple[str, str], ...]]]:
     """Parse explicit root ownership; invalid keys never silently select default roots."""
     from .accounts import validate_account_key
 
-    roots: list[tuple[str, str, str]] = []
+    roots: list[tuple[str, str, str, bool, tuple[tuple[str, str], ...]]] = []
     if not isinstance(raw_roots, list):
         return roots
     for item in raw_roots:
         account_key = ""
+        auto_provider = default_auto_provider
+        provider_rules = default_provider_rules
         if isinstance(item, str):
             raw_path = item.strip()
             provider = ""
@@ -146,6 +196,10 @@ def _parse_root_items(raw_roots: object, label: str) -> list[tuple[str, str, str
             raw = item.get("path")
             raw_path = raw.strip() if isinstance(raw, str) else ""
             provider = str(item.get("provider") or "").strip()
+            if "auto_provider" in item:
+                auto_provider = bool(item.get("auto_provider"))
+            if "provider_rules" in item:
+                provider_rules = _parse_provider_rules(item.get("provider_rules"))
             raw_key = item.get("account_key")
             if raw_key is not None:
                 if not isinstance(raw_key, str):
@@ -157,19 +211,32 @@ def _parse_root_items(raw_roots: object, label: str) -> list[tuple[str, str, str
         else:
             continue
         if raw_path:
-            roots.append((raw_path, provider, account_key))
+            roots.append((raw_path, provider, account_key, auto_provider, provider_rules))
     return roots
 
 
-def _raw_collector_roots(config: dict, name: str) -> list[tuple[str, str, str]]:
+def _raw_collector_roots(
+    config: dict, name: str
+) -> list[tuple[str, str, str, bool, tuple[tuple[str, str], ...]]]:
     collectors = config.get("collectors")
     raw_collector = collectors.get(name) if isinstance(collectors, dict) else None
     raw_roots = None
+    default_auto_provider = True
+    default_provider_rules: tuple[tuple[str, str], ...] = ()
     if isinstance(raw_collector, dict):
         raw_roots = raw_collector.get("roots")
+        if "auto_provider" in raw_collector:
+            default_auto_provider = bool(raw_collector.get("auto_provider"))
+        if "provider_rules" in raw_collector:
+            default_provider_rules = _parse_provider_rules(raw_collector.get("provider_rules"))
     elif isinstance(raw_collector, list):
         raw_roots = raw_collector
-    return _parse_root_items(raw_roots, f"collectors.{name}.roots")
+    return _parse_root_items(
+        raw_roots,
+        f"collectors.{name}.roots",
+        default_auto_provider=default_auto_provider,
+        default_provider_rules=default_provider_rules,
+    )
 
 
 def _collector_roots(name: str, default_path: Path, default_raw_path: str) -> list[CollectorRoot]:
@@ -188,7 +255,7 @@ def _collector_roots(name: str, default_path: Path, default_raw_path: str) -> li
         "claude_code": {
           "roots": [
             {"path": "~/.claude"},
-            {"path": "~/.claude-alt"}
+            {"path": "~/.wcc", "provider": "ichat", "auto_provider": true}
           ]
         }
       }
@@ -196,11 +263,16 @@ def _collector_roots(name: str, default_path: Path, default_raw_path: str) -> li
     """
     config = _load_config()
     roots: list[CollectorRoot] = []
-    for raw_path, provider, account_key in _raw_collector_roots(config, name):
+    for raw_path, provider, account_key, auto_provider, provider_rules in _raw_collector_roots(config, name):
         path = _expand_path(raw_path)
         if path is not None:
             roots.append(CollectorRoot(
-                path=path, provider=provider, raw_path=raw_path, account_key=account_key,
+                path=path,
+                provider=provider,
+                raw_path=raw_path,
+                account_key=account_key,
+                auto_provider=auto_provider,
+                provider_rules=provider_rules,
             ))
 
     return roots or [CollectorRoot(default_path, raw_path=default_raw_path)]
@@ -227,17 +299,32 @@ def _remote_collector_roots(
     collectors = remote.get("collectors")
     raw_collector = collectors.get(name) if isinstance(collectors, dict) else None
 
+    default_auto_provider = True
+    default_provider_rules: tuple[tuple[str, str], ...] = ()
     if isinstance(raw_collector, dict):
         raw_roots = raw_collector.get("roots")
+        if "auto_provider" in raw_collector:
+            default_auto_provider = bool(raw_collector.get("auto_provider"))
+        if "provider_rules" in raw_collector:
+            default_provider_rules = _parse_provider_rules(raw_collector.get("provider_rules"))
     elif isinstance(raw_collector, list):
         raw_roots = raw_collector
     else:
         raw_roots = None
 
     roots = [
-        RemoteCollectorRoot(path=raw_path, provider=provider, account_key=account_key)
-        for raw_path, provider, account_key in _parse_root_items(
-            raw_roots, f"remotes[{host}].collectors.{name}.roots",
+        RemoteCollectorRoot(
+            path=raw_path,
+            provider=provider,
+            account_key=account_key,
+            auto_provider=auto_provider,
+            provider_rules=provider_rules,
+        )
+        for raw_path, provider, account_key, auto_provider, provider_rules in _parse_root_items(
+            raw_roots,
+            f"remotes[{host}].collectors.{name}.roots",
+            default_auto_provider=default_auto_provider,
+            default_provider_rules=default_provider_rules,
         )
     ]
 
@@ -247,7 +334,12 @@ def _remote_collector_roots(
     # Account ownership is source-specific: a local account_key is never
     # inherited by a different host.
     return [
-        RemoteCollectorRoot(path=root.raw_path or str(root.path), provider=root.provider)
+        RemoteCollectorRoot(
+            path=root.raw_path or str(root.path),
+            provider=root.provider,
+            auto_provider=root.auto_provider,
+            provider_rules=root.provider_rules,
+        )
         for root in local_fallback
     ]
 
@@ -262,6 +354,7 @@ def get_remote_specs() -> list[RemoteSpec]:
         {
           "name": "remote-dev",
           "host": "remote-dev",
+          "archived": false,
           "collectors": {
             "codex": {"roots": [{"path": "~/.codex", "provider": "openai"}]},
             "claude_code": {"roots": [{"path": "~/.claude"}]}
@@ -296,6 +389,7 @@ def get_remote_specs() -> list[RemoteSpec]:
         timeout = raw_timeout if isinstance(raw_timeout, int) and raw_timeout > 0 else 30
         raw_options = remote.get("ssh_options")
         ssh_options = tuple(str(opt) for opt in raw_options) if isinstance(raw_options, list) else ()
+        archived = bool(remote.get("archived", False))
         collectors = {
             "codex": _remote_collector_roots(remote, "codex", local_codex, host),
             "claude_code": _remote_collector_roots(remote, "claude_code", local_claude, host),
@@ -309,6 +403,7 @@ def get_remote_specs() -> list[RemoteSpec]:
                 timeout=timeout,
                 ssh_options=ssh_options,
                 collectors=collectors,
+                archived=archived,
             )
         )
     return remotes

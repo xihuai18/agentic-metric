@@ -252,7 +252,7 @@ _UNKNOWN_MODEL_PREFIXES = (
     "gpt-5-pro",
 )
 
-_PRICING_FINGERPRINT_VERSION = 22
+_PRICING_FINGERPRINT_VERSION = 23
 
 # Long-context pricing applies per request/prompt, not per stored hour/session.
 # Collectors pass single-event usage into ``estimate_cost`` before aggregating
@@ -365,7 +365,7 @@ _TRAILING_MODE_OR_EFFORT_RE = re.compile(
     r"(?:[-_./:]+)(fast|priority|ultrafast|flex|none|minimal|low|medium|high|xhigh|ultra|max)$"
 )
 _TRAILING_DATE_OR_VERSION_RE = re.compile(r"(?:[-_.]+)(?:\d{8}|v\d+(?::\d+)?)$")
-_BRACKET_FAST_RE = re.compile(r"\[fast\]")
+_BRACKET_MODE_RE = re.compile(r"\[(fast|priority|ultrafast|flex)\]")
 
 
 def _model_tokens(name: str) -> tuple[str, ...]:
@@ -401,9 +401,10 @@ def _clean_model_name(name: str) -> tuple[str, str]:
     mode = ""
     clean = name.strip().lower()
     while True:
-        if _BRACKET_FAST_RE.search(clean):
-            mode = "fast"
-            clean = _BRACKET_FAST_RE.sub("", clean)
+        match = _BRACKET_MODE_RE.search(clean)
+        if match:
+            mode = match.group(1)
+            clean = clean[: match.start()] + clean[match.end() :]
             continue
         match = _TRAILING_MODE_OR_EFFORT_RE.search(clean)
         if match:

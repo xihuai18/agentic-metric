@@ -61,6 +61,8 @@ class RemoteSyncTarget:
     provider: str
     index: int
     account_key: str = ""
+    auto_provider: bool = True
+    provider_rules: tuple[tuple[str, str], ...] = ()
 
     @property
     def child_dir(self) -> str:
@@ -118,6 +120,8 @@ class RemoteHistoryCollector(BaseCollector):
                 provider=self.provider,
                 data_root=self.data_root,
                 account_key=target.account_key,
+                auto_provider=target.auto_provider,
+                provider_rules=target.provider_rules,
             )
         else:
             raise ValueError(f"unsupported remote agent type: {target.agent_type}")
@@ -127,6 +131,14 @@ class RemoteHistoryCollector(BaseCollector):
         return self._agent_type
 
     @property
+    def auto_provider(self) -> bool:
+        return self.target.agent_type == "claude_code" and self.target.auto_provider
+
+    @property
+    def provider_rules(self) -> tuple[tuple[str, str], ...]:
+        return self.target.provider_rules if self.target.agent_type == "claude_code" else ()
+
+    @property
     def sync_state_prefix(self) -> str:
         return self._inner.sync_state_prefix
 
@@ -134,8 +146,13 @@ class RemoteHistoryCollector(BaseCollector):
         """Mirror the remote root into the local cache (no DB access).
 
         Network-only, so a registry can run one prepare per remote target in
-        parallel before the serial DB parsing phase.
+        parallel before the serial DB parsing phase. Archived remotes never
+        open SSH connections and reuse their local cache snapshot when present.
         """
+        if self.target.remote.archived:
+            self._prepared = _read_archived_cache(self.target)
+            self.last_error = ""
+            return
         try:
             self._prepared = _sync_target_to_cache(self.target)
             if not self._prepared[0]:
@@ -165,6 +182,7 @@ class RemoteHistoryCollector(BaseCollector):
         found, cache_changed, manifest_digest, complete = prepared
         if not found:
             return
+        archived = self.target.remote.archived
         ready_key = self._ready_state_key()
         if complete and not cache_changed and db.get_sync_state(ready_key) == manifest_digest:
             # The mirror is byte-identical to the last fully parsed state, so
@@ -178,12 +196,18 @@ class RemoteHistoryCollector(BaseCollector):
                 paths = [_safe_member_path(rel) for rel in manifest]
                 if all(path is not None for path in paths):
                     files = [root / self.target.source_child / path for path in paths if path is not None]
-        if cache_changed and complete and self.agent_type == "claude_code":
+        if not archived and cache_changed and complete and self.agent_type == "claude_code":
             _purge_removed_remote_sessions(db, self.target, files=files)
+        allow_reconcile = complete and not archived
         if isinstance(self._inner, CodexCollector):
-            self._inner.sync_history(db, reconcile=complete, files=files, preserve_missing_parents=not complete)
+            self._inner.sync_history(
+                db,
+                reconcile=allow_reconcile,
+                files=files,
+                preserve_missing_parents=not allow_reconcile,
+            )
         else:
-            self._inner.sync_history(db, reconcile=complete, files=files)
+            self._inner.sync_history(db, reconcile=allow_reconcile, files=files)
         if complete and self._inner.last_sync_complete:
             db.set_sync_state(ready_key, manifest_digest)
         else:
@@ -227,22 +251,35 @@ def _purge_removed_remote_sessions(db, target: RemoteSyncTarget, *, files: list[
     )
     if not active_ids:
         return
-    rows = db.conn.execute(
-        """SELECT session_id
-           FROM sessions
-           WHERE session_id != ''
-             AND agent_type = ?
-             AND provider = ?
-             AND data_root = ?""",
-        (target.agent_type, target.provider, target.data_root),
-    ).fetchall()
+    dynamic = target.agent_type == "claude_code" and (
+        target.auto_provider or bool(target.provider_rules)
+    )
+    if dynamic:
+        rows = db.conn.execute(
+            """SELECT session_id, provider
+               FROM sessions
+               WHERE session_id != ''
+                 AND agent_type = ?
+                 AND data_root = ?""",
+            (target.agent_type, target.data_root),
+        ).fetchall()
+    else:
+        rows = db.conn.execute(
+            """SELECT session_id, provider
+               FROM sessions
+               WHERE session_id != ''
+                 AND agent_type = ?
+                 AND provider = ?
+                 AND data_root = ?""",
+            (target.agent_type, target.provider, target.data_root),
+        ).fetchall()
     for row in rows:
         if row["session_id"] in active_ids:
             continue
         db.delete_session(
             row["session_id"],
             target.agent_type,
-            provider=target.provider,
+            provider=str(row["provider"] or ""),
             data_root=target.data_root,
         )
     db.commit()
@@ -397,6 +434,17 @@ def _download_command(target: RemoteSyncTarget) -> str:
         _remote_base_script(target.source_root, target.source_child)
         + 'if [ -d "$base" ]; then cd "$base"; tar -czf - --null -T -; fi'
     )
+
+
+def _read_archived_cache(target: RemoteSyncTarget) -> tuple[bool, bool, str, bool]:
+    """Read local mirror metadata for an archived remote without touching SSH."""
+    cache_root = _cache_root_for(target)
+    if not (cache_root / target.source_child).exists():
+        return (False, False, "", False)
+    manifest = _load_manifest(cache_root)
+    complete = manifest is not None and not _manifest_is_incomplete(cache_root)
+    digest = _manifest_digest(manifest) if manifest is not None else ""
+    return (True, False, digest, complete)
 
 
 def _sync_target_to_cache(target: RemoteSyncTarget) -> tuple[bool, bool, str, bool]:

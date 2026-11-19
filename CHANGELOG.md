@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.8.23 (2026-11-19)
+
+- Auto-detect sub-providers from routed Claude Code / WCC model ids (`codex/<model>`, `google-ai/<model>`, `cursor/<model>`, `custom/<name>/<model>`) with fallback to each root's default `provider`, plus optional `auto_provider` toggle and ordered `provider_rules` overrides in `config.json`.
+- Deduplicate multi-provider session counts per `(agent_type, data_root, session_id)`, strip redundant routing prefixes in model tables, add `By agent × provider` (`by_agent_provider`) to CLI `--full` and `--json` reports, fold shared `data_root` onto the harness line in TUI Breakdown, and escape literal `[fast]`/`[ultrafast]` brackets in Rich tables.
+- Support `"archived": true` on SSH remotes to stop SSH polling without deleting historical DB rows or local caches, and add `agentic-metric config` subcommands (`path`, `show`, `remote add/archive/unarchive`).
+- Show approximate `~XX.X%` shares for priced rows when unpriced usage is present, support `[ultrafast]` / `[priority]` / `[flex]` bracket mode pricing, compact the CLI `Pricing missing` panel, widen cross-table model columns, zlib-compress `assistant_ids` sync state, and add `agentic-metric cache vacuum` plus DB freelist reporting in `cache info`.
+
 ## v0.8.22 (2026-11-19)
 
 - Prioritize verified builtin standard list rates over the cached models.dev catalog (`user override > builtin > catalog`) so temporary introductory/promotional rates in models.dev do not overwrite standard pricing, while catalog entries still cover newer models absent from the builtin table (including their modes and long-context tiers).

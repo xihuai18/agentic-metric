@@ -76,10 +76,21 @@ def local_time_bucket(ts: str) -> tuple[str, int]:
     return bucket
 
 
-def sync_key_identity(provider: str, data_root: str, *, account_key: str = "") -> str:
-    scope = {"provider": provider or "", "data_root": data_root or ""}
+def sync_key_identity(
+    provider: str,
+    data_root: str,
+    *,
+    account_key: str = "",
+    auto_provider: bool | None = None,
+    provider_rules: tuple[tuple[str, str], ...] = (),
+) -> str:
+    scope: dict[str, object] = {"provider": provider or "", "data_root": data_root or ""}
     if account_key:
         scope["account_key"] = account_key
+    if auto_provider is not None:
+        scope["auto_provider"] = auto_provider
+    if provider_rules:
+        scope["provider_rules"] = [list(rule) for rule in provider_rules]
     raw = json.dumps(
         scope,
         sort_keys=True,
@@ -250,7 +261,12 @@ class CollectorRegistry:
         scopes = [
             (
                 str(getattr(collector, "agent_type", "")),
-                str(getattr(collector, "provider", "") or ""),
+                ""
+                if (
+                    getattr(collector, "auto_provider", False)
+                    or getattr(collector, "provider_rules", ())
+                )
+                else str(getattr(collector, "provider", "") or ""),
                 str(getattr(collector, "data_root", "") or ""),
             )
             for collector in self._collectors
@@ -349,6 +365,8 @@ def create_default_registry() -> CollectorRegistry:
                 provider=root.provider,
                 data_root=str(data_root),
                 account_key=root.account_key,
+                auto_provider=root.auto_provider,
+                provider_rules=root.provider_rules,
             )
         )
 
@@ -379,6 +397,8 @@ def create_default_registry() -> CollectorRegistry:
                             provider=root.provider,
                             index=idx,
                             account_key=root.account_key,
+                            auto_provider=root.auto_provider,
+                            provider_rules=root.provider_rules,
                         )
                     )
                 )

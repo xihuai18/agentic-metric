@@ -349,12 +349,12 @@ collector 会读取这些环境变量。需要同时扫描多个目录、手动�
 ```
 
 默认配置路径是 `$DATA/agentic_metric/config.json`,也可以用
-`AGENTIC_METRIC_CONFIG` 指向其他 JSON 文件。Claude Code 目录没有 provider
-时不会被强行推断;Codex 未配置 provider 时会尝试读取 JSONL 里的
-`model_provider`。
+`AGENTIC_METRIC_CONFIG` 指向其他 JSON 文件。Claude Code / WCC 目录默认开启
+`auto_provider`:带路由前缀的模型名(`codex/<model>`、`google-ai/<model>`、
+`cursor/<model>`、`custom/<name>/<model>`)会自动拆到对应子 provider,裸模型名则落回该目录配置的默认 `provider`;如需禁用可设 `"auto_provider": false`,也可通过 `"provider_rules": [{"prefix": "...", "provider": "..."}]` 自定义映射规则。Codex 未配置 provider 时会尝试读取 JSONL 里的 `model_provider`。
 
 远程配置会使用已有的 `ssh` 配置。`host` 可以是 SSH alias 或主机名;可选字段有
-`name`、`user`、`port`、`timeout`、`ssh_options`。如果某个远程没有配置
+`name`、`user`、`port`、`timeout`、`ssh_options` 以及 `archived`(设为 `true` 可停用已归档主机的 SSH 同步,同时完整保留其历史数据与本地缓存)。如果某个远程没有配置
 collector 目录,它会复用本机的 collector roots;本机也没有配置时,等价于远程的
 `~/.claude` 和 `~/.codex`。远程同步会在远程主机上展开 `~`,通过 SSH 读取
 `projects/` 和 `sessions/`,缓存到 `$DATA/agentic_metric/remote-cache/`,再和本机用量一起汇总。

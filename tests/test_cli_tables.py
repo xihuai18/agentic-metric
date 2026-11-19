@@ -91,6 +91,12 @@ def _tables(width: int) -> list[Table | None]:
         cli._build_dimension_table("By model", "Model", rows, "model", max_label_width=32),
         cli._build_by_agent_model_table(rows),
         cli._build_cross_table(
+            "By agent × provider", "Agent", rows,
+            lambda r: r.get("agent_type") or "—", a_width=cli._scale_width(10, 16),
+            b_title="Provider", b_value=lambda r: r.get("provider") or "—",
+            b_width=cli._scale_width(10, 18),
+        ),
+        cli._build_cross_table(
             "By provider × model", "Provider", rows,
             lambda r: r.get("provider") or "—", a_width=cli._scale_width(10, 16),
         ),

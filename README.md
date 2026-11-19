@@ -445,13 +445,19 @@ SSH remotes, create this tool's own config file:
 ```
 
 The default config path is `$DATA/agentic_metric/config.json`; set
-`AGENTIC_METRIC_CONFIG` to point at another JSON file. Claude Code roots
-without a provider are not guessed; Codex roots without a provider can still
-fall back to the JSONL `model_provider`.
+`AGENTIC_METRIC_CONFIG` to point at another JSON file. For Claude Code / WCC
+roots, `auto_provider` is enabled by default: model ids carrying routing
+prefixes (`codex/<model>`, `google-ai/<model>`, `cursor/<model>`,
+`custom/<name>/<model>`) split automatically into their sub-provider, while
+bare model names fall back to the root's configured `provider`. You can set
+`"auto_provider": false` to force one static provider per root, or add ordered
+`"provider_rules": [{"prefix": "...", "provider": "..."}]` overrides. Codex
+roots without a provider still fall back to the JSONL `model_provider`.
 
 Remote entries use your existing `ssh` config. `host` may be an SSH alias or a
-hostname; optional fields are `name`, `user`, `port`, `timeout`, and
-`ssh_options`. If a remote does not configure collector roots, it reuses the
+hostname; optional fields are `name`, `user`, `port`, `timeout`, `ssh_options`,
+and `archived` (set `"archived": true` to stop SSH syncing for a retired host
+while keeping its historical data and local cache intact). If a remote does not configure collector roots, it reuses the
 local collector root configuration; with no local config that means `~/.claude`
 and `~/.codex` on the remote. Remote sync expands `~` on the remote host, reads
 `projects/` and `sessions/` over SSH, stores a cache under

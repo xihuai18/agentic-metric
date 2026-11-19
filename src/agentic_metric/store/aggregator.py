@@ -7,7 +7,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 
-from ..formatting import source_label
+from ..formatting import source_label, strip_provider_prefix
 from ..pricing import is_model_priced
 from .database import Database
 
@@ -164,7 +164,7 @@ def _shifted_month_bounds(now: datetime, offset: int) -> tuple[date, date]:
 
 def _session_count_expr(column: str = "session_id") -> str:
     return (
-        "COUNT(DISTINCT agent_type || ':' || COALESCE(provider, '') || ':' || "
+        "COUNT(DISTINCT agent_type || ':' || "
         f"COALESCE(data_root, '') || ':' || {column})"
     )
 
@@ -185,14 +185,57 @@ def _preferred_session_model_expr(session_alias: str = "s", usage_alias: str = "
     )"""
 
 
-def _model_label(model: str) -> str:
+def _model_label(model: str, *, provider: str = "") -> str:
     """Return a display label, hiding unpriced model ids as Unknown."""
     model = model or ""
     if not model:
         return "(unknown)"
     if not is_model_priced(model):
         return "Unknown"
-    return model
+    return strip_provider_prefix(model, provider)
+
+
+def _merge_model_rows(
+    rows: list[dict],
+    key_fields: tuple[str, ...],
+    *,
+    sort_by_cost: bool = True,
+) -> list[dict]:
+    """Merge rows whose stripped priced model labels collide under the same keys."""
+    sum_fields = (
+        "session_count",
+        "user_turns",
+        "message_count",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_creation_tokens",
+        "estimated_cost_usd",
+        "unknown_cost_count",
+    )
+    merged: dict[tuple[object, ...], dict] = {}
+    for row in rows:
+        model = row.get("model") or ""
+        raw = row.get("raw_model") or ""
+        model_key = (model, raw) if model == "Unknown" else (model, "")
+        key = tuple(row.get(field) for field in key_fields) + model_key
+        existing = merged.get(key)
+        if existing is None:
+            merged[key] = row
+            continue
+        for field in sum_fields:
+            if field in existing or field in row:
+                existing[field] = (existing.get(field) or 0) + (row.get(field) or 0)
+    out = list(merged.values())
+    if sort_by_cost:
+        out.sort(
+            key=lambda r: (
+                r.get("estimated_cost_usd") or 0,
+                r.get("unknown_cost_count") or 0,
+            ),
+            reverse=True,
+        )
+    return out
 
 
 def _unknown_cost_expr(column: str = "estimated_cost_usd") -> str:
@@ -470,7 +513,34 @@ def get_range_by_model(db: Database, from_date: str, to_date: str) -> list[dict]
         row["raw_model"] = raw
         row["model"] = _model_label(raw)
         out.append(row)
-    return out
+    return _merge_model_rows(out, ())
+
+
+def get_range_by_agent_provider(
+    db: Database, from_date: str, to_date: str
+) -> list[dict]:
+    """Return per-(agent/harness, provider) aggregates within the range."""
+    usage = _usage_source(db)
+    rows = db.conn.execute(
+        f"""SELECT agent_type,
+                  CASE WHEN provider = '' THEN '—' ELSE provider END AS provider,
+                  {_session_count_expr()} AS session_count,
+                  COALESCE(SUM(user_turns), 0) AS user_turns,
+                  COALESCE(SUM(message_count), 0) AS message_count,
+                  COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                  COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                  COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+                  COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
+                  COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd,
+                  {_unknown_cost_expr()} AS unknown_cost_count
+           FROM {usage}
+           WHERE usage_date BETWEEN ? AND ?
+           GROUP BY agent_type, provider
+           ORDER BY estimated_cost_usd DESC, unknown_cost_count DESC
+        """,
+        (from_date, to_date),
+    ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def get_range_by_agent_model(db: Database, from_date: str, to_date: str) -> list[dict]:
@@ -503,9 +573,19 @@ def get_range_by_agent_model(db: Database, from_date: str, to_date: str) -> list
         row = dict(r)
         raw = row.pop("raw_model") or ""
         row["raw_model"] = raw
-        row["model"] = _model_label(raw)
+        row["model"] = _model_label(raw, provider=str(row.get("provider") or ""))
         out.append(row)
-    return out
+    merged = _merge_model_rows(out, ("agent_type", "provider", "data_root"), sort_by_cost=False)
+    merged.sort(
+        key=lambda r: (
+            str(r.get("agent_type") or ""),
+            str(r.get("provider") or ""),
+            str(r.get("data_root") or ""),
+            -(r.get("estimated_cost_usd") or 0),
+            -(r.get("unknown_cost_count") or 0),
+        )
+    )
+    return merged
 
 
 def _range_by_key_model(
@@ -516,6 +596,7 @@ def _range_by_key_model(
     select_expr: str,
     group_expr: str,
     key_name: str,
+    strip_by_key: bool = False,
 ) -> list[dict]:
     """Per-(key, model) aggregates: one row per ``group_expr`` × model."""
     usage = _usage_source(db)
@@ -543,9 +624,13 @@ def _range_by_key_model(
         row = dict(r)
         raw = row.pop("raw_model") or ""
         row["raw_model"] = raw
-        row["model"] = _model_label(raw)
+        prov = ""
+        if strip_by_key:
+            key_val = str(row.get(key_name) or "")
+            prov = "" if key_val == "—" else key_val
+        row["model"] = _model_label(raw, provider=prov)
         out.append(row)
-    return out
+    return _merge_model_rows(out, (key_name,))
 
 
 def get_range_by_provider_model(db: Database, from_date: str, to_date: str) -> list[dict]:
@@ -563,6 +648,7 @@ def get_range_by_provider_model(db: Database, from_date: str, to_date: str) -> l
         select_expr="CASE WHEN provider = '' THEN '—' ELSE provider END",
         group_expr="provider",
         key_name="provider",
+        strip_by_key=True,
     )
 
 
