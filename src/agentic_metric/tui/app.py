@@ -153,6 +153,8 @@ class AgenticMetricApp(App):
         # every 5 min by default, so this just speeds it up). Two
         # bindings share r; `check_action` shows whichever matches state,
         # and the active one is highlighted via `-auto-on` in styles.tcss.
+        Binding("s,S", "sort_by_tokens", "Sort: cost", key_display="s"),
+        Binding("s,S", "sort_by_cost", "Sort: tokens", key_display="s"),
         Binding("r", "auto_refresh_on", "Auto-refresh"),
         Binding("r", "auto_refresh_off", "Auto-refresh"),
         Binding("q", "quit", "Quit"),
@@ -183,6 +185,7 @@ class AgenticMetricApp(App):
         self._range_totals_cache: dict[tuple[str, str], dict] | None = None
         self._focus: str = "today"
         self._offset: int = 0  # 0 = current period; N = N units in the past
+        self._sort_by: str = "cost"  # "cost" or "tokens"
         self._auto_refresh_timer: Timer | None = None
         self._sync_timer: Timer | None = None
         self._sync_in_progress = False
@@ -306,7 +309,8 @@ class AgenticMetricApp(App):
 
         label, frm, to = resolve_range(self._focus, offset=self._offset)
         totals = self._range_totals(frm, to)
-        project_rows = get_range_by_project(self._db, frm, to, limit=3)
+        project_limit = 50 if self._sort_by == "tokens" else 3
+        project_rows = get_range_by_project(self._db, frm, to, limit=project_limit)
         provider_rows = get_range_by_provider(self._db, frm, to)
 
         highlight_index = None
@@ -326,6 +330,7 @@ class AgenticMetricApp(App):
             projects=project_rows,
             providers=provider_rows,
             total_cost=totals.get("estimated_cost_usd") or 0.0,
+            sort_by=self._sort_by,
         )
 
         titles = {
@@ -480,32 +485,40 @@ class AgenticMetricApp(App):
                 "cache_write": cache_write,
             })
 
+        by_tokens = self._sort_by == "tokens"
         groups = []
         for host in hosts_by_name.values():
             agents = []
             for agent in host["agents"].values():
-                providers = sorted(agent.pop("providers").values(), key=lambda g: -g["cost"])
+                providers = sorted(
+                    agent.pop("providers").values(),
+                    key=lambda g: (-(g["tokens"] if by_tokens else g["cost"]), -g["cost"]),
+                )
                 for provider_group in providers:
                     provider_group["models"].sort(
                         key=lambda m: (
-                            1 if _has_unknown_cost(m) else 0,
-                            m.get("cost") or 0,
+                            (m.get("tokens") or 0, m.get("cost") or 0)
+                            if by_tokens
+                            else (1 if _has_unknown_cost(m) else 0, m.get("cost") or 0)
                         ),
                         reverse=True,
                     )
                 agent["providers"] = providers
                 agents.append(agent)
-            agents.sort(key=lambda a: -a["cost"])
+            agents.sort(key=lambda a: (-(a["tokens"] if by_tokens else a["cost"]), -a["cost"]))
             host["agents"] = agents
             groups.append(host)
-        groups.sort(key=lambda h: -h["cost"])
+        groups.sort(key=lambda h: (-(h["tokens"] if by_tokens else h["cost"]), -h["cost"]))
 
         total_cost = sum(h["cost"] for h in groups)
+        sort_suffix = " (by tokens)" if by_tokens else ""
 
         self.query_one("#breakdown-panel", Vertical).border_title = (
-            f"By host → agent → provider → model — {label} ({frm} → {to})"
+            f"By host → agent → provider → model{sort_suffix} — {label} ({frm} → {to})"
         )
-        self.query_one("#breakdown-body", Breakdown).update_data(groups, total_cost)
+        self.query_one("#breakdown-body", Breakdown).update_data(
+            groups, total_cost, sort_by=self._sort_by,
+        )
 
     # ── Periodic sync (5 min) ─────────────────────────────────────────
 
@@ -738,6 +751,20 @@ class AgenticMetricApp(App):
         """Open the keybinding cheatsheet."""
         self.push_screen(HelpScreen())
 
+    def action_sort_by_tokens(self) -> None:
+        if self._sort_by == "tokens":
+            return
+        self._sort_by = "tokens"
+        self._populate_chart_and_breakdown()
+        self.refresh_bindings()
+
+    def action_sort_by_cost(self) -> None:
+        if self._sort_by == "cost":
+            return
+        self._sort_by = "cost"
+        self._populate_chart_and_breakdown()
+        self.refresh_bindings()
+
     def action_auto_refresh_on(self) -> None:
         """Enable fast auto-sync and pause the slow periodic one (single loop)."""
         if self._auto_refresh_timer is not None:
@@ -763,7 +790,11 @@ class AgenticMetricApp(App):
         self.refresh_bindings()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
-        """Hide whichever auto-refresh binding doesn't match current state."""
+        """Hide whichever toggle binding doesn't match current state."""
+        if action == "sort_by_tokens":
+            return self._sort_by == "cost"
+        if action == "sort_by_cost":
+            return self._sort_by == "tokens"
         if action == "auto_refresh_on":
             return self._auto_refresh_timer is None
         if action == "auto_refresh_off":

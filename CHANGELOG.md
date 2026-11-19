@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.8.24 (2026-11-19)
+
+- Show both cost and token counts inline on TUI `Providers` and `Top projects` rows, and add `s`/`S` keybinding (`Sort: cost` / `Sort: tokens`) to switch ranking and shares across the heatmap histogram, peak summary, providers, top projects, and breakdown tree.
+
 ## v0.8.23 (2026-11-19)
 
 - Auto-detect sub-providers from routed Claude Code / WCC model ids (`codex/<model>`, `google-ai/<model>`, `cursor/<model>`, `custom/<name>/<model>`) with fallback to each root's default `provider`, plus optional `auto_provider` toggle and ordered `provider_rules` overrides in `config.json`.

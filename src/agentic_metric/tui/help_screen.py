@@ -22,6 +22,7 @@ _SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
         ("↑ ↓", "Scroll the breakdown panel"),
     ]),
     ("Data", [
+        ("s / S", "Toggle ranking & sort order (cost / tokens)"),
         ("r", "Toggle fast auto-refresh"),
         ("p", "Pricing for recorded models (u updates prices)"),
         ("a", "Account API equivalents and manual payments"),

@@ -18,6 +18,7 @@ from ..formatting import share_pct as _share_pct
 from ..formatting import share_suffix as _share_suffix
 from ..formatting import source_prefixed_path as _source_prefixed_path
 from ..formatting import strip_provider_prefix as _strip_provider_prefix
+from ..formatting import sum_tokens as _sum_tokens
 from ..formatting import token_summary as _token_summary
 
 
@@ -440,6 +441,7 @@ class PeriodicHeatmap(Static):
         self._projects: list[dict] = []
         self._providers: list[dict] = []
         self._total_cost: float = 0.0
+        self._sort_by: str = "cost"
 
     def update_data(
         self,
@@ -449,6 +451,8 @@ class PeriodicHeatmap(Static):
         projects: list[dict] | None = None,
         providers: list[dict] | None = None,
         total_cost: float = 0.0,
+        *,
+        sort_by: str = "cost",
     ) -> None:
         self._buckets = buckets
         self._highlight = highlight_index
@@ -456,6 +460,7 @@ class PeriodicHeatmap(Static):
         self._projects = projects or []
         self._providers = providers or []
         self._total_cost = total_cost
+        self._sort_by = sort_by
         self.refresh()
 
     @staticmethod
@@ -518,8 +523,9 @@ class PeriodicHeatmap(Static):
             "bold bright_green",
             "bold bright_green",
         ]
+        by_tokens = self._sort_by == "tokens"
         histogram = _render_histogram(
-            [b.get("cost") or 0 for b in points],
+            [(b.get("tokens") or 0) if by_tokens else (b.get("cost") or 0) for b in points],
             labels=[str(b.get("label") or "") for b in points],
             available=available,
             colors=colors,
@@ -529,29 +535,42 @@ class PeriodicHeatmap(Static):
 
         buckets = self._buckets
         n = len(buckets)
-        known_peak_idx = max(range(n), key=lambda i: buckets[i].get("cost") or 0)
-        unknown_peak_idx = next(
-            (i for i, b in enumerate(buckets) if _has_unknown_cost(b)),
-            None,
-        )
-        peak_idx = known_peak_idx if (buckets[known_peak_idx].get("cost") or 0) > 0 else (
-            unknown_peak_idx if unknown_peak_idx is not None else known_peak_idx
-        )
+        if by_tokens:
+            peak_idx = max(range(n), key=lambda i: (buckets[i].get("tokens") or 0, buckets[i].get("cost") or 0))
+        else:
+            known_peak_idx = max(range(n), key=lambda i: buckets[i].get("cost") or 0)
+            unknown_peak_idx = next(
+                (i for i, b in enumerate(buckets) if _has_unknown_cost(b)),
+                None,
+            )
+            peak_idx = known_peak_idx if (buckets[known_peak_idx].get("cost") or 0) > 0 else (
+                unknown_peak_idx if unknown_peak_idx is not None else known_peak_idx
+            )
 
         peak_b = buckets[peak_idx]
         peak_unknown = _has_unknown_cost(peak_b)
         peak_line = Text("  ")
-        if (peak_b.get("cost") or 0) > 0 or peak_unknown:
+        if (peak_b.get("cost") or 0) > 0 or (peak_b.get("tokens") or 0) > 0 or peak_unknown:
             peak_line.append("peak ", style="white")
             peak_line.append(peak_b["label"], style="bold")
-            peak_line.append(
-                f"  {fmt_cost(peak_b.get('cost'), unknown=peak_unknown)}",
-                style="bright_yellow",
-            )
-            peak_line.append(
-                f"  {fmt_tokens(peak_b.get('tokens') or 0)}",
-                style="bright_cyan",
-            )
+            if by_tokens:
+                peak_line.append(
+                    f"  {fmt_tokens(peak_b.get('tokens') or 0)}",
+                    style="bold bright_cyan",
+                )
+                peak_line.append(
+                    f"  {fmt_cost(peak_b.get('cost'), unknown=peak_unknown)}",
+                    style="bright_yellow",
+                )
+            else:
+                peak_line.append(
+                    f"  {fmt_cost(peak_b.get('cost'), unknown=peak_unknown)}",
+                    style="bright_yellow",
+                )
+                peak_line.append(
+                    f"  {fmt_tokens(peak_b.get('tokens') or 0)}",
+                    style="bright_cyan",
+                )
         else:
             peak_line.append("peak —", style="white")
 
@@ -567,11 +586,14 @@ class PeriodicHeatmap(Static):
 
         # Providers + Top projects share a single separator from the chart and
         # sit back-to-back (each carries its own row label) to stay compact.
+        total_tokens = _sum_tokens(self._totals)
         lists: list[Text] = []
         providers_block = _top_providers_block(
             self._providers,
             self._total_cost,
+            total_tokens=total_tokens,
             total_unknown=_has_unknown_cost(self._totals),
+            sort_by=self._sort_by,
         )
         if providers_block is not None:
             lists.extend(providers_block)
@@ -579,8 +601,10 @@ class PeriodicHeatmap(Static):
         projects_block = _top_projects_block(
             self._projects,
             self._total_cost,
+            total_tokens=total_tokens,
             total_unknown=_has_unknown_cost(self._totals),
             available=available,
+            sort_by=self._sort_by,
         )
         if projects_block is not None:
             lists.extend(projects_block)
@@ -600,17 +624,22 @@ class PeriodicHeatmap(Static):
         if _token_summary_block(self._totals, compact=width < 62) is not None:
             height += 2
 
+        total_tokens = _sum_tokens(self._totals)
         detail_rows = 0
         providers = _top_providers_block(
             self._providers,
             self._total_cost,
+            total_tokens=total_tokens,
             total_unknown=_has_unknown_cost(self._totals),
+            sort_by=self._sort_by,
         )
         projects = _top_projects_block(
             self._projects,
             self._total_cost,
+            total_tokens=total_tokens,
             total_unknown=_has_unknown_cost(self._totals),
             available=width,
+            sort_by=self._sort_by,
         )
         detail_rows += len(providers or ())
         detail_rows += len(projects or ())
@@ -820,33 +849,40 @@ def _top_providers_block(
     providers: list[dict],
     total_cost: float,
     *,
+    total_tokens: int = 0,
     total_unknown: bool = False,
     limit: int = 3,
+    sort_by: str = "cost",
 ) -> list[Text] | None:
-    """Up to ``limit`` provider cost rows for the focused TUI range."""
-    entries = [
-        p for p in providers
-        if (p.get("estimated_cost_usd") or 0) > 0 or _has_unknown_cost(p)
-    ][:limit]
+    """Up to ``limit`` provider rows for the focused TUI range."""
+    by_tokens = sort_by == "tokens"
+    if by_tokens:
+        all_entries = sorted(
+            (
+                p for p in providers
+                if _sum_tokens(p) > 0 or (p.get("estimated_cost_usd") or 0) > 0 or _has_unknown_cost(p)
+            ),
+            key=lambda p: (_sum_tokens(p), p.get("estimated_cost_usd") or 0.0),
+            reverse=True,
+        )
+    else:
+        all_entries = [
+            p for p in providers
+            if (p.get("estimated_cost_usd") or 0) > 0 or _has_unknown_cost(p)
+        ]
+    entries = all_entries[:limit]
     if not entries:
         return None
 
-    all_entries = [
-        p for p in providers
-        if (p.get("estimated_cost_usd") or 0) > 0 or _has_unknown_cost(p)
-    ]
     any_unknown = total_unknown or any(_has_unknown_cost(p) for p in all_entries)
+    effective_total_tokens = total_tokens or sum(_sum_tokens(p) for p in all_entries)
     label_text = "Providers"
 
     lines: list[Text] = []
     for i, p in enumerate(entries):
         unknown = _has_unknown_cost(p)
-        share_text = _share_suffix(
-            p.get("estimated_cost_usd") or 0.0,
-            total_cost,
-            unknown=unknown,
-            total_unknown=any_unknown,
-        )
+        tokens = _sum_tokens(p)
+        cost_text = fmt_cost(p.get("estimated_cost_usd"), unknown=unknown)
 
         line = Text("  ")
         if i == 0:
@@ -855,12 +891,30 @@ def _top_providers_block(
             line.append(" " * len(label_text), style="default")
         line.append("  ")
         line.append(_clip(str(p.get("provider") or "—"), 16), style="bright_blue")
-        line.append(
-            f" · {fmt_cost(p.get('estimated_cost_usd'), unknown=unknown)}",
-            style="bold bright_yellow" if i == 0 else "bright_yellow",
-        )
-        if share_text:
-            line.append(share_text, style="white")
+        if by_tokens:
+            tok_share = _share_suffix(float(tokens), float(effective_total_tokens))
+            line.append(
+                f" · {fmt_tokens(tokens)}",
+                style="bold bright_cyan" if i == 0 else "bright_cyan",
+            )
+            if tok_share:
+                line.append(tok_share, style="white")
+            line.append(f" · {cost_text}", style="bright_yellow")
+        else:
+            share_text = _share_suffix(
+                p.get("estimated_cost_usd") or 0.0,
+                total_cost,
+                unknown=unknown,
+                total_unknown=any_unknown,
+            )
+            line.append(
+                f" · {cost_text}",
+                style="bold bright_yellow" if i == 0 else "bright_yellow",
+            )
+            if share_text:
+                line.append(share_text, style="white")
+            if tokens > 0:
+                line.append(f" · {fmt_tokens(tokens)}", style="bright_cyan")
         lines.append(line)
 
     hidden = len(all_entries) - len(entries)
@@ -876,26 +930,41 @@ def _top_projects_block(
     projects: list[dict],
     total_cost: float,
     *,
+    total_tokens: int = 0,
     total_unknown: bool = False,
     limit: int = 3,
     available: int = 80,
+    sort_by: str = "cost",
 ) -> list[Text] | None:
     """Up to ``limit`` project rows. First row is labeled "Top projects"."""
     if not projects:
         return None
-    entries = [
-        p for p in projects
-        if (p.get("estimated_cost_usd") or 0) > 0 or _has_unknown_cost(p)
-    ][:limit]
+    by_tokens = sort_by == "tokens"
+    if by_tokens:
+        entries = sorted(
+            (
+                p for p in projects
+                if _sum_tokens(p) > 0 or (p.get("estimated_cost_usd") or 0) > 0 or _has_unknown_cost(p)
+            ),
+            key=lambda p: (_sum_tokens(p), p.get("estimated_cost_usd") or 0.0),
+            reverse=True,
+        )[:limit]
+    else:
+        entries = [
+            p for p in projects
+            if (p.get("estimated_cost_usd") or 0) > 0 or _has_unknown_cost(p)
+        ][:limit]
     if not entries:
         return None
 
     any_unknown = total_unknown or any(_has_unknown_cost(p) for p in entries)
+    effective_total_tokens = total_tokens or sum(_sum_tokens(p) for p in projects)
     label_text = "Top projects"
 
     lines: list[Text] = []
     for i, p in enumerate(entries):
         unknown = _has_unknown_cost(p)
+        tokens = _sum_tokens(p)
         line = Text("  ")
         if i == 0:
             line.append(label_text, style="white")
@@ -903,14 +972,28 @@ def _top_projects_block(
             line.append(" " * len(label_text), style="default")
         line.append("  ")
         cost = fmt_cost(p.get("estimated_cost_usd"), unknown=unknown)
-        share_text = _share_suffix(
-            p.get("estimated_cost_usd") or 0.0,
-            total_cost,
-            unknown=unknown,
-            total_unknown=any_unknown,
-        )
+        if by_tokens:
+            primary = fmt_tokens(tokens)
+            share_text = _share_suffix(float(tokens), float(effective_total_tokens))
+            secondary = f" · {cost}" if available >= 76 else ""
+            primary_style = "bold bright_cyan" if i == 0 else "bright_cyan"
+            secondary_style = "bright_yellow"
+        else:
+            primary = cost
+            share_text = _share_suffix(
+                p.get("estimated_cost_usd") or 0.0,
+                total_cost,
+                unknown=unknown,
+                total_unknown=any_unknown,
+            )
+            secondary = f" · {fmt_tokens(tokens)}" if (tokens > 0 and available >= 76) else ""
+            primary_style = "bold bright_yellow" if i == 0 else "bright_yellow"
+            secondary_style = "bright_cyan"
         prefix_width = 2 + len(label_text) + 2
-        path_max = max(12, min(44, available - prefix_width - len(cost) - len(share_text) - 3))
+        path_max = max(
+            12,
+            min(44, available - prefix_width - len(primary) - len(share_text) - len(secondary) - 3),
+        )
         line.append(
             _source_prefixed_path(
                 p["project_path"] or "",
@@ -919,12 +1002,11 @@ def _top_projects_block(
             ),
             style="bright_blue",
         )
-        line.append(
-            f" · {cost}",
-            style="bold bright_yellow" if i == 0 else "bright_yellow",
-        )
+        line.append(f" · {primary}", style=primary_style)
         if share_text:
             line.append(share_text, style="white")
+        if secondary:
+            line.append(secondary, style=secondary_style)
         lines.append(line)
     return lines
 
@@ -966,10 +1048,18 @@ class Breakdown(Static):
         super().__init__(**kwargs)
         self._groups: list[dict] = []
         self._total_cost: float = 0.0
+        self._sort_by: str = "cost"
 
-    def update_data(self, groups: list[dict], total_cost: float) -> None:
+    def update_data(
+        self,
+        groups: list[dict],
+        total_cost: float,
+        *,
+        sort_by: str = "cost",
+    ) -> None:
         self._groups = groups
         self._total_cost = total_cost
+        self._sort_by = sort_by
         self.refresh(layout=True)
 
     # Fixed-width value columns to the right of every tree row:
@@ -1066,6 +1156,28 @@ class Breakdown(Static):
     def _share(cost: float, unknown: bool, total: float, total_unknown: bool) -> str:
         return _share_pct(cost, total, unknown=unknown, total_unknown=total_unknown)
 
+    def _row_share(
+        self,
+        row: dict,
+        *,
+        total_cost: float,
+        total_tokens: int,
+        total_unknown: bool,
+    ) -> str:
+        if self._sort_by == "tokens":
+            tokens = (
+                row.get("tokens")
+                if row.get("tokens") is not None
+                else (row.get("input") or 0) + (row.get("output") or 0) + (row.get("cache") or 0)
+            )
+            return _share_pct(float(tokens or 0), float(total_tokens))
+        return self._share(
+            row.get("cost") or 0.0,
+            _has_unknown_cost(row),
+            total_cost,
+            total_unknown,
+        )
+
     def _emit_agent(
         self,
         t: Text,
@@ -1073,6 +1185,7 @@ class Breakdown(Static):
         *,
         label_width: int,
         total: float,
+        total_tokens: int,
         total_unknown: bool,
         base_bar: str,
         agent_last: bool,
@@ -1122,7 +1235,9 @@ class Breakdown(Static):
             agent,
             cost=agent_cost,
             cost_unknown=agent_unknown,
-            share=self._share(agent_cost, agent_unknown, total, total_unknown),
+            share=self._row_share(
+                agent, total_cost=total, total_tokens=total_tokens, total_unknown=total_unknown,
+            ),
             cost_style="bold bright_yellow",
             compact=compact,
         )
@@ -1157,7 +1272,12 @@ class Breakdown(Static):
                 provider_group,
                 cost=provider_cost,
                 cost_unknown=provider_unknown,
-                share=self._share(provider_cost, provider_unknown, total, total_unknown),
+                share=self._row_share(
+                    provider_group,
+                    total_cost=total,
+                    total_tokens=total_tokens,
+                    total_unknown=total_unknown,
+                ),
                 cost_style="bold bright_yellow",
                 compact=compact,
             )
@@ -1165,10 +1285,24 @@ class Breakdown(Static):
             # The enclosing panel scrolls, so model rows can stay complete.
             model_base = provider_base + ("  " if provider_last else "│ ")
             raw_models = provider_group.get("models", []) or []
-            visible = sorted(
-                [m for m in raw_models if (m.get("cost") or 0) > 0 or _has_unknown_cost(m)],
-                key=lambda m: -(m.get("cost") or 0),
-            )
+            if self._sort_by == "tokens":
+                visible = sorted(
+                    [
+                        m for m in raw_models
+                        if (m.get("tokens") or 0) > 0
+                        or (m.get("cost") or 0) > 0
+                        or _has_unknown_cost(m)
+                    ],
+                    key=lambda m: (
+                        -(m.get("tokens") or ((m.get("input") or 0) + (m.get("output") or 0) + (m.get("cache") or 0))),
+                        -(m.get("cost") or 0),
+                    ),
+                )
+            else:
+                visible = sorted(
+                    [m for m in raw_models if (m.get("cost") or 0) > 0 or _has_unknown_cost(m)],
+                    key=lambda m: -(m.get("cost") or 0),
+                )
             for j, m in enumerate(visible):
                 last = j == len(visible) - 1
                 model_prefix = model_base + ("└ " if last else "├ ")
@@ -1202,6 +1336,10 @@ class Breakdown(Static):
             return Text("  No activity in the selected range.", style="white")
 
         total = max(self._total_cost, 1e-9)
+        total_tokens = sum(
+            (h.get("tokens") if h.get("tokens") is not None else (h.get("input") or 0) + (h.get("output") or 0) + (h.get("cache") or 0))
+            for h in self._groups
+        )
         total_unknown = any(_has_unknown_cost(h) for h in self._groups)
         width = width or 120
         compact = width < self._VALUE_W + 24
@@ -1220,7 +1358,8 @@ class Breakdown(Static):
                 for a_index, agent in enumerate(agents):
                     self._emit_agent(
                         t, agent,
-                        label_width=label_width, total=total, total_unknown=total_unknown,
+                        label_width=label_width, total=total, total_tokens=total_tokens,
+                        total_unknown=total_unknown,
                         base_bar="", agent_last=(a_index == len(agents) - 1), top_level=True,
                         compact=compact,
                     )
@@ -1238,14 +1377,17 @@ class Breakdown(Static):
                 host,
                 cost=host_cost,
                 cost_unknown=host_unknown,
-                share=self._share(host_cost, host_unknown, total, total_unknown),
+                share=self._row_share(
+                    host, total_cost=total, total_tokens=total_tokens, total_unknown=total_unknown,
+                ),
                 cost_style="bold bright_yellow",
                 compact=compact,
             )
             for a_index, agent in enumerate(agents):
                 self._emit_agent(
                     t, agent,
-                    label_width=label_width, total=total, total_unknown=total_unknown,
+                    label_width=label_width, total=total, total_tokens=total_tokens,
+                    total_unknown=total_unknown,
                     base_bar="", agent_last=(a_index == len(agents) - 1), top_level=False,
                     compact=compact,
                 )

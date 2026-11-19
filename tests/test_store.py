@@ -3699,6 +3699,49 @@ def test_database_vacuum_reclaims_freelist_and_cli_config_commands(tmp_path, mon
     assert "archived" not in json.loads(cfg_path.read_text())["remotes"][0]
 
 
+def test_tui_sort_toggle_reorders_providers_between_cost_and_tokens(tmp_path):
+    import asyncio
+    from agentic_metric.tui import app as app_module
+
+    # Render heatmap directly in cost vs tokens sort modes.
+    widget = PeriodicHeatmap()
+    providers = [
+        {"provider": "expensive", "estimated_cost_usd": 100.0, "input_tokens": 1_000_000, "unknown_cost_count": 0},
+        {"provider": "high-vol", "estimated_cost_usd": 10.0, "input_tokens": 9_000_000, "unknown_cost_count": 0},
+        {"provider": "welm", "estimated_cost_usd": 0.0, "input_tokens": 5_000_000, "unknown_cost_count": 1},
+    ]
+    totals = {"estimated_cost_usd": 110.0, "input_tokens": 15_000_000, "unknown_cost_count": 1}
+    buckets = [{"label": "10", "cost": 110.0, "tokens": 15_000_000, "unknown_cost_count": 1}]
+
+    widget.update_data(buckets, totals=totals, providers=providers, total_cost=110.0, sort_by="cost")
+    con = Console(record=True, width=100, color_system=None)
+    con.print(widget.render())
+    cost_out = con.export_text()
+    assert "expensive · $100.00 (~90.9%) · 1.0M" in cost_out
+    assert cost_out.index("expensive") < cost_out.index("high-vol")
+
+    widget.update_data(buckets, totals=totals, providers=providers, total_cost=110.0, sort_by="tokens")
+    con2 = Console(record=True, width=100, color_system=None)
+    con2.print(widget.render())
+    tok_out = con2.export_text()
+    assert "high-vol · 9.0M (60.0%) · $10.00" in tok_out
+    assert "welm · 5.0M (33.3%) · —" in tok_out
+    assert tok_out.index("high-vol") < tok_out.index("welm") < tok_out.index("expensive")
+
+    # Both lowercase `s` and uppercase `S` toggle sort mode in the TUI app.
+    async def _run():
+        db = Database(db_path=str(tmp_path / "tui_sort.db"))
+        app = app_module.AgenticMetricApp(db=db, sync_on_mount=False, show_clock=False)
+        async with app.run_test(size=(120, 40), notifications=False) as pilot:
+            assert app._sort_by == "cost"
+            await pilot.press("s")
+            assert app._sort_by == "tokens"
+            await pilot.press("S")
+            assert app._sort_by == "cost"
+
+    asyncio.run(_run())
+
+
 def test_interrupted_sql_without_cancellation_is_not_converted(tmp_path, pricing_env, monkeypatch):
     path = str(tmp_path / "d.db")
 
