@@ -148,6 +148,8 @@ class Database:
             return
         try:
             self._conn.execute("PRAGMA journal_mode=WAL").fetchone()
+            self._conn.execute("PRAGMA cache_size=-16000")
+            self._conn.execute("PRAGMA temp_store=MEMORY")
         except sqlite3.OperationalError:
             # Another connection holds the file; keep the current mode.
             pass

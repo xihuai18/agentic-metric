@@ -672,7 +672,14 @@ class ClaudeCodeCollector(BaseCollector):
         )
         return f"cc_jsonl:{CLAUDE_SYNC_VERSION}:{identity}"
 
-    def sync_history(self, db, *, reconcile: bool = True, files: list[Path] | None = None) -> None:
+    def sync_history(
+        self,
+        db,
+        *,
+        reconcile: bool = True,
+        files: list[Path] | None = None,
+        evicted_files: dict[Path, dict[str, str]] | None = None,
+    ) -> None:
         """Sync Claude Code history into the database.
 
         Parses two data sources:
@@ -680,12 +687,14 @@ class ClaudeCodeCollector(BaseCollector):
         2. ``.jsonl`` files -- per-session token data (incremental via sync_state)
         """
         self.last_sync_complete = False
+        self.evicted_rehydrate_needed: set[Path] = set()
         indexed_ids, index_complete = self._sync_sessions_index(db, files=files)
         jsonl_ids, jsonl_complete = self._sync_jsonl_tokens(
             db,
             indexed_ids,
             reconcile=reconcile,
             files=files,
+            evicted_files=evicted_files,
         )
         if reconcile and index_complete and jsonl_complete:
             active_ids = indexed_ids | jsonl_ids
@@ -814,6 +823,7 @@ class ClaudeCodeCollector(BaseCollector):
         *,
         reconcile: bool = True,
         files: list[Path] | None = None,
+        evicted_files: dict[Path, dict[str, str]] | None = None,
     ) -> tuple[set[str], bool]:
         """Scan .jsonl files for per-session token data.
 
@@ -861,9 +871,10 @@ class ClaudeCodeCollector(BaseCollector):
         except OSError:
             return (active_ids, False)
 
+        evicted = evicted_files or {}
         for project_dir in project_dirs:
             check_sync_cancelled()
-            if not project_dir.is_dir():
+            if files is None and not project_dir.is_dir():
                 continue
 
             try:
@@ -878,26 +889,34 @@ class ClaudeCodeCollector(BaseCollector):
             file_states = []
             for jsonl_file in jsonl_files:
                 sync_key = f"{sync_prefix}{jsonl_file}"
+                evicted_meta = evicted.get(jsonl_file)
+                is_evicted = False
                 try:
                     stat = jsonl_file.stat()
+                    state = _sync_state_value(stat.st_size, stat.st_mtime_ns)
                 except OSError:
-                    complete = False
-                    continue
-                state = _sync_state_value(stat.st_size, stat.st_mtime_ns)
+                    if evicted_meta is not None and evicted_meta.get("sync_state"):
+                        state = evicted_meta["sync_state"]
+                        is_evicted = True
+                    else:
+                        complete = False
+                        continue
                 unchanged = db.get_sync_state(sync_key) == state
-                file_states.append((jsonl_file, sync_key, state, unchanged))
+                file_states.append((jsonl_file, sync_key, state, unchanged, is_evicted))
                 active_ids.add(
-                    _session_id_for_jsonl(project_dir, jsonl_file, jsonl_file.stem)
+                    evicted_meta.get("session_id")
+                    if is_evicted and evicted_meta and evicted_meta.get("session_id")
+                    else _session_id_for_jsonl(project_dir, jsonl_file, jsonl_file.stem)
                 )
                 active_sync_keys.add(sync_key)
                 active_sync_keys.add(f"{assistant_ids_prefix}{jsonl_file}")
                 active_sync_keys.add(f"{checkpoint_prefix}{jsonl_file}")
 
-            if file_states and all(unchanged for _, _, _, unchanged in file_states):
+            if file_states and all(unchanged for _, _, _, unchanged, _ in file_states):
                 continue
 
             seen_assistant_ids: set[str] = set()
-            for jsonl_file, sync_key, state, unchanged in file_states:
+            for jsonl_file, sync_key, state, unchanged, is_evicted in file_states:
                 reprocess_for_replay = False
                 if unchanged:
                     cached = _cached_assistant_ids(
@@ -915,6 +934,10 @@ class ClaudeCodeCollector(BaseCollector):
                         if not reprocess_for_replay:
                             seen_assistant_ids.update(owned_ids)
                             continue
+                if is_evicted:
+                    self.evicted_rehydrate_needed.add(jsonl_file)
+                    complete = False
+                    continue
 
                 real_cwd = _read_cwd(jsonl_file)
                 project_path = real_cwd if real_cwd else str(project_dir)

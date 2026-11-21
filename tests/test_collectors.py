@@ -2897,6 +2897,150 @@ def test_codex_cached_only_update_recomputes_input_tokens():
     assert sum(r["cache_read_tokens"] for r in accum.usage_bucket_rows()) == 200
 
 
+def test_remote_cold_eviction_preserves_db_and_skips_redownload(tmp_path):
+    from agentic_metric.collectors.remote import (
+        RemoteHistoryCollector,
+        _evicted_path,
+        _save_manifest,
+    )
+
+    remote = RemoteSpec(
+        host="remote-dev",
+        name="dev",
+        collectors={
+            "claude_code": [RemoteCollectorRoot(path="~/.claude", provider="anthropic")],
+            "codex": [],
+        },
+    )
+    target = RemoteSyncTarget(
+        remote=remote,
+        agent_type="claude_code",
+        remote_root="~/.claude",
+        provider="anthropic",
+        index=0,
+    )
+
+    with patch("agentic_metric.collectors.remote.DATA_DIR", tmp_path / "data"):
+        cache_root = _cache_root_for(target)
+        proj = cache_root / "projects" / "demo-proj"
+        proj.mkdir(parents=True)
+        cold_file = proj / "cold-session.jsonl"
+        hot_file = proj / "hot-session.jsonl"
+
+        def _make_session(sid: str, msg_id: str, tokens: int) -> str:
+            return "".join(
+                json.dumps(row) + "\n"
+                for row in [
+                    {
+                        "type": "user",
+                        "sessionId": sid,
+                        "cwd": "/repo/demo",
+                        "timestamp": "2026-04-01T10:00:00Z",
+                        "message": {"role": "user", "content": "hi"},
+                    },
+                    {
+                        "type": "assistant",
+                        "sessionId": sid,
+                        "cwd": "/repo/demo",
+                        "timestamp": "2026-04-01T10:00:05Z",
+                        "message": {
+                            "id": msg_id,
+                            "role": "assistant",
+                            "model": "claude-sonnet-4-6",
+                            "usage": {"input_tokens": tokens, "output_tokens": 10},
+                        },
+                    },
+                ]
+            )
+
+        cold_file.write_text(_make_session("cold-session", "msg-cold-1", 500))
+        hot_file.write_text(_make_session("hot-session", "msg-hot-1", 200))
+        old_ts = time.time() - 15 * 86400
+        os.utime(cold_file, (old_ts, old_ts))
+
+        cold_rel = "demo-proj/cold-session.jsonl"
+        hot_rel = "demo-proj/hot-session.jsonl"
+        manifest = {
+            cold_rel: {"size": str(cold_file.stat().st_size), "mtime": str(int(old_ts))},
+            hot_rel: {"size": str(hot_file.stat().st_size), "mtime": str(int(hot_file.stat().st_mtime))},
+        }
+        _save_manifest(cache_root, manifest)
+
+        db = Database(db_path=str(tmp_path / "data.db"))
+        collector = RemoteHistoryCollector(target)
+
+        with patch(
+            "agentic_metric.collectors.remote._read_remote_inventory",
+            return_value=(manifest, None),
+        ), patch(
+            "agentic_metric.collectors.remote._download_changed_files",
+            return_value=set(),
+        ) as dl_mock:
+            collector.prepare_cache()
+            collector.sync_history(db)
+
+        assert dl_mock.call_count == 0
+        # Cold file (>7d) was evicted from disk; hot file remains on disk.
+        assert not cold_file.exists()
+        assert hot_file.exists()
+        assert _evicted_path(cache_root).exists()
+
+        # Both sessions exist in DB.
+        sids = {
+            r["session_id"]: r["input_tokens"]
+            for r in db.conn.execute("SELECT session_id, input_tokens FROM sessions").fetchall()
+        }
+        assert sids == {"cold-session": 500, "hot-session": 200}
+
+        # Next sync with an updated hot sibling must NOT re-download the evicted cold file
+        # and must preserve cold-session in DB under reconcile=True.
+        hot_file.write_text(_make_session("hot-session", "msg-hot-1", 250))
+        manifest_v2 = {
+            cold_rel: manifest[cold_rel],
+            hot_rel: {"size": str(hot_file.stat().st_size), "mtime": str(int(hot_file.stat().st_mtime) + 1)},
+        }
+        with patch(
+            "agentic_metric.collectors.remote._read_remote_inventory",
+            return_value=(manifest_v2, None),
+        ), patch(
+            "agentic_metric.collectors.remote._download_changed_files",
+            return_value=set(),
+        ) as dl_mock2:
+            collector.prepare_cache()
+            collector.sync_history(db)
+
+        assert dl_mock2.call_count == 1
+        assert dl_mock2.call_args[0][4] == [hot_rel]
+        assert not cold_file.exists()
+        sids2 = {
+            r["session_id"]: r["input_tokens"]
+            for r in db.conn.execute("SELECT session_id, input_tokens FROM sessions").fetchall()
+        }
+        assert sids2["cold-session"] == 500
+        assert sids2["hot-session"] == 250
+
+        # If the cold file is removed on the remote, reconcile purges it from DB.
+        manifest_v3 = {hot_rel: manifest_v2[hot_rel]}
+        with patch(
+            "agentic_metric.collectors.remote._read_remote_inventory",
+            return_value=(manifest_v3, None),
+        ), patch(
+            "agentic_metric.collectors.remote._download_changed_files",
+            return_value=set(),
+        ):
+            collector.prepare_cache()
+            collector.sync_history(db)
+
+        sids3 = {
+            r["session_id"]
+            for r in db.conn.execute("SELECT session_id FROM sessions").fetchall()
+        }
+        assert sids3 == {"hot-session"}
+        assert not _evicted_path(cache_root).exists()
+        db.close()
+
+
+
 def test_codex_thread_settings_service_tier_prices_priority_requests():
     accum = CodexSessionAccum(Path("/tmp/fake.jsonl"), project_path="/test")
     accum.model = "gpt-5.6-sol"

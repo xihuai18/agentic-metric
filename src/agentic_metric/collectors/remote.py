@@ -27,8 +27,13 @@ from .claude_code import ClaudeCodeCollector
 from .codex import CodexCollector
 
 # Stale archives keep a short-lived local copy of files that disappeared from
-# a remote; they are never parsed again, so age them out to bound cache growth.
-_STALE_RETENTION_DAYS = 30
+# a remote; they are never parsed again, so age them out quickly to bound growth.
+_STALE_RETENTION_DAYS = 3
+
+# Cold mirrored Claude Code JSONL files older than this age whose metrics and
+# replay checkpoints are already stored in SQLite are evicted from disk while
+# their manifest/sync metadata stays recorded so unchanged files are not re-fetched.
+_COLD_EVICT_AGE_DAYS = 7
 
 # Download budget per ssh/tar round trip, measured in remote (uncompressed)
 # bytes. Small enough that one batch still fits in the default 30s ssh timeout
@@ -189,15 +194,28 @@ class RemoteHistoryCollector(BaseCollector):
             # the per-file scan of the whole cache tree can be skipped.
             return
         files = None
+        root = _cache_root_for(self.target)
+        manifest = None
         if complete:
-            root = _cache_root_for(self.target)
             manifest = _load_manifest(root)
             if manifest is not None and _manifest_digest(manifest) == manifest_digest:
                 paths = [_safe_member_path(rel) for rel in manifest]
                 if all(path is not None for path in paths):
                     files = [root / self.target.source_child / path for path in paths if path is not None]
+        evicted_map = _load_evicted(root) if self.agent_type == "claude_code" else {}
+        evicted_files: dict[Path, dict[str, str]] = {}
+        evicted_ids: set[str] = set()
+        if evicted_map:
+            active_root = root / self.target.source_child
+            for rel, meta in evicted_map.items():
+                member = _safe_member_path(rel)
+                if member is None:
+                    continue
+                evicted_files[active_root / member] = meta
+                if meta.get("session_id"):
+                    evicted_ids.add(meta["session_id"])
         if not archived and cache_changed and complete and self.agent_type == "claude_code":
-            _purge_removed_remote_sessions(db, self.target, files=files)
+            _purge_removed_remote_sessions(db, self.target, files=files, evicted_ids=evicted_ids)
         allow_reconcile = complete and not archived
         if isinstance(self._inner, CodexCollector):
             self._inner.sync_history(
@@ -207,9 +225,35 @@ class RemoteHistoryCollector(BaseCollector):
                 preserve_missing_parents=not allow_reconcile,
             )
         else:
-            self._inner.sync_history(db, reconcile=allow_reconcile, files=files)
+            self._inner.sync_history(
+                db,
+                reconcile=allow_reconcile,
+                files=files,
+                evicted_files=evicted_files or None,
+            )
+            rehydrate = getattr(self._inner, "evicted_rehydrate_needed", set())
+            if rehydrate and evicted_map:
+                active_root = root / self.target.source_child
+                changed_evicted = False
+                for path in rehydrate:
+                    try:
+                        rel = str(PurePosixPath(*path.relative_to(active_root).parts))
+                    except ValueError:
+                        continue
+                    if evicted_map.pop(rel, None) is not None:
+                        changed_evicted = True
+                if changed_evicted:
+                    _save_evicted(root, evicted_map)
         if complete and self._inner.last_sync_complete:
             db.set_sync_state(ready_key, manifest_digest)
+            if not archived and self.agent_type == "claude_code" and manifest is not None:
+                _evict_cold_cache_files(
+                    root,
+                    self.target,
+                    self._inner,
+                    db,
+                    manifest,
+                )
         else:
             db.conn.execute("DELETE FROM sync_state WHERE key = ?", (ready_key,))
             db.commit()
@@ -243,12 +287,20 @@ def _cache_root_for(target: RemoteSyncTarget) -> Path:
     return DATA_DIR / "remote-cache" / digest
 
 
-def _purge_removed_remote_sessions(db, target: RemoteSyncTarget, *, files: list[Path] | None = None) -> None:
+def _purge_removed_remote_sessions(
+    db,
+    target: RemoteSyncTarget,
+    *,
+    files: list[Path] | None = None,
+    evicted_ids: set[str] | None = None,
+) -> None:
     """Drop derived DB rows whose remote JSONL no longer exists in active cache."""
     active_ids = (
         _active_claude_session_ids(_cache_root_for(target) / target.source_child, files=files)
         if target.agent_type == "claude_code" else _active_remote_session_ids(target)
     )
+    if evicted_ids:
+        active_ids |= evicted_ids
     if not active_ids:
         return
     dynamic = target.agent_type == "claude_code" and (
@@ -462,9 +514,14 @@ def _sync_target_to_cache(target: RemoteSyncTarget) -> tuple[bool, bool, str, bo
     # purging still run once the mirror completes.
     had_manifest = loaded is not None and not _manifest_is_incomplete(cache_root)
     previous = loaded or {}
+    evicted = _load_evicted(cache_root) if target.agent_type == "claude_code" else {}
     changed = [
         rel for rel, meta in manifest.items()
-        if previous.get(rel) != meta or not (cache_root / target.source_child / rel).exists()
+        if previous.get(rel) != meta
+        or (
+            not (cache_root / target.source_child / rel).exists()
+            and not _is_evicted_current(evicted, rel, meta)
+        )
     ]
     if changed:
         missing = _download_changed_files(
@@ -481,6 +538,16 @@ def _sync_target_to_cache(target: RemoteSyncTarget) -> tuple[bool, bool, str, bo
         manifest if not missing
         else {rel: meta for rel, meta in manifest.items() if rel not in missing}
     )
+    if evicted:
+        pruned_evicted = {
+            rel: entry
+            for rel, entry in evicted.items()
+            if rel in saved_manifest
+            and _is_evicted_current(evicted, rel, saved_manifest[rel])
+            and not (cache_root / target.source_child / rel).exists()
+        }
+        if pruned_evicted != evicted:
+            _save_evicted(cache_root, pruned_evicted)
     if cache_changed:
         # Stale archiving and session purging only matter when the mirror
         # actually changed; skipping them keeps unchanged remotes cheap. Stale
@@ -963,6 +1030,204 @@ def _save_manifest(cache_root: Path, manifest: dict[str, dict[str, str]]) -> Non
     )
 
 
+def _evicted_path(cache_root: Path) -> Path:
+    return cache_root / ".remote-evicted.json"
+
+
+def _load_evicted(cache_root: Path) -> dict[str, dict[str, str]]:
+    path = _evicted_path(cache_root)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        str(k): {str(mk): str(mv) for mk, mv in v.items()}
+        for k, v in data.items()
+        if isinstance(v, dict)
+    }
+
+
+def _save_evicted(cache_root: Path, evicted: dict[str, dict[str, str]]) -> None:
+    path = _evicted_path(cache_root)
+    if not evicted:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        return
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(
+        json.dumps(evicted, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    tmp.replace(path)
+
+
+def _is_evicted_current(
+    evicted: dict[str, dict[str, str]],
+    rel: str,
+    meta: dict[str, str],
+) -> bool:
+    entry = evicted.get(rel)
+    if not entry:
+        return False
+    return (
+        entry.get("size") == meta.get("size")
+        and entry.get("mtime") == meta.get("mtime")
+        and bool(entry.get("sync_state"))
+    )
+
+
+def _evict_cold_cache_files(
+    cache_root: Path,
+    target: RemoteSyncTarget,
+    collector: ClaudeCodeCollector,
+    db,
+    manifest: dict[str, dict[str, str]],
+    *,
+    min_age_days: int = _COLD_EVICT_AGE_DAYS,
+    dry_run: bool = False,
+) -> tuple[int, int]:
+    """Evict cold already-ingested remote Claude Code JSONL files from disk.
+
+    Keeps manifest and sync_state metadata so unchanged files are not
+    re-downloaded and session reconciliation stays accurate.
+    Returns (evicted_count, reclaimed_bytes).
+    """
+    if target.agent_type != "claude_code" or target.remote.archived:
+        return (0, 0)
+    active_root = cache_root / target.source_child
+    if not active_root.exists():
+        return (0, 0)
+    cutoff = time.time() - max(0, min_age_days) * 86400
+    sync_prefix = f"{collector.sync_state_prefix}:"
+    assistant_ids_prefix = f"{collector.sync_state_prefix}:assistant_ids:"
+    evicted = _load_evicted(cache_root)
+    to_unlink: list[tuple[Path, int]] = []
+    updated_evicted = dict(evicted)
+
+    for rel, meta in manifest.items():
+        if not rel.endswith(".jsonl"):
+            continue
+        member = _safe_member_path(rel)
+        if member is None or len(member.parts) < 2:
+            continue
+        try:
+            remote_mtime = float(meta.get("mtime") or 0)
+        except ValueError:
+            continue
+        if remote_mtime <= 0 or remote_mtime >= cutoff:
+            continue
+        path = active_root / member
+        if not path.is_file():
+            continue
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        state = f"{st.st_size}:{st.st_mtime_ns}"
+        sync_key = f"{sync_prefix}{path}"
+        if db.get_sync_state(sync_key) != state:
+            continue
+        if db.get_sync_state(f"{assistant_ids_prefix}{path}") is None:
+            continue
+        project_dir = active_root / member.parts[0]
+        session_id = _claude_session_id_for_jsonl(project_dir, path)
+        updated_evicted[rel] = {
+            "size": str(meta.get("size", "")),
+            "mtime": str(meta.get("mtime", "")),
+            "session_id": session_id,
+            "sync_state": state,
+        }
+        to_unlink.append((path, st.st_size))
+
+    if not to_unlink:
+        return (0, 0)
+    reclaimed = sum(size for _, size in to_unlink)
+    if dry_run:
+        return (len(to_unlink), reclaimed)
+
+    _save_evicted(cache_root, updated_evicted)
+    unlinked_count = 0
+    unlinked_bytes = 0
+    touched_parents: set[Path] = set()
+    for path, size in to_unlink:
+        try:
+            path.unlink()
+            unlinked_count += 1
+            unlinked_bytes += size
+            touched_parents.add(path.parent)
+        except OSError:
+            continue
+    for parent in sorted(touched_parents, key=lambda p: len(p.parts), reverse=True):
+        cur = parent
+        while cur != active_root and active_root in cur.parents:
+            try:
+                if not any(cur.iterdir()):
+                    cur.rmdir()
+                    cur = cur.parent
+                    continue
+            except OSError:
+                pass
+            break
+    return (unlinked_count, unlinked_bytes)
+
+
+def evict_cold_remote_cache(
+    db,
+    *,
+    min_age_days: int = _COLD_EVICT_AGE_DAYS,
+    dry_run: bool = False,
+) -> dict:
+    """Evict cold already-ingested remote JSONL files across all active mirrors."""
+    targets = _configured_targets()
+    total_files = 0
+    total_bytes = 0
+    details: list[dict] = []
+    for digest, target in targets.items():
+        if target.agent_type != "claude_code" or target.remote.archived:
+            continue
+        cache_root = _cache_root_for(target)
+        manifest = _load_manifest(cache_root)
+        if not manifest:
+            continue
+        collector = ClaudeCodeCollector(
+            projects_dir=cache_root / target.source_child,
+            provider=target.provider,
+            data_root=target.data_root,
+            account_key=target.account_key,
+            auto_provider=target.auto_provider,
+            provider_rules=target.provider_rules,
+        )
+        count, reclaimed = _evict_cold_cache_files(
+            cache_root,
+            target,
+            collector,
+            db,
+            manifest,
+            min_age_days=min_age_days,
+            dry_run=dry_run,
+        )
+        if count:
+            total_files += count
+            total_bytes += reclaimed
+            details.append({
+                "path": cache_root,
+                "owner": f"{target.label}/{target.agent_type}/{target.remote_root}",
+                "files": count,
+                "bytes": reclaimed,
+            })
+    return {
+        "evicted_files": total_files,
+        "reclaimed_bytes": total_bytes,
+        "targets": details,
+    }
+
+
 def _archive_stale_cache_files(
     cache_root: Path,
     target: RemoteSyncTarget,
@@ -1060,6 +1325,9 @@ def _configured_targets() -> dict[str, RemoteSyncTarget]:
                     remote_root=root.path,
                     provider=root.provider,
                     index=index,
+                    account_key=root.account_key,
+                    auto_provider=root.auto_provider,
+                    provider_rules=root.provider_rules,
                 )
                 targets[_cache_root_for(target).name] = target
     return targets

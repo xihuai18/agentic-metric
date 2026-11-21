@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.8.25 (2026-11-21)
+
+- Automatically evict cold (>7 days unmodified) already-ingested remote Claude Code `.jsonl` mirror files from disk after complete sync while keeping compact `.remote-evicted.json` metadata so unchanged files are not re-downloaded, session reconciliation and replay deduplication stay accurate, and remote updates or deletions remain tracked.
+- Add `--evict-cold` to `agentic-metric cache prune` for on-demand eviction of cold mirrored JSONL files, and fix `_configured_targets()` to preserve `account_key`, `auto_provider`, and `provider_rules` when matching `sync_state` keys.
+- Reduce remote `.stale` archive retention from 30 days to 3 days and enable a 16 MiB SQLite page cache (`PRAGMA cache_size=-16000`) plus `PRAGMA temp_store=MEMORY` for faster database reads and aggregations.
+
 ## v0.8.24 (2026-11-19)
 
 - Show both cost and token counts inline on TUI `Providers` and `Top projects` rows, and add `s`/`S` keybinding (`Sort: cost` / `Sort: tokens`) to switch ranking and shares across the heatmap histogram, peak summary, providers, top projects, and breakdown tree.

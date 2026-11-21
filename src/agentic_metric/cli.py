@@ -2346,19 +2346,31 @@ def cache_prune(
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Show what would be removed without deleting."
     ),
+    evict_cold: bool = typer.Option(
+        False, "--evict-cold", help="Also evict cold (>7d) already-ingested remote JSONL files."
+    ),
 ) -> None:
-    """Remove orphaned remote mirrors and stale archives."""
-    from .collectors.remote import prune_remote_cache
+    """Remove orphaned remote mirrors, stale archives, and optionally cold mirrored JSONLs."""
+    from .collectors.remote import evict_cold_remote_cache, prune_remote_cache
 
     with _sync_status("Scanning remote cache..."):
         result = prune_remote_cache(dry_run=dry_run)
+        cold = None
+        if evict_cold:
+            from .store.database import Database
+            db = Database(reprice_on_open=False)
+            try:
+                cold = evict_cold_remote_cache(db, dry_run=dry_run)
+            finally:
+                db.close()
 
     if result["config_unavailable"]:
         console.print(
             f"[{C_YELLOW}]Config file missing or unreadable — "
             f"orphan removal skipped, only stale archives are pruned.[/]"
         )
-    if not result["removed"] and not result["failed"]:
+    has_cold = bool(cold and cold["evicted_files"])
+    if not result["removed"] and not result["failed"] and not has_cold:
         console.print(f"[{C_MUTED}]Nothing to reclaim.[/]")
         return
 
@@ -2368,12 +2380,20 @@ def cache_prune(
             f"  [{C_MUTED}]{verb}[/] {_shorten_home(str(item['path']))} "
             f"[{C_PEACH}]{_fmt_bytes(item['bytes'])}[/] [{C_MUTED}]({item['kind']})[/]"
         )
+    if cold:
+        cold_verb = "Would evict" if dry_run else "Evicted"
+        for item in cold["targets"]:
+            console.print(
+                f"  [{C_MUTED}]{cold_verb}[/] {item['files']} cold files in {item['owner']} "
+                f"[{C_PEACH}]{_fmt_bytes(item['bytes'])}[/] [{C_MUTED}](cold-jsonl)[/]"
+            )
     for item in result["failed"]:
         console.print(
             f"  [{C_RED}]Failed to remove[/] {_shorten_home(str(item['path']))} "
             f"[{C_MUTED}]({item['kind']})[/]"
         )
-    total = _fmt_bytes(result["reclaimed_bytes"])
+    total_bytes = result["reclaimed_bytes"] + (cold["reclaimed_bytes"] if cold else 0)
+    total = _fmt_bytes(total_bytes)
     if dry_run:
         console.print(f"Total reclaimable: [bold {C_PEACH}]{total}[/] (dry run — nothing deleted)")
     else:
